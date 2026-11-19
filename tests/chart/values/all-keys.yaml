@@ -13,6 +13,10 @@ database:
   migrate:
     key: owner-url
   connectionBudget: 40
+  caBundle:
+    enabled: true
+    configMapName: example-db-ca
+    key: root-ca.pem
 api:
   replicas: 2
   resources:
@@ -25,6 +29,7 @@ api:
   terminationGracePeriodSeconds: 20
   strategy: {maxSurge: 0, maxUnavailable: 1}
   service: {port: 80}
+  podDisruptionBudget: {enabled: true, maxUnavailable: 1}
   podAnnotations: {example.test/note: synthetic}
   nodeSelector: {kubernetes.io/os: linux}
   tolerations:
@@ -96,3 +101,19 @@ networkPolicy:
       - ipBlock:
           cidr: 2001:db8::/64
     port: 5433
+storage:
+  artifacts:
+    enabled: true
+    size: 5Gi
+    accessModes: [ReadWriteMany]
+    storageClassName: example-rwx
+    annotations: {example.test/role: artifacts}
+# Reserved example.test hostnames; the TLS Secret is a placeholder name.
+ingress:
+  enabled: true
+  className: example-ingress
+  annotations: {example.test/access-log: redacted}
+  hosts: [openmettle.example.test]
+  tls:
+    - secretName: example-openmettle-tls
+      hosts: [openmettle.example.test]

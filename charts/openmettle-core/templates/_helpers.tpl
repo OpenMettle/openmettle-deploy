@@ -70,14 +70,72 @@ valueFrom:
     key: {{ required (printf "database.%s.key is required" .name) .ref.key | quote }}
 {{- end -}}
 
-{{/* Matches the core images (USER 65532:65532) and the restricted Pod Security Standard. */}}
+{{/*
+Matches the core images (USER 65532:65532) and the restricted Pod Security Standard.
+Arguments: dict "storage" <bool>. fsGroup is set only on pods that mount the artifact volume, so
+that a freshly provisioned volume is writable by the non-root user.
+*/}}
 {{- define "openmettle-core.podSecurityContext" -}}
 securityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
+  {{- if .storage }}
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  {{- end }}
   seccompProfile:
     type: RuntimeDefault
+{{- end -}}
+
+{{/* Fixed in-pod paths. The database URL's sslrootcert must name the CA file exactly. */}}
+{{- define "openmettle-core.artifactsMountPath" -}}/var/lib/openmettle/artifacts{{- end -}}
+{{- define "openmettle-core.databaseCaDirectory" -}}/etc/openmettle/db-ca{{- end -}}
+
+{{/* Arguments: the root context. Name of the claim the artifact volume mounts. */}}
+{{- define "openmettle-core.artifactsClaimName" -}}
+{{- default (printf "%s-artifacts" (include "openmettle-core.fullname" .)) .Values.storage.artifacts.existingClaim -}}
+{{- end -}}
+
+{{/*
+Volumes and mounts for one pod. Arguments: dict "root" $ "artifacts" <bool>. The database CA is
+mounted into every component (api, worker, migrate) when enabled; the artifact volume only where
+"artifacts" is true. Each helper renders nothing when no volume applies.
+*/}}
+{{- define "openmettle-core.volumes" -}}
+{{- $ca := .root.Values.database.caBundle -}}
+{{- if or $ca.enabled .artifacts }}
+volumes:
+  {{- if .artifacts }}
+  - name: artifacts
+    persistentVolumeClaim:
+      claimName: {{ include "openmettle-core.artifactsClaimName" .root | quote }}
+  {{- end }}
+  {{- if $ca.enabled }}
+  - name: db-ca
+    configMap:
+      name: {{ required "database.caBundle.configMapName is required when database.caBundle.enabled is true" $ca.configMapName | quote }}
+      items:
+        - key: {{ $ca.key | quote }}
+          path: ca.crt
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "openmettle-core.volumeMounts" -}}
+{{- $ca := .root.Values.database.caBundle -}}
+{{- if or $ca.enabled .artifacts }}
+volumeMounts:
+  {{- if .artifacts }}
+  - name: artifacts
+    mountPath: {{ include "openmettle-core.artifactsMountPath" . | quote }}
+  {{- end }}
+  {{- if $ca.enabled }}
+  - name: db-ca
+    mountPath: {{ include "openmettle-core.databaseCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+{{- end }}
 {{- end -}}
 
 {{- define "openmettle-core.containerSecurityContext" -}}
@@ -154,6 +212,124 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Database CA bundle. The key selects one ConfigMap entry; it is mounted under the fixed file name
+ca.crt, so the key never becomes a path. The checks repeat the schema for --skip-schema-validation.
+*/ -}}
+{{- $ca := .Values.database.caBundle -}}
+{{- if $ca.enabled -}}
+{{- if not $ca.configMapName -}}
+{{- fail "database.caBundle.configMapName is required when database.caBundle.enabled is true (an existing ConfigMap holding the PEM CA bundle)" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $ca.key))) (has (toString $ca.key) (list "." "..")) -}}
+{{- fail "database.caBundle.key must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Artifact volume: exactly one source. The chart-owned settings would be silently ignored for an
+existing claim, so they are rejected there.
+*/ -}}
+{{- $artifacts := .Values.storage.artifacts -}}
+{{- if $artifacts.enabled -}}
+{{- if and $artifacts.existingClaim $artifacts.size -}}
+{{- fail "storage.artifacts: set either existingClaim or size, not both" -}}
+{{- end -}}
+{{- if not (or $artifacts.existingClaim $artifacts.size) -}}
+{{- fail "storage.artifacts: set existingClaim (an existing PVC) or size (a chart-owned PVC) when storage.artifacts.enabled is true" -}}
+{{- end -}}
+{{- if $artifacts.existingClaim -}}
+{{- if not (kindIs "invalid" $artifacts.storageClassName) -}}
+{{- fail "storage.artifacts.storageClassName applies only to the chart-owned PVC; leave it null with existingClaim" -}}
+{{- end -}}
+{{- if $artifacts.annotations -}}
+{{- fail "storage.artifacts.annotations apply only to the chart-owned PVC; leave them empty with existingClaim" -}}
+{{- end -}}
+{{- else -}}
+{{- if not $artifacts.accessModes -}}
+{{- fail "storage.artifacts.accessModes must list at least one access mode" -}}
+{{- end -}}
+{{- range $artifacts.accessModes -}}
+{{- if not (has . (list "ReadWriteOnce" "ReadWriteMany")) -}}
+{{- fail (printf "storage.artifacts.accessModes: %v is not accepted; api and worker both mount the claim read-write (ReadWriteOnce or ReadWriteMany)" .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Ingress: HTTPS only, every routed host covered by a TLS entry, and, under the chart's
+NetworkPolicies, an explicit ingress-controller peer (otherwise the controller could not reach the
+API and the Ingress would be dead).
+*/ -}}
+{{- $ingress := .Values.ingress -}}
+{{- if $ingress.enabled -}}
+{{- if not $ingress.className -}}
+{{- fail "ingress.className is required when ingress.enabled is true; the access-log redaction it relies on is controller-specific" -}}
+{{- end -}}
+{{- if not $ingress.hosts -}}
+{{- fail "ingress.hosts must list at least one hostname when ingress.enabled is true" -}}
+{{- end -}}
+{{- $covered := list -}}
+{{- range $i, $entry := $ingress.tls -}}
+{{- if not $entry.secretName -}}
+{{- fail (printf "ingress.tls[%d].secretName is required (an existing TLS Secret)" $i) -}}
+{{- end -}}
+{{- range $entry.hosts -}}
+{{- if not (has . $ingress.hosts) -}}
+{{- fail (printf "ingress.tls[%d] lists host %q, which is not in ingress.hosts" $i .) -}}
+{{- end -}}
+{{- $covered = append $covered . -}}
+{{- end -}}
+{{- end -}}
+{{- range $ingress.hosts -}}
+{{- if not (has . $covered) -}}
+{{- fail (printf "ingress host %q has no ingress.tls entry; the chart routes HTTPS only" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.ingressFrom) -}}
+{{- fail "networkPolicy.api.ingressFrom must select the ingress controller pods when ingress.enabled and networkPolicy.enabled are true" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+API PodDisruptionBudget. Kubernetes rounds percentages up for both fields. The budget must allow
+at least one voluntary eviction, or it blocks node drains.
+*/ -}}
+{{- $pdb := .Values.api.podDisruptionBudget -}}
+{{- if $pdb.enabled -}}
+{{- $min := $pdb.minAvailable -}}
+{{- $max := $pdb.maxUnavailable -}}
+{{- $hasMin := not (kindIs "invalid" $min) -}}
+{{- $hasMax := not (kindIs "invalid" $max) -}}
+{{- if and $hasMin $hasMax -}}
+{{- fail "api.podDisruptionBudget: set either minAvailable or maxUnavailable, not both" -}}
+{{- end -}}
+{{- if not (or $hasMin $hasMax) -}}
+{{- fail "api.podDisruptionBudget: set minAvailable or maxUnavailable when enabled is true" -}}
+{{- end -}}
+{{- $replicas := int64 .Values.api.replicas -}}
+{{- if lt $replicas 2 -}}
+{{- fail (printf "api.podDisruptionBudget requires api.replicas >= 2 (found %d); a budget on one replica would block node drains" $replicas) -}}
+{{- end -}}
+{{- $field := ternary "minAvailable" "maxUnavailable" $hasMin -}}
+{{- $value := ternary $min $max $hasMin -}}
+{{- $count := 0 -}}
+{{- if kindIs "string" $value -}}
+{{- if not (regexMatch "^(100|[1-9]?[0-9])%$" $value) -}}
+{{- fail (printf "api.podDisruptionBudget.%s must be a non-negative integer or a percentage from 0%% to 100%%" $field) -}}
+{{- end -}}
+{{- $count = div (add (mul (atoi (trimSuffix "%" $value)) $replicas) 99) 100 -}}
+{{- else -}}
+{{- $count = int64 $value -}}
+{{- if lt $count 0 -}}
+{{- fail (printf "api.podDisruptionBudget.%s must not be negative" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if and $hasMin (ge (int64 $count) $replicas) -}}
+{{- fail (printf "api.podDisruptionBudget.minAvailable (%v) keeps all %d API replicas and would block every voluntary eviction" $value $replicas) -}}
+{{- end -}}
+{{- if and $hasMax (lt (int64 $count) 1) -}}
+{{- fail (printf "api.podDisruptionBudget.maxUnavailable (%v) allows no voluntary eviction and would block node drains" $value) -}}
 {{- end -}}
 {{- end -}}
 {{- /*

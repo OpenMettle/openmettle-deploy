@@ -1,0 +1,91 @@
+# SYNTHETIC EXAMPLE. NOT INSTALLABLE. Do not copy real values into this file.
+#
+# A complete private overlay for charts/openmettle-core, showing every I4 option: database CA,
+# artifact volume, Ingress with TLS for a Traefik controller, the matching NetworkPolicy peer and an
+# API PodDisruptionBudget. Copy it to a private location outside this repository (for example an
+# ignored config/<site>.local.yaml or a private configuration repository), replace each placeholder
+# and render it with:
+#
+#   helm template openmettle charts/openmettle-core --namespace openmettle -f <private>.yaml
+#
+# Placeholders: the reserved .example top-level domain (RFC 2606), all-zero image digests that name
+# no image, and Secret, ConfigMap and claim names that exist nowhere. The chart creates none of the
+# referenced Secrets or ConfigMaps. OIDC and login settings are not accepted yet (V1-32 I5).
+
+images:
+  api:
+    registry: registry.openmettle.example
+    repository: openmettle/api
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  worker:
+    registry: registry.openmettle.example
+    repository: openmettle/worker
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  migrate:
+    registry: registry.openmettle.example
+    repository: openmettle/migrate
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+database:
+  # Each Secret holds one role's URL under `url`, created outside the chart, for example
+  #   postgres://openmettle_api:<password>@db.openmettle.example:5432/openmettle?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt
+  # sslrootcert must name the mounted file exactly; the chart sets no PG* environment variable.
+  api:
+    existingSecret: example-openmettle-api-database
+  worker:
+    existingSecret: example-openmettle-worker-database
+  migrate:
+    existingSecret: example-openmettle-owner-database
+  # Existing ConfigMap with the PEM bundle of the CA that issued the PostgreSQL server certificate.
+  caBundle:
+    enabled: true
+    configMapName: example-openmettle-db-ca
+    key: ca.crt
+
+api:
+  # A PodDisruptionBudget needs at least two API replicas.
+  replicas: 2
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+
+storage:
+  artifacts:
+    enabled: true
+    # A chart-owned claim of 20Gi on the cluster's default StorageClass. ReadWriteOnce keeps api and
+    # worker on one node; use ReadWriteMany for multi-node scheduling. To mount a claim you manage
+    # instead, set existingClaim and remove size.
+    size: 20Gi
+    accessModes: [ReadWriteOnce]
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    # Traefik: HTTPS entry point only, and a request-limit Middleware the operator creates in the
+    # release namespace (named <namespace>-<middleware>@kubernetescrd). See the chart README.
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: openmettle-openmettle-request-limits@kubernetescrd
+  hosts: [openmettle.example]
+  tls:
+    # An existing kubernetes.io/tls Secret, for example issued by cert-manager.
+    - secretName: example-openmettle-tls
+      hosts: [openmettle.example]
+
+networkPolicy:
+  api:
+    # Only the ingress controller may connect to the API. These labels match a Traefik installed in
+    # kube-system with app.kubernetes.io/name=traefik (as K3s bundles it); verify them on the cluster.
+    ingressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+  database:
+    # Documentation range (RFC 5737) standing in for the PostgreSQL address.
+    to:
+      - ipBlock:
+          cidr: 192.0.2.10/32

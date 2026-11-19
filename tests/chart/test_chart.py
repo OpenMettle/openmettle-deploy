@@ -1,4 +1,5 @@
-"""Policy tests over `helm template` output for charts/openmettle-core (V1-32 I1 render contract, I3 network policy).
+"""Policy tests over `helm template` output for charts/openmettle-core (V1-32 I1 render contract, I3 network
+policy, I4 storage, database CA, Ingress and PodDisruptionBudget).
 
 These tests render the chart; they do not install it. Each test docstring names a template or
 schema change that would make it fail. Requires helm (or HELM) and PyYAML (test-only).
@@ -16,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts" / "openmettle-core"
 VALUES = ROOT / "tests" / "chart" / "values"
 CONTRACT = ROOT / "tests" / "fixtures" / "core-5cd8a9d" / "process-contract.json"
+EXAMPLE = ROOT / "examples" / "values-synthetic.yaml"
 HELM = os.environ.get("HELM", "helm")
 RELEASE = "openmettle"
 
@@ -25,10 +27,13 @@ MATRIX = {
     "all-keys": ("all-keys.yaml",),
     "migration-disabled": ("migration-disabled.yaml",),
     "network-policy-disabled": ("network-policy-disabled.yaml",),
+    "storage-existing-claim": ("storage-existing-claim.yaml",),
+    "ingress-network-policy-disabled": ("ingress-network-policy-disabled.yaml",),
 }
 PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_"}
 PORT = {"api": 8080, "worker": 8081}
-ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job", "NetworkPolicy"}
+ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job", "NetworkPolicy", "PersistentVolumeClaim", "Ingress",
+                 "PodDisruptionBudget"}
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
 IMAGE = re.compile(r"^(?:[a-z0-9.-]+(?::[0-9]+)?/)?[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
 HOOK = "helm.sh/hook"
@@ -142,7 +147,12 @@ class PodPolicyTest(Rendered):
             self.assertEqual(context.get("runAsUser"), 65532)
             self.assertEqual(context.get("runAsGroup"), 65532)
             self.assertEqual(context.get("seccompProfile"), {"type": "RuntimeDefault"})
-            self.assertNotIn("fsGroup", context, "fsGroup is only for storage (I4)")
+            if any(v["name"] == "artifacts" for v in pod.get("volumes", [])):
+                self.assertEqual(context.get("fsGroup"), 65532)
+                self.assertEqual(context.get("fsGroupChangePolicy"), "OnRootMismatch")
+            else:
+                self.assertNotIn("fsGroup", context, "fsGroup is only for pods that mount the artifact volume")
+                self.assertNotIn("fsGroupChangePolicy", context)
 
     def test_container_security_context(self):
         """Fails if the containerSecurityContext helper is dropped or loosened for any container."""
@@ -164,6 +174,19 @@ class PodPolicyTest(Rendered):
             for container in containers(pod):
                 for port in container.get("ports", []):
                     self.assertNotIn("hostPort", port)
+
+    def test_only_known_volumes(self):
+        """Fails if a pod gains a volume other than the artifact claim or the database CA ConfigMap, or a mount without one."""
+        for _, _, pod in self.each_pod():
+            volumes = {v["name"]: v for v in pod.get("volumes", [])}
+            self.assertLessEqual(set(volumes), {"artifacts", "db-ca"})
+            if "artifacts" in volumes:
+                self.assertEqual(set(volumes["artifacts"]), {"name", "persistentVolumeClaim"})
+            if "db-ca" in volumes:
+                self.assertEqual(set(volumes["db-ca"]), {"name", "configMap"})
+            for container in containers(pod):
+                mounts = container.get("volumeMounts", [])
+                self.assertEqual(sorted(m["name"] for m in mounts), sorted(volumes))
 
     def test_no_token_and_no_service_links(self):
         """Fails if a pod omits automountServiceAccountToken: false or enableServiceLinks: false."""
@@ -565,9 +588,240 @@ class NetworkPolicyTest(Rendered):
 
     def test_names_fit_in_63_characters(self):
         """Fails if an object name can exceed 63 characters at the longest fullname (Helm caps release names at 53)."""
-        names = [d["metadata"]["name"] for d in render(release="r" * 53)]
+        names = [d["metadata"]["name"] for d in render(("all-keys.yaml",), release="r" * 53)]
         self.assertIn("r" * 52 + "-deny-all", names)
+        self.assertIn("r" * 52 + "-artifacts", names)
         self.assertLessEqual(max(map(len, names)), 63, names)
+
+
+ARTIFACTS_PATH = "/var/lib/openmettle/artifacts"
+DB_CA_DIRECTORY = "/etc/openmettle/db-ca"
+I4_KINDS = {"PersistentVolumeClaim", "Ingress", "PodDisruptionBudget"}
+
+
+def mounts(pod):
+    return {m["name"]: m for m in pod["containers"][0].get("volumeMounts", [])}
+
+
+def volumes(pod):
+    return {v["name"]: v for v in pod.get("volumes", [])}
+
+
+class OptionalDefaultsTest(Rendered):
+    """I4 features are off by default and add nothing to a default render."""
+
+    def test_chart_defaults(self):
+        """Fails if values.yaml enables or pre-fills the artifact volume, database CA, Ingress or API PDB."""
+        defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(defaults["database"]["caBundle"], {"enabled": False, "configMapName": "", "key": "ca.crt"})
+        self.assertEqual(defaults["api"]["podDisruptionBudget"],
+                         {"enabled": False, "minAvailable": None, "maxUnavailable": None})
+        self.assertEqual(defaults["storage"], {"artifacts": {
+            "enabled": False, "existingClaim": "", "size": "", "accessModes": ["ReadWriteOnce"],
+            "storageClassName": None, "annotations": {}}})
+        self.assertEqual(defaults["ingress"], {"enabled": False, "className": "", "annotations": {}, "hosts": [], "tls": []})
+
+    def test_defaults_render_no_optional_resource_volume_or_env(self):
+        """Fails if a default render gains a PVC, Ingress, PDB, volume, mount, fsGroup or environment variable."""
+        for name in ("minimal", "migration-disabled", "network-policy-disabled"):
+            docs = self.renders[name]
+            with self.subTest(values=name):
+                self.assertFalse(I4_KINDS & {d["kind"] for d in docs})
+                for role, pod in pods(docs):
+                    self.assertNotIn("volumes", pod, role)
+                    self.assertNotIn("volumeMounts", pod["containers"][0], role)
+                    self.assertNotIn("fsGroup", pod["securityContext"], role)
+        for role, pod in pods(self.renders["minimal"]):
+            env = {e["name"][len(PREFIX[role]):] for e in pod["containers"][0]["env"]}
+            self.assertEqual(env, set(DEFAULT_ENV[role]) | {"DATABASE_URL"})
+
+
+class DatabaseCaTest(Rendered):
+    """database.caBundle mounts one existing ConfigMap key read-only into every component."""
+
+    def test_mounted_read_only_into_every_component(self):
+        """Fails if api, worker or migrate lacks the CA volume, the mount is writable or the file name changes."""
+        roles = []
+        for role, pod in pods(self.renders["all-keys"]):
+            roles.append(role)
+            with self.subTest(component=role):
+                self.assertEqual(volumes(pod)["db-ca"], {"name": "db-ca", "configMap": {
+                    "name": "example-db-ca", "items": [{"key": "root-ca.pem", "path": "ca.crt"}]}})
+                self.assertEqual(mounts(pod)["db-ca"], {"name": "db-ca", "mountPath": DB_CA_DIRECTORY, "readOnly": True})
+        self.assertEqual(sorted(roles), ["api", "migrate", "worker"])
+
+    def test_no_environment_variable(self):
+        """Fails if the CA adds an environment variable (core ADR 0002: no shared PG* defaults; use sslrootcert in the URL)."""
+        enabled = dict(pods(render(set_values=["database.caBundle.enabled=true", "database.caBundle.configMapName=ca"])))
+        for role, pod in pods(self.renders["minimal"]):
+            with self.subTest(component=role):
+                self.assertEqual(pod["containers"][0]["env"], enabled[role]["containers"][0]["env"])
+                self.assertEqual(volumes(enabled[role])["db-ca"]["configMap"]["items"], [{"key": "ca.crt", "path": "ca.crt"}])
+
+    def test_follows_migration_toggle(self):
+        """Fails if the CA renders a migrate pod when migration is disabled, or is lost from api or worker."""
+        docs = render(("migration-disabled.yaml",), ["database.caBundle.enabled=true", "database.caBundle.configMapName=ca"])
+        self.assertEqual(sorted(role for role, pod in pods(docs) if "db-ca" in volumes(pod)), ["api", "worker"])
+
+    def test_chart_creates_no_config_map(self):
+        """Fails if the chart starts rendering the CA ConfigMap (or any ConfigMap or Secret) itself."""
+        for name, docs in self.renders.items():
+            with self.subTest(values=name):
+                self.assertFalse({"ConfigMap", "Secret"} & {d["kind"] for d in docs})
+
+
+class ArtifactStorageTest(Rendered):
+    """storage.artifacts mounts one claim read-write into api and worker only."""
+
+    def test_chart_owned_claim(self):
+        """Fails if the PVC's name, access modes, class, size or keep policy change, or user annotations override keep."""
+        claim = find(self.renders["all-keys"], "PersistentVolumeClaim", "-artifacts")
+        self.assertEqual(claim["metadata"]["name"], f"{RELEASE}-openmettle-core-artifacts")
+        self.assertEqual(claim["metadata"]["annotations"],
+                         {"helm.sh/resource-policy": "keep", "example.test/role": "artifacts"})
+        self.assertEqual(claim["spec"], {"accessModes": ["ReadWriteMany"], "storageClassName": "example-rwx",
+                                         "resources": {"requests": {"storage": "5Gi"}}})
+        self.assertNotIn(HOOK, claim["metadata"]["annotations"])
+        docs = render(set_values=["storage.artifacts.enabled=true", "storage.artifacts.size=1Gi",
+                                  r"storage.artifacts.annotations.helm\.sh/resource-policy=delete"])
+        claim = find(docs, "PersistentVolumeClaim", "-artifacts")
+        self.assertEqual(claim["metadata"]["annotations"], {"helm.sh/resource-policy": "keep"})
+        self.assertEqual(claim["spec"]["accessModes"], ["ReadWriteOnce"])
+        self.assertNotIn("storageClassName", claim["spec"], "null selects the cluster default class")
+
+    def test_empty_storage_class_is_rendered(self):
+        """Fails if storageClassName "" (static binding, no class) is dropped instead of rendered."""
+        docs = render(set_values=["storage.artifacts.enabled=true", "storage.artifacts.size=1Gi",
+                                  "storage.artifacts.storageClassName="])
+        self.assertEqual(find(docs, "PersistentVolumeClaim", "-artifacts")["spec"]["storageClassName"], "")
+
+    def test_mounted_read_write_into_api_and_worker_only(self):
+        """Fails if the migrate pod mounts artifacts, the mount is read-only or moves, or the claim name is wrong."""
+        expected = {"all-keys": f"{RELEASE}-openmettle-core-artifacts", "storage-existing-claim": "example-artifacts"}
+        for name, claim in expected.items():
+            for role, pod in pods(self.renders[name]):
+                with self.subTest(values=name, component=role):
+                    if role == "migrate":
+                        self.assertNotIn("artifacts", volumes(pod))
+                        continue
+                    self.assertEqual(volumes(pod)["artifacts"], {"name": "artifacts",
+                                                                  "persistentVolumeClaim": {"claimName": claim}})
+                    self.assertEqual(mounts(pod)["artifacts"], {"name": "artifacts", "mountPath": ARTIFACTS_PATH})
+                    self.assertIs(pod["containers"][0]["securityContext"]["readOnlyRootFilesystem"], True)
+                    self.assertEqual(pod["securityContext"]["runAsUser"], 65532)
+
+    def test_existing_claim_renders_no_pvc(self):
+        """Fails if an existingClaim still renders a chart-owned PVC."""
+        self.assertNotIn("PersistentVolumeClaim", {d["kind"] for d in self.renders["storage-existing-claim"]})
+
+
+class IngressTest(Rendered):
+    """ingress routes HTTPS for the configured hosts to the API Service, unmodified."""
+
+    def test_routes_every_path_to_the_api_service(self):
+        """Fails if a rule rewrites or narrows the path, targets another Service or port, or drops a host or TLS entry."""
+        cases = {
+            "all-keys": (["openmettle.example.test"],
+                         [{"secretName": "example-openmettle-tls", "hosts": ["openmettle.example.test"]}]),
+            "ingress-network-policy-disabled": (
+                ["openmettle.example.test", "api.openmettle.example.test"],
+                [{"secretName": "example-openmettle-tls", "hosts": ["openmettle.example.test"]},
+                 {"secretName": "example-openmettle-api-tls", "hosts": ["api.openmettle.example.test"]}]),
+        }
+        for name, (hosts, tls) in cases.items():
+            with self.subTest(values=name):
+                docs = self.renders[name]
+                ingress = find(docs, "Ingress", "-api")
+                service = find(docs, "Service", "-api")
+                backend = {"service": {"name": service["metadata"]["name"], "port": {"name": "http"}}}
+                self.assertEqual(ingress["apiVersion"], "networking.k8s.io/v1")
+                self.assertEqual(ingress["spec"], {
+                    "ingressClassName": "example-ingress", "tls": tls,
+                    "rules": [{"host": host, "http": {"paths": [{"path": "/", "pathType": "Prefix", "backend": backend}]}}
+                              for host in hosts]})
+                self.assertIn("http", [p["name"] for p in service["spec"]["ports"]])
+                self.assertNotIn(HOOK, ingress["metadata"].get("annotations", {}))
+        annotations = find(self.renders["all-keys"], "Ingress", "-api")["metadata"]["annotations"]
+        self.assertEqual(annotations, {"example.test/access-log": "redacted"})
+
+    def test_every_host_is_tls_covered(self):
+        """Fails if any rendered rule host lacks a TLS entry (the chart routes HTTPS only)."""
+        for name, docs in self.renders.items():
+            for ingress in (d for d in docs if d["kind"] == "Ingress"):
+                with self.subTest(values=name):
+                    covered = {h for entry in ingress["spec"]["tls"] for h in entry["hosts"]}
+                    self.assertLessEqual({rule["host"] for rule in ingress["spec"]["rules"]}, covered)
+
+    def test_network_policy_admits_only_configured_peers(self):
+        """Fails if enabling the Ingress widens API ingress beyond networkPolicy.api.ingressFrom."""
+        docs = self.renders["all-keys"]
+        api = find(docs, "NetworkPolicy", "-api")
+        self.assertEqual(len(api["spec"]["ingress"]), 1)
+        self.assertEqual(api["spec"]["ingress"][0]["from"],
+                         yaml.safe_load((VALUES / "all-keys.yaml").read_text(encoding="utf-8"))["networkPolicy"]["api"]["ingressFrom"])
+
+
+class PodDisruptionBudgetTest(Rendered):
+    """api.podDisruptionBudget protects the API only and never blocks every eviction."""
+
+    def test_budget_selects_only_api_pods(self):
+        """Fails if the PDB selector matches worker or migrate pods, drops AlwaysAllow or changes the budget."""
+        docs = self.renders["all-keys"]
+        pdb = find(docs, "PodDisruptionBudget", "-api")
+        self.assertEqual(pdb["apiVersion"], "policy/v1")
+        self.assertEqual(pdb["spec"]["maxUnavailable"], 1)
+        self.assertNotIn("minAvailable", pdb["spec"])
+        self.assertEqual(pdb["spec"]["unhealthyPodEvictionPolicy"], "AlwaysAllow")
+        matched = sorted(role for role, labels in pod_labels(docs) if selects(pdb["spec"]["selector"], labels))
+        self.assertEqual(matched, ["api"])
+
+    def test_values_render_with_their_type(self):
+        """Fails if a percentage renders as a number or an integer as a string (both change PDB semantics)."""
+        base = ["api.replicas=3", "api.podDisruptionBudget.enabled=true"]
+        for value, field, expected in (("50%", "minAvailable", "50%"), ("2", "minAvailable", 2),
+                                       ("34%", "maxUnavailable", "34%"), ("1", "maxUnavailable", 1)):
+            with self.subTest(field=field, value=value):
+                pdb = find(render(set_values=base + [f"api.podDisruptionBudget.{field}={value}"]), "PodDisruptionBudget", "-api")
+                self.assertEqual(pdb["spec"][field], expected)
+                self.assertEqual(type(pdb["spec"][field]), type(expected))
+
+
+class ExampleOverlayTest(unittest.TestCase):
+    """examples/values-synthetic.yaml renders standalone and stays synthetic."""
+
+    @classmethod
+    def setUpClass(cls):
+        result = subprocess.run([HELM, "template", RELEASE, str(CHART), "--namespace", "openmettle", "-f", str(EXAMPLE)],
+                                capture_output=True, text=True, timeout=120, check=False)
+        if result.returncode != 0:
+            raise AssertionError(f"helm template failed: {result.stderr}")
+        cls.docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        cls.values = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+
+    def test_shows_every_i4_feature(self):
+        """Fails if the example stops demonstrating the PVC, Ingress, PDB, database CA or ingress-controller peer."""
+        self.assertLessEqual(I4_KINDS, {d["kind"] for d in self.docs})
+        for role, pod in pods(self.docs):
+            self.assertIn("db-ca", volumes(pod), role)
+        self.assertTrue(find(self.docs, "NetworkPolicy", "-api")["spec"]["ingress"])
+
+    def test_values_are_synthetic(self):
+        """Fails if the example names a non-reserved domain, a real digest or a non-documentation address."""
+        text = EXAMPLE.read_text(encoding="utf-8")
+        self.assertIn("SYNTHETIC EXAMPLE", text)
+        for host in self.values["ingress"]["hosts"] + [self.values["images"][r]["registry"] for r in ("api", "worker", "migrate")]:
+            self.assertTrue(host == "example" or host.endswith(".example"), host)
+        for role in ("api", "worker", "migrate"):
+            self.assertEqual(self.values["images"][role]["digest"], DIGEST)
+        for peer in self.values["networkPolicy"]["database"]["to"]:
+            self.assertTrue(peer["ipBlock"]["cidr"].startswith("192.0.2."))
+        self.assertNotIn("oidc", self.values)
+
+    def test_traefik_annotations_stay_strings(self):
+        """Fails if a Traefik annotation such as router.tls: "true" is emitted as a YAML boolean."""
+        annotations = find(self.docs, "Ingress", "-api")["metadata"]["annotations"]
+        self.assertEqual(annotations["traefik.ingress.kubernetes.io/router.tls"], "true")
+        self.assertTrue(all(isinstance(v, str) for v in annotations.values()))
 
 
 class NegativeCaseTest(unittest.TestCase):
@@ -657,6 +911,109 @@ class NegativeCaseTest(unittest.TestCase):
          [SCHEMA, "/networkPolicy/database/to/0/podSelector/matchExpressions/0/operator"]),
         ("unknown networkPolicy key", ["networkPolicy.api.ingressPorts=8081"], [],
          [SCHEMA, "additional properties 'ingressPorts' not allowed"]),
+        # Database CA (I4).
+        ("CA without ConfigMap", ["database.caBundle.enabled=true"], [], [SCHEMA, "/database/caBundle/configMapName"]),
+        ("CA without ConfigMap without schema", ["database.caBundle.enabled=true"], ["--skip-schema-validation"],
+         ["database.caBundle.configMapName is required when database.caBundle.enabled is true"]),
+        ("CA key with a path", ["database.caBundle.key=../ca.crt"], [], [SCHEMA, "/database/caBundle/key"]),
+        ("CA key dot-dot", ["database.caBundle.key=.."], [], [SCHEMA, "/database/caBundle/key"]),
+        ("CA key dot-dot without schema",
+         ["database.caBundle.enabled=true", "database.caBundle.configMapName=ca", "database.caBundle.key=.."],
+         ["--skip-schema-validation"], ["database.caBundle.key must be a ConfigMap key"]),
+        ("CA key with a path without schema",
+         ["database.caBundle.enabled=true", "database.caBundle.configMapName=ca", "database.caBundle.key=a/b"],
+         ["--skip-schema-validation"], ["database.caBundle.key must be a ConfigMap key"]),
+        ("CA bad ConfigMap name", ["database.caBundle.configMapName=CA_Bundle"], [], [SCHEMA, "/database/caBundle/configMapName"]),
+        ("unknown caBundle key", ["database.caBundle.mountPath=/tmp"], [], [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        # Artifact volume (I4).
+        ("artifacts without a source", ["storage.artifacts.enabled=true"], [],
+         ["storage.artifacts: set existingClaim (an existing PVC) or size (a chart-owned PVC)"]),
+        ("artifacts with both sources",
+         ["storage.artifacts.enabled=true", "storage.artifacts.size=1Gi", "storage.artifacts.existingClaim=claim"], [],
+         ["storage.artifacts: set either existingClaim or size, not both"]),
+        ("storage class with existing claim",
+         ["storage.artifacts.enabled=true", "storage.artifacts.existingClaim=claim", "storage.artifacts.storageClassName=fast"], [],
+         ["storage.artifacts.storageClassName applies only to the chart-owned PVC"]),
+        ("annotations with existing claim",
+         ["storage.artifacts.enabled=true", "storage.artifacts.existingClaim=claim", "storage.artifacts.annotations.a=b"], [],
+         ["storage.artifacts.annotations apply only to the chart-owned PVC"]),
+        ("ReadWriteOncePod", ["storage.artifacts.enabled=true", "storage.artifacts.size=1Gi"],
+         ["--set-json", 'storage.artifacts.accessModes=["ReadWriteOncePod"]'], [SCHEMA, "/storage/artifacts/accessModes/0"]),
+        ("ReadWriteOncePod without schema", ["storage.artifacts.enabled=true", "storage.artifacts.size=1Gi"],
+         ["--set-json", 'storage.artifacts.accessModes=["ReadWriteOncePod"]', "--skip-schema-validation"],
+         ["storage.artifacts.accessModes: ReadWriteOncePod is not accepted"]),
+        ("ReadOnlyMany", [], ["--set-json", 'storage.artifacts.accessModes=["ReadOnlyMany"]'], [SCHEMA, "/storage/artifacts/accessModes/0"]),
+        ("no access modes", [], ["--set-json", "storage.artifacts.accessModes=[]"], [SCHEMA, "/storage/artifacts/accessModes"]),
+        ("size without unit", ["storage.artifacts.size=10"], [], [SCHEMA, "/storage/artifacts/size"]),
+        ("size in GB", ["storage.artifacts.size=10GB"], [], [SCHEMA, "/storage/artifacts/size"]),
+        ("zero size", ["storage.artifacts.size=0Gi"], [], [SCHEMA, "/storage/artifacts/size"]),
+        ("bad claim name", ["storage.artifacts.existingClaim=Claim_1"], [], [SCHEMA, "/storage/artifacts/existingClaim"]),
+        ("unknown storage key", ["storage.artifacts.mountPath=/data"], [], [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        # Ingress (I4).
+        ("ingress without class, hosts or TLS", ["ingress.enabled=true"], [],
+         [SCHEMA, "/ingress/className", "/ingress/hosts", "/ingress/tls"]),
+        ("ingress without class without schema", ["ingress.enabled=true"], ["--skip-schema-validation"],
+         ["ingress.className is required when ingress.enabled is true"]),
+        ("ingress without hosts without schema", ["ingress.enabled=true", "ingress.className=traefik"],
+         ["--skip-schema-validation"], ["ingress.hosts must list at least one hostname"]),
+        ("ingress host without TLS", ["ingress.enabled=true", "ingress.className=traefik"],
+         ["--set-json", 'ingress.hosts=["a.example.test","b.example.test"]',
+          "--set-json", 'ingress.tls=[{"secretName":"tls","hosts":["a.example.test"]}]'],
+         ['ingress host "b.example.test" has no ingress.tls entry; the chart routes HTTPS only']),
+        ("ingress without TLS without schema", ["ingress.enabled=true", "ingress.className=traefik"],
+         ["--set-json", 'ingress.hosts=["a.example.test"]', "--skip-schema-validation"],
+         ['ingress host "a.example.test" has no ingress.tls entry']),
+        ("TLS for an unrouted host", ["ingress.enabled=true", "ingress.className=traefik"],
+         ["--set-json", 'ingress.hosts=["a.example.test"]',
+          "--set-json", 'ingress.tls=[{"secretName":"tls","hosts":["a.example.test","c.example.test"]}]'],
+         ['ingress.tls[0] lists host "c.example.test", which is not in ingress.hosts']),
+        ("TLS without Secret without schema", ["ingress.enabled=true", "ingress.className=traefik"],
+         ["--set-json", 'ingress.hosts=["a.example.test"]', "--set-json", 'ingress.tls=[{"hosts":["a.example.test"]}]',
+          "--skip-schema-validation"], ["ingress.tls[0].secretName is required"]),
+        ("TLS without hosts", [], ["--set-json", 'ingress.tls=[{"secretName":"tls","hosts":[]}]'], [SCHEMA, "/ingress/tls/0/hosts"]),
+        ("ingress without controller peer", ["ingress.enabled=true", "ingress.className=traefik"],
+         ["--set-json", 'ingress.hosts=["a.example.test"]',
+          "--set-json", 'ingress.tls=[{"secretName":"tls","hosts":["a.example.test"]}]'],
+         ["networkPolicy.api.ingressFrom must select the ingress controller pods"]),
+        ("wildcard host", [], ["--set-json", 'ingress.hosts=["*.example.test"]'], [SCHEMA, "/ingress/hosts/0"]),
+        ("IP address host", [], ["--set-json", 'ingress.hosts=["192.0.2.1"]'], [SCHEMA, "/ingress/hosts/0"]),
+        ("single-label host", [], ["--set-json", 'ingress.hosts=["localhost"]'], [SCHEMA, "/ingress/hosts/0"]),
+        ("uppercase host", [], ["--set-json", 'ingress.hosts=["Example.test"]'], [SCHEMA, "/ingress/hosts/0"]),
+        ("host with port", [], ["--set-json", 'ingress.hosts=["a.example.test:443"]'], [SCHEMA, "/ingress/hosts/0"]),
+        ("duplicate host", [], ["--set-json", 'ingress.hosts=["a.example.test","a.example.test"]'], [SCHEMA, "/ingress/hosts"]),
+        ("ingress path setting", [], ["--set-json", 'ingress.paths=["/api"]'], [SCHEMA, "additional properties 'paths' not allowed"]),
+        ("unknown TLS key", [], ["--set-json", 'ingress.tls=[{"secretName":"tls","hosts":["a.example.test"],"create":true}]'],
+         [SCHEMA, "additional properties 'create' not allowed"]),
+        # API PodDisruptionBudget (I4).
+        ("PDB without a field", ["api.replicas=2", "api.podDisruptionBudget.enabled=true"], [],
+         ["api.podDisruptionBudget: set minAvailable or maxUnavailable when enabled is true"]),
+        ("PDB with both fields", ["api.replicas=2", "api.podDisruptionBudget.enabled=true",
+                                  "api.podDisruptionBudget.minAvailable=1", "api.podDisruptionBudget.maxUnavailable=1"], [],
+         ["api.podDisruptionBudget: set either minAvailable or maxUnavailable, not both"]),
+        ("PDB on one replica", ["api.podDisruptionBudget.enabled=true", "api.podDisruptionBudget.maxUnavailable=1"], [],
+         ["api.podDisruptionBudget requires api.replicas >= 2 (found 1)"]),
+        ("PDB keeps every replica", ["api.replicas=2", "api.podDisruptionBudget.enabled=true",
+                                     "api.podDisruptionBudget.minAvailable=2"], [],
+         ["api.podDisruptionBudget.minAvailable (2) keeps all 2 API replicas"]),
+        ("PDB percentage rounds up to every replica", ["api.replicas=2", "api.podDisruptionBudget.enabled=true",
+                                                       "api.podDisruptionBudget.minAvailable=51%"], [],
+         ["api.podDisruptionBudget.minAvailable (51%) keeps all 2 API replicas"]),
+        ("PDB allows no eviction", ["api.replicas=2", "api.podDisruptionBudget.enabled=true",
+                                    "api.podDisruptionBudget.maxUnavailable=0"], [],
+         ["api.podDisruptionBudget.maxUnavailable (0) allows no voluntary eviction"]),
+        ("PDB allows no eviction by percentage", ["api.replicas=2", "api.podDisruptionBudget.enabled=true",
+                                                  "api.podDisruptionBudget.maxUnavailable=0%"], [],
+         ["api.podDisruptionBudget.maxUnavailable (0%) allows no voluntary eviction"]),
+        ("PDB percentage above 100", ["api.podDisruptionBudget.maxUnavailable=101%"], [],
+         [SCHEMA, "/api/podDisruptionBudget/maxUnavailable"]),
+        ("PDB negative", ["api.podDisruptionBudget.minAvailable=-1"], [], [SCHEMA, "/api/podDisruptionBudget/minAvailable"]),
+        ("PDB fraction", ["api.podDisruptionBudget.minAvailable=0.5"], [], [SCHEMA, "/api/podDisruptionBudget/minAvailable"]),
+        ("PDB malformed percentage without schema", ["api.replicas=2", "api.podDisruptionBudget.enabled=true",
+                                                     "api.podDisruptionBudget.minAvailable=half"],
+         ["--skip-schema-validation"], ["api.podDisruptionBudget.minAvailable must be a non-negative integer or a percentage"]),
+        ("unknown PDB key", ["api.podDisruptionBudget.selector=x"], [], [SCHEMA, "additional properties 'selector' not allowed"]),
+        ("worker has no PDB", ["worker.podDisruptionBudget.enabled=true"], [],
+         [SCHEMA, "additional properties 'podDisruptionBudget' not allowed"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -681,6 +1038,22 @@ class NegativeCaseTest(unittest.TestCase):
         # Database peers are not required while the policies are disabled.
         result = helm_template(extra=["--set", "networkPolicy.enabled=false", "--set-json", "networkPolicy.database.to=[]"])
         self.assertEqual(result.returncode, 0, result.stderr)
+        pdb = ["api.podDisruptionBudget.enabled=true"]
+        for set_values in (pdb + ["api.replicas=2", "api.podDisruptionBudget.minAvailable=1"],
+                           pdb + ["api.replicas=2", "api.podDisruptionBudget.minAvailable=50%"],
+                           pdb + ["api.replicas=2", "api.podDisruptionBudget.minAvailable=0"],
+                           pdb + ["api.replicas=2", "api.podDisruptionBudget.maxUnavailable=1%"],
+                           pdb + ["api.replicas=2", "api.podDisruptionBudget.maxUnavailable=100%"],
+                           # Unused values are not checked while the feature is disabled.
+                           ["api.podDisruptionBudget.minAvailable=1", "api.podDisruptionBudget.maxUnavailable=1"],
+                           ["storage.artifacts.existingClaim=claim", "storage.artifacts.size=1Gi"],
+                           ["storage.artifacts.enabled=true", "storage.artifacts.size=1.5Gi"],
+                           ["storage.artifacts.enabled=true", "storage.artifacts.size=500M"],
+                           ["database.caBundle.configMapName=ca"],
+                           ["ingress.className=traefik"]):
+            with self.subTest(values=set_values):
+                result = helm_template(set_values=set_values)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_chart_defaults_refuse_to_render(self):
         """Fails if values.yaml ever ships an image digest or Secret name."""

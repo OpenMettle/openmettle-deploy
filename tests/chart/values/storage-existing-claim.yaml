@@ -1,0 +1,6 @@
+# Synthetic overlay on minimal.yaml: the artifact volume mounts an existing claim, so the chart
+# renders no PersistentVolumeClaim. The database CA is left disabled.
+storage:
+  artifacts:
+    enabled: true
+    existingClaim: example-artifacts

@@ -87,7 +87,7 @@ OPENMETTLE_K8S_QUALIFICATION=isolated-dev OPENMETTLE_K8S_DOCKER_CONTEXT=default 
 
 ## Limitations
 
-- One single-node kind cluster on amd64, Kubernetes 1.37.0. No storage, ingress, TLS or multi-node scheduling.
+- One single-node kind cluster on amd64, Kubernetes 1.37.0. No storage, ingress, TLS or multi-node scheduling. The I4 options (artifact volume, database CA, Ingress and API PDB) stay at their off defaults, and check 5 asserts that the release has no PVC, Ingress or PodDisruptionBudget. They are covered by the render tests and kubeconform only.
 - NetworkPolicy enforcement depends on kind v0.33's built-in `kindnet` (which runs `kube-network-policies` fail-open). If `kindnet` does not enforce NetworkPolicy on the hosted runner, check 9 fails loudly rather than passing vacuously; installing a third-party CNI (such as Calico or Cilium) in the smoke cluster would require owner sign-off and a pinned upstream entry.
 - Images are built locally. Registry pulls, pull secrets and published digests are not exercised.
 - Not a qualification of the owner's cluster. That remains an owner action.

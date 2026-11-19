@@ -39,7 +39,8 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ int64 $values.terminationGracePeriodSeconds }}
-      {{- include "openmettle-core.podSecurityContext" $root | nindent 6 }}
+      {{- $volumes := dict "root" $root "artifacts" $root.Values.storage.artifacts.enabled }}
+      {{- include "openmettle-core.podSecurityContext" (dict "storage" $root.Values.storage.artifacts.enabled) | nindent 6 }}
       {{- with $root.Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
@@ -85,6 +86,12 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- include "openmettle-core.containerSecurityContext" $root | nindent 10 }}
+          {{- with include "openmettle-core.volumeMounts" $volumes | trim }}
+          {{- . | nindent 10 }}
+          {{- end }}
+      {{- with include "openmettle-core.volumes" $volumes | trim }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- with $values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

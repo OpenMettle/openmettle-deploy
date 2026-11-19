@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Lint and render the core chart for each synthetic values set, then validate the output with
-# kubeconform against pinned Kubernetes schemas. Uses helm and kubeconform from PATH, or HELM and
-# KUBECONFORM. Negative cases and policy assertions live in the Python unit tests.
+# Lint and render the core chart for each synthetic values set and each standalone example in
+# examples/, then validate the output with kubeconform against pinned Kubernetes schemas. Uses helm
+# and kubeconform from PATH, or HELM and KUBECONFORM. Negative cases and policy assertions live in
+# the Python unit tests.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -25,8 +26,12 @@ matrix=(
   "openmettle all-keys.yaml"
   "openmettle migration-disabled.yaml"
   "openmettle network-policy-disabled.yaml"
+  "openmettle storage-existing-claim.yaml"
+  "openmettle ingress-network-policy-disabled.yaml"
   "123 yaml-ambiguous.yaml"
 )
+# Standalone private-overlay examples, rendered without minimal.yaml.
+examples=("$root/examples/values-synthetic.yaml")
 
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
@@ -48,6 +53,13 @@ for entry in "${matrix[@]}"; do
   echo "== $entry"
   "$helm" lint --strict "$chart" "${args[@]}"
   "$helm" template "$release" "$chart" "${args[@]}" > "$out/rendered.yaml"
+  "$kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
+    -schema-location "$schema_location" "$out/rendered.yaml"
+done
+for example in "${examples[@]}"; do
+  echo "== example ${example#"$root"/}"
+  "$helm" lint --strict "$chart" -f "$example"
+  "$helm" template openmettle "$chart" --namespace openmettle -f "$example" > "$out/rendered.yaml"
   "$kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
     -schema-location "$schema_location" "$out/rendered.yaml"
 done

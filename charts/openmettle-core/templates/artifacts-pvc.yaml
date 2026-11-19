@@ -1,0 +1,29 @@
+{{- /*
+Chart-owned artifact claim, rendered only when storage.artifacts is enabled without an
+existingClaim. Helm keeps it on uninstall (helm.sh/resource-policy: keep) so that artifacts
+survive; reinstalling then needs storage.artifacts.existingClaim set to this claim's name.
+*/ -}}
+{{- $artifacts := .Values.storage.artifacts }}
+{{- if and $artifacts.enabled (not $artifacts.existingClaim) }}
+{{- $context := dict "root" . "component" "storage" }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "openmettle-core.artifactsClaimName" . | quote }}
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+  {{- /* The keep policy takes precedence over a user annotation with the same key. */}}
+  annotations:
+    {{- toYaml (merge (dict "helm.sh/resource-policy" "keep") (deepCopy $artifacts.annotations)) | nindent 4 }}
+spec:
+  accessModes:
+    {{- range $artifacts.accessModes }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- if not (kindIs "invalid" $artifacts.storageClassName) }}
+  storageClassName: {{ $artifacts.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $artifacts.size | quote }}
+{{- end }}
