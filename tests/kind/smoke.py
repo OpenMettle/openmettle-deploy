@@ -59,6 +59,8 @@ SECRET = {"api": "openmettle-api-database", "worker": "openmettle-worker-databas
           "migrate": "openmettle-owner-database"}
 DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "openmettle_owner"}
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
+# Helm 4 has no `list --all`; these status filters together list releases in every state.
+HELM_EVERY_STATUS = ("--deployed", "--failed", "--pending", "--superseded", "--uninstalled", "--uninstalling")
 MIGRATION_DEADLINE_SECONDS = 120
 OPTIONAL_KINDS = "networkpolicies,ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
 RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets"
@@ -639,7 +641,7 @@ class Smoke:
         self.expect(inventory == expected_release_objects(), f"release objects: {inventory}")
         optional = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", OPTIONAL_KINDS)["items"])
         self.expect(not optional, f"optional objects present: {optional}")
-        releases = json.loads(self.run([*self.helm[:5], "list", "--all-namespaces", "--all",
+        releases = json.loads(self.run([*self.helm[:5], "list", "--all-namespaces", *HELM_EVERY_STATUS,
                                         "--output", "json"]).stdout)
         self.expect([r["name"] for r in releases] == [RELEASE], f"other Helm releases: {releases}")
         all_pods = self.kube_json("--namespace", APP_NAMESPACE, "get", "pods")["items"]
@@ -700,7 +702,7 @@ class Smoke:
                                                 "--selector", f"kubernetes.io/service-name={FULLNAME}-api")["items"])
             return left
         self.wait_for("release objects to be removed", lambda: not residue(), timeout=120)
-        releases = json.loads(self.helm_run("list", "--all", "--output", "json").stdout)
+        releases = json.loads(self.helm_run("list", *HELM_EVERY_STATUS, "--output", "json").stdout)
         self.expect(releases == [], f"Helm still lists a release: {releases}")
         # The test, not the chart, owns the URL Secrets: uninstall must leave them alone.
         remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "secrets",
