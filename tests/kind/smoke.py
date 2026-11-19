@@ -154,6 +154,24 @@ def parse_cri_image_id(output: str) -> str:
     return image_id
 
 
+def parse_cri_container_image_id(output: str) -> str:
+    """Return the image id of the single container in `crictl ps --id <id> --output json`.
+
+    `crictl ps` reports the container's image id directly. Unlike `crictl inspect`, its output
+    carries no container environment, so no Secret value can reach the job log.
+    """
+    try:
+        (container,) = json.loads(output)["containers"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SmokeFailure("crictl ps did not return exactly one container") from exc
+    candidates = [container.get("imageId"), (container.get("image") or {}).get("image"),
+                  container.get("imageRef")]
+    for candidate in candidates:
+        if isinstance(candidate, str) and DIGEST.fullmatch(candidate):
+            return candidate
+    raise SmokeFailure("crictl ps reported no image id for the container")
+
+
 def tag_reference(role: str, run_id: str) -> str:
     return f"{REGISTRY}/openmettle/{role}:smoke-{run_id}"
 
@@ -556,14 +574,18 @@ class Smoke:
                 image = self.report["images"][component]
                 self.expect(container["image"] == image["reference"] and container["imagePullPolicy"] == "Never",
                             f"{component} pod does not run {image['reference']} with pullPolicy Never")
-                # The kubelet reports one digested name of the running image, or its image id. It
-                # may pick the `import-<date>@sha256:...` name `kind load` created, whose digest is
-                # not the tag's, so resolve the reported name through CRI and require the same image.
-                running = pod["status"]["containerStatuses"][0].get("imageID", "")
-                self.expect(bool(running) and (
-                    running == image["cri_image_id"]
-                    or self.cri_image_id(running, check=False) == image["cri_image_id"]),
-                    f"{component} container runs {running or 'an unknown image'}, not {image['reference']}")
+                # The kubelet's imageID is one digested name of the image (often the
+                # `import-<date>@sha256:...` name `kind load` created), so ask CRI for the running
+                # container's image id instead and require the image the digest reference resolved to.
+                status = pod["status"]["containerStatuses"][0]
+                container_id = status.get("containerID", "").removeprefix("containerd://")
+                self.expect(bool(container_id), f"{component} container has no containerd id")
+                running = parse_cri_container_image_id(self.node_exec(
+                    "crictl", "ps", "--id", container_id, "--output", "json").stdout)
+                self.expect(running == image["cri_image_id"],
+                            f"{component} container runs image {running} (kubelet reports "
+                            f"{status.get('imageID') or 'nothing'}), not {image['cri_image_id']} "
+                            f"resolved from {image['reference']}")
         self.expect(not self.kube("--namespace", APP_NAMESPACE, "get", "job", f"{FULLNAME}-migrate",
                                   "--ignore-not-found", "--output=name").stdout.strip(),
                     "migrate Job remains after success (hook-succeeded delete policy)")

@@ -446,3 +446,22 @@ class CoreGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CriContainerImageIdTests(unittest.TestCase):
+    ID = "sha256:" + "a" * 64
+
+    def test_reads_the_image_id_of_the_single_container(self):
+        for container in ({"imageId": self.ID}, {"image": {"image": self.ID}},
+                          {"imageRef": self.ID}, {"image": {"image": "repo:tag"}, "imageRef": self.ID}):
+            with self.subTest(container=container):
+                self.assertEqual(smoke.parse_cri_container_image_id(
+                    json.dumps({"containers": [container]})), self.ID)
+
+    def test_refuses_missing_ambiguous_or_malformed_output(self):
+        for output in ("not json", json.dumps({}), json.dumps({"containers": []}),
+                       json.dumps({"containers": [{"imageId": self.ID}, {"imageId": self.ID}]}),
+                       json.dumps({"containers": [{"imageRef": "docker.io/library/import@sha256:" + "b" * 64}]})):
+            with self.subTest(output=output[:40]):
+                with self.assertRaises(smoke.SmokeFailure):
+                    smoke.parse_cri_container_image_id(output)
