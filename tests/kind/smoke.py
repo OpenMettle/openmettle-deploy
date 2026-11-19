@@ -556,10 +556,14 @@ class Smoke:
                 image = self.report["images"][component]
                 self.expect(container["image"] == image["reference"] and container["imagePullPolicy"] == "Never",
                             f"{component} pod does not run {image['reference']} with pullPolicy Never")
-                # containerd reports a digested name of the running image, or its image id.
+                # The kubelet reports one digested name of the running image, or its image id. It
+                # may pick the `import-<date>@sha256:...` name `kind load` created, whose digest is
+                # not the tag's, so resolve the reported name through CRI and require the same image.
                 running = pod["status"]["containerStatuses"][0].get("imageID", "")
-                self.expect(running.endswith("@" + self.digests[component]) or running == image["cri_image_id"],
-                            f"{component} container runs {running or 'an unknown image'}, not {image['reference']}")
+                self.expect(bool(running) and (
+                    running == image["cri_image_id"]
+                    or self.cri_image_id(running, check=False) == image["cri_image_id"]),
+                    f"{component} container runs {running or 'an unknown image'}, not {image['reference']}")
         self.expect(not self.kube("--namespace", APP_NAMESPACE, "get", "job", f"{FULLNAME}-migrate",
                                   "--ignore-not-found", "--output=name").stdout.strip(),
                     "migrate Job remains after success (hook-succeeded delete policy)")

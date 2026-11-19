@@ -10,7 +10,7 @@ Every assertion reads live cluster, Helm, containerd or PostgreSQL state. A rend
 
 | # | Check | Observed through |
 | --- | --- | --- |
-| 1 | api, worker and migrate install by digest from core `5cd8a9d` | Pod spec `image` is `<registry>/openmettle/<role>@sha256:…` with `imagePullPolicy: Never`. The digest is read back from the node's containerd and resolved through CRI. Kubelet reports each reference as already present, and the running container's `imageID` carries the same digest. |
+| 1 | api, worker and migrate install by digest from core `5cd8a9d` | Pod spec `image` is `<registry>/openmettle/<role>@sha256:…` with `imagePullPolicy: Never`. The digest is read back from the node's containerd and resolved through CRI. Kubelet reports each reference as already present, and the running container's reported `imageID` resolves through CRI to the same image. It may name the `import-<date>@sha256:…` alias that `kind load` created. |
 | 2 | Migration hook completes before the Deployments exist | A `Completed` event for the migrate Job precedes both Deployments' `creationTimestamp`. `openmettle._sqlx_migrations` holds only successful rows. The Job is deleted afterwards (`hook-succeeded`). |
 | 3 | API and worker Ready; `/readyz` 200 | Helm `--wait=watcher`, `readyReplicas`, the pod `Ready` condition, zero restarts, and HTTP through `kubectl port-forward` to the API Service |
 | 4 | Worker scales to 2 while the API stays at 1 | `helm upgrade` with `worker.replicas: 2`. The API pod is unchanged. |
