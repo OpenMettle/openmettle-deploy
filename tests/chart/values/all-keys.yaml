@@ -1,0 +1,60 @@
+# Synthetic overlay on minimal.yaml that sets every I1 key to a non-default value.
+# Non-installable: reserved example names and all-zero digests.
+images:
+  pullPolicy: Never
+  pullSecrets: [example-pull-secret]
+  api:
+    registry: registry.example.test:5000
+database:
+  api:
+    key: api-url
+  worker:
+    key: worker-url
+  migrate:
+    key: owner-url
+  connectionBudget: 40
+api:
+  replicas: 2
+  resources:
+    requests: {cpu: 200m, memory: 128Mi}
+    limits: {cpu: "1", memory: 256Mi, ephemeral-storage: 64Mi}
+  serviceAccount:
+    create: false
+    name: example-api
+  settings: {dbMaxConnections: 6, dbTimeoutMs: 2500, shutdownTimeoutMs: 8000}
+  terminationGracePeriodSeconds: 20
+  strategy: {maxSurge: 0, maxUnavailable: 1}
+  service: {port: 80}
+  podAnnotations: {example.test/note: synthetic}
+  nodeSelector: {kubernetes.io/os: linux}
+  tolerations:
+    - {key: example.test/dedicated, operator: Equal, value: openmettle, effect: NoSchedule}
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels: {app.kubernetes.io/component: api}
+worker:
+  replicas: 3
+  resources:
+    requests: {cpu: 150m, memory: 96Mi}
+  serviceAccount:
+    create: true
+    name: example-worker
+    annotations: {example.test/role: worker}
+  settings: {dbMaxConnections: 2, dbTimeoutMs: 1000, shutdownTimeoutMs: 3000}
+  terminationGracePeriodSeconds: 10
+  strategy: {maxSurge: 2, maxUnavailable: 0}
+  podAnnotations: {example.test/note: synthetic}
+  nodeSelector: {kubernetes.io/os: linux}
+migration:
+  settings: {connectTimeoutMs: 10000, lockTimeoutMs: 30000, statementTimeoutMs: 600000}
+  activeDeadlineSeconds: 1800
+  resources:
+    requests: {cpu: 50m, memory: 32Mi}
+  serviceAccount:
+    create: true
+    annotations: {example.test/role: migrate}

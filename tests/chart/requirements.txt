@@ -1,0 +1,7 @@
+# Test-only dependency for tests/chart; never part of the chart or any image. Provenance: UPSTREAM.md.
+# PyYAML 6.0.3 (MIT), https://pypi.org/project/PyYAML/6.0.3/. The hash is for the CPython 3.12
+# manylinux x86_64 wheel used by hosted CI (ubuntu-24.04), resolved 2026-11-19 from the PyPI JSON
+# API and checked against the downloaded wheel. Install with:
+#   pip install --require-hashes --only-binary :all: --no-deps -r tests/chart/requirements.txt
+PyYAML==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc

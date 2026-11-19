@@ -1,0 +1,23 @@
+{
+  "status": "deploy input fixture; not a Kubernetes manifest or qualified resource sizing",
+  "api": {
+    "imageTarget": "api",
+    "configurationPrefix": "OPENMETTLE_API_",
+    "port": 8080,
+    "serviceAccountName": "openmettle-api",
+    "automountServiceAccountToken": false,
+    "requests": {"cpu": "100m", "memory": "64Mi"},
+    "livenessPath": "/healthz",
+    "readinessPath": "/readyz"
+  },
+  "worker": {
+    "imageTarget": "worker",
+    "configurationPrefix": "OPENMETTLE_WORKER_",
+    "port": 8081,
+    "serviceAccountName": "openmettle-worker",
+    "automountServiceAccountToken": false,
+    "requests": {"cpu": "100m", "memory": "64Mi"},
+    "livenessPath": "/healthz",
+    "readinessPath": "/readyz"
+  }
+}

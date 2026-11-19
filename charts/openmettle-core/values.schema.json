@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "openmettle-core chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["images", "database", "api", "worker", "migration"],
+  "properties": {
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pullPolicy", "pullSecrets", "api", "worker", "migrate"],
+      "properties": {
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]},
+        "pullSecrets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/dnsSubdomain"}
+        },
+        "api": {"$ref": "#/$defs/image"},
+        "worker": {"$ref": "#/$defs/image"},
+        "migrate": {"$ref": "#/$defs/image"}
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "worker", "migrate"],
+      "properties": {
+        "api": {"$ref": "#/$defs/secretKeyRef"},
+        "worker": {"$ref": "#/$defs/secretKeyRef"},
+        "migrate": {"$ref": "#/$defs/secretKeyRef"},
+        "connectionBudget": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "replicas", "resources", "serviceAccount", "settings", "terminationGracePeriodSeconds",
+        "strategy", "service", "podAnnotations", "nodeSelector", "tolerations", "affinity"
+      ],
+      "properties": {
+        "replicas": {"$ref": "#/$defs/replicas"},
+        "resources": {"$ref": "#/$defs/resources"},
+        "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
+        "settings": {"$ref": "#/$defs/processSettings"},
+        "terminationGracePeriodSeconds": {"$ref": "#/$defs/gracePeriod"},
+        "strategy": {"$ref": "#/$defs/strategy"},
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["port"],
+          "properties": {
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        },
+        "podAnnotations": {"$ref": "#/$defs/stringMap"},
+        "nodeSelector": {"$ref": "#/$defs/stringMap"},
+        "tolerations": {"$ref": "#/$defs/tolerations"},
+        "affinity": {"$ref": "#/$defs/affinity"}
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "replicas", "resources", "serviceAccount", "settings", "terminationGracePeriodSeconds",
+        "strategy", "podAnnotations", "nodeSelector", "tolerations", "affinity"
+      ],
+      "properties": {
+        "replicas": {"$ref": "#/$defs/replicas"},
+        "resources": {"$ref": "#/$defs/resources"},
+        "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
+        "settings": {"$ref": "#/$defs/processSettings"},
+        "terminationGracePeriodSeconds": {"$ref": "#/$defs/gracePeriod"},
+        "strategy": {"$ref": "#/$defs/strategy"},
+        "podAnnotations": {"$ref": "#/$defs/stringMap"},
+        "nodeSelector": {"$ref": "#/$defs/stringMap"},
+        "tolerations": {"$ref": "#/$defs/tolerations"},
+        "affinity": {"$ref": "#/$defs/affinity"}
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "settings", "activeDeadlineSeconds", "resources", "serviceAccount"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "settings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["connectTimeoutMs", "lockTimeoutMs", "statementTimeoutMs"],
+          "properties": {
+            "connectTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "lockTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 600000},
+            "statementTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 3600000}
+          }
+        },
+        "activeDeadlineSeconds": {"type": "integer", "minimum": 1},
+        "resources": {"$ref": "#/$defs/resources"},
+        "serviceAccount": {"$ref": "#/$defs/serviceAccount"}
+      }
+    }
+  },
+  "$defs": {
+    "dnsSubdomain": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+    },
+    "optionalDnsSubdomain": {
+      "anyOf": [{"const": ""}, {"$ref": "#/$defs/dnsSubdomain"}]
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "repository", "digest"],
+      "properties": {
+        "registry": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*(:[0-9]{1,5})?)?$"
+        },
+        "repository": {
+          "description": "Repository path without registry, tag or digest.",
+          "type": "string",
+          "pattern": "^([a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*)?$"
+        },
+        "digest": {
+          "description": "Required before rendering; empty only in chart defaults.",
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64})?$"
+        }
+      }
+    },
+    "secretKeyRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["existingSecret", "key"],
+      "properties": {
+        "existingSecret": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "key": {"type": "string", "maxLength": 253, "pattern": "^[-._a-zA-Z0-9]+$"}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "annotations": {"$ref": "#/$defs/stringMap"}
+      }
+    },
+    "quantity": {
+      "type": ["string", "number"],
+      "minimum": 0,
+      "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|Ki|M|Mi|G|Gi|T|Ti|P|Pi|E|Ei)?$"
+    },
+    "resourceList": {
+      "description": "CPU, memory and ephemeral storage only; the core chart never requests devices.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {"$ref": "#/$defs/quantity"},
+        "memory": {"$ref": "#/$defs/quantity"},
+        "ephemeral-storage": {"$ref": "#/$defs/quantity"}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {"$ref": "#/$defs/resourceList"},
+        "limits": {"$ref": "#/$defs/resourceList"}
+      }
+    },
+    "toleration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {"type": "string"},
+        "operator": {"enum": ["Exists", "Equal"]},
+        "value": {"type": "string"},
+        "effect": {"enum": ["", "NoSchedule", "PreferNoSchedule", "NoExecute"]},
+        "tolerationSeconds": {"type": "integer"}
+      }
+    },
+    "affinity": {
+      "description": "Passed through to the pod spec; Kubernetes validates the nested structure.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nodeAffinity": {"type": "object"},
+        "podAffinity": {"type": "object"},
+        "podAntiAffinity": {"type": "object"}
+      }
+    },
+    "tolerations": {"type": "array", "items": {"$ref": "#/$defs/toleration"}},
+    "replicas": {"type": "integer", "minimum": 0},
+    "gracePeriod": {
+      "description": "Seconds; rendering fails unless it exceeds settings.shutdownTimeoutMs.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "processSettings": {
+      "description": "Bounds match core src/lib.rs.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dbMaxConnections", "dbTimeoutMs", "shutdownTimeoutMs"],
+      "properties": {
+        "dbMaxConnections": {"type": "integer", "minimum": 1, "maximum": 64},
+        "dbTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 30000},
+        "shutdownTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 60000}
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxSurge", "maxUnavailable"],
+      "properties": {
+        "maxSurge": {"type": "integer", "minimum": 0},
+        "maxUnavailable": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

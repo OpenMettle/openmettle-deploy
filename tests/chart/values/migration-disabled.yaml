@@ -1,0 +1,11 @@
+# Synthetic overlay on minimal.yaml: migrations run out of band, so no Job, owner Secret or migrate image.
+images:
+  migrate:
+    registry: ""
+    repository: ""
+    digest: ""
+database:
+  migrate:
+    existingSecret: ""
+migration:
+  enabled: false

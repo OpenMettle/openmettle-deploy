@@ -1,0 +1,22 @@
+# Synthetic, non-installable values: the smallest set the chart accepts.
+# registry.example.test is reserved (RFC 2606) and the all-zero digests name no real image.
+images:
+  api:
+    registry: registry.example.test
+    repository: openmettle/api
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  worker:
+    registry: registry.example.test
+    repository: openmettle/worker
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  migrate:
+    registry: registry.example.test
+    repository: openmettle/migrate
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+database:
+  api:
+    existingSecret: openmettle-api-database
+  worker:
+    existingSecret: openmettle-worker-database
+  migrate:
+    existingSecret: openmettle-owner-database
