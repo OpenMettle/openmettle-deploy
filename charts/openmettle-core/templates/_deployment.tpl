@@ -9,6 +9,7 @@ Arguments: dict "root" $ "component" "api|worker" "port" <container port>
 {{- $settings := $values.settings -}}
 {{- $prefix := printf "OPENMETTLE_%s_" (upper $component) -}}
 {{- $context := dict "root" $root "component" $component -}}
+{{- $auth := and (eq $component "api") $root.Values.auth.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,8 +40,8 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ int64 $values.terminationGracePeriodSeconds }}
-      {{- $volumes := dict "root" $root "artifacts" $root.Values.storage.artifacts.enabled }}
-      {{- include "openmettle-core.podSecurityContext" (dict "storage" $root.Values.storage.artifacts.enabled) | nindent 6 }}
+      {{- $volumes := dict "root" $root "artifacts" $root.Values.storage.artifacts.enabled "auth" $auth }}
+      {{- include "openmettle-core.podSecurityContext" (dict "storage" $root.Values.storage.artifacts.enabled "auth" $auth) | nindent 6 }}
       {{- with $root.Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
@@ -66,6 +67,10 @@ spec:
               value: {{ int64 $settings.dbTimeoutMs | quote }}
             - name: {{ $prefix }}SHUTDOWN_TIMEOUT_MS
               value: {{ int64 $settings.shutdownTimeoutMs | quote }}
+            {{- if $auth }}
+            - name: OPENMETTLE_API_AUTH_CONFIG
+              value: {{ include "openmettle-core.authConfigPath" $root | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

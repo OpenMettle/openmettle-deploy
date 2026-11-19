@@ -72,25 +72,37 @@ valueFrom:
 
 {{/*
 Matches the core images (USER 65532:65532) and the restricted Pod Security Standard.
-Arguments: dict "storage" <bool>. fsGroup is set only on pods that mount the artifact volume, so
-that a freshly provisioned volume is writable by the non-root user.
+Arguments: dict "storage" <bool> "auth" <bool>. fsGroup is set on pods that mount the artifact
+volume (so a freshly provisioned volume is writable by the non-root user) or the API login keys
+Secret (so mode 0440 key files are readable by GID 65532 without world-read permission).
+fsGroupChangePolicy applies only to persistent volumes.
 */}}
 {{- define "openmettle-core.podSecurityContext" -}}
 securityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
-  {{- if .storage }}
+  {{- if or .storage .auth }}
   fsGroup: 65532
+  {{- end }}
+  {{- if .storage }}
   fsGroupChangePolicy: OnRootMismatch
   {{- end }}
   seccompProfile:
     type: RuntimeDefault
 {{- end -}}
 
-{{/* Fixed in-pod paths. The database URL's sslrootcert must name the CA file exactly. */}}
+{{/*
+Fixed in-pod paths. The database URL's sslrootcert must name the CA file exactly. Auth paths are
+non-overlapping sibling directories under /etc/openmettle so read-only ConfigMap mounts never block
+nested mountpoints under containerd/runc.
+*/}}
 {{- define "openmettle-core.artifactsMountPath" -}}/var/lib/openmettle/artifacts{{- end -}}
 {{- define "openmettle-core.databaseCaDirectory" -}}/etc/openmettle/db-ca{{- end -}}
+{{- define "openmettle-core.authConfigDirectory" -}}/etc/openmettle/auth{{- end -}}
+{{- define "openmettle-core.authConfigPath" -}}/etc/openmettle/auth/auth.json{{- end -}}
+{{- define "openmettle-core.authLoginKeysDirectory" -}}/etc/openmettle/auth-keys{{- end -}}
+{{- define "openmettle-core.authProviderCaDirectory" -}}/etc/openmettle/auth-ca{{- end -}}
 
 {{/* Arguments: the root context. Name of the claim the artifact volume mounts. */}}
 {{- define "openmettle-core.artifactsClaimName" -}}
@@ -98,13 +110,18 @@ securityContext:
 {{- end -}}
 
 {{/*
-Volumes and mounts for one pod. Arguments: dict "root" $ "artifacts" <bool>. The database CA is
-mounted into every component (api, worker, migrate) when enabled; the artifact volume only where
-"artifacts" is true. Each helper renders nothing when no volume applies.
+Volumes and mounts for one pod. Arguments: dict "root" $ "artifacts" <bool> "auth" <bool>. The
+database CA is mounted into every component (api, worker, migrate) when enabled; the artifact
+volume only where "artifacts" is true (api and worker); auth config, login keys and optional
+provider CA only where "auth" is true (api only). Each helper renders nothing when no volume
+applies.
 */}}
 {{- define "openmettle-core.volumes" -}}
 {{- $ca := .root.Values.database.caBundle -}}
-{{- if or $ca.enabled .artifacts }}
+{{- $auth := .root.Values.auth -}}
+{{- $mountAuth := and .auth $auth.enabled -}}
+{{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
+{{- if or $ca.enabled .artifacts $mountAuth }}
 volumes:
   {{- if .artifacts }}
   - name: artifacts
@@ -119,12 +136,36 @@ volumes:
         - key: {{ $ca.key | quote }}
           path: ca.crt
   {{- end }}
+  {{- if $mountAuth }}
+  - name: auth-config
+    configMap:
+      name: {{ required "auth.configMapName is required when auth.enabled is true" $auth.configMapName | quote }}
+      items:
+        - key: {{ $auth.configKey | quote }}
+          path: auth.json
+  - name: auth-login-keys
+    secret:
+      secretName: {{ required "auth.loginKeysSecretName is required when auth.enabled is true" $auth.loginKeysSecretName | quote }}
+      # 0440 octal: readable by root and pod fsGroup 65532 only, never world-readable.
+      defaultMode: 288
+  {{- end }}
+  {{- if $mountProviderCa }}
+  - name: auth-provider-ca
+    configMap:
+      name: {{ required "auth.providerCaBundle.configMapName is required when auth.providerCaBundle.enabled is true" $auth.providerCaBundle.configMapName | quote }}
+      items:
+        - key: {{ $auth.providerCaBundle.key | quote }}
+          path: ca.crt
+  {{- end }}
 {{- end }}
 {{- end -}}
 
 {{- define "openmettle-core.volumeMounts" -}}
 {{- $ca := .root.Values.database.caBundle -}}
-{{- if or $ca.enabled .artifacts }}
+{{- $auth := .root.Values.auth -}}
+{{- $mountAuth := and .auth $auth.enabled -}}
+{{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
+{{- if or $ca.enabled .artifacts $mountAuth }}
 volumeMounts:
   {{- if .artifacts }}
   - name: artifacts
@@ -133,6 +174,19 @@ volumeMounts:
   {{- if $ca.enabled }}
   - name: db-ca
     mountPath: {{ include "openmettle-core.databaseCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountAuth }}
+  - name: auth-config
+    mountPath: {{ include "openmettle-core.authConfigDirectory" . | quote }}
+    readOnly: true
+  - name: auth-login-keys
+    mountPath: {{ include "openmettle-core.authLoginKeysDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountProviderCa }}
+  - name: auth-provider-ca
+    mountPath: {{ include "openmettle-core.authProviderCaDirectory" . | quote }}
     readOnly: true
   {{- end }}
 {{- end }}
@@ -206,7 +260,7 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- if not .Values.networkPolicy.dns.to -}}
 {{- fail "networkPolicy.dns.to must list at least one DNS peer when networkPolicy.enabled is true (an empty list would allow egress to every destination on port 53)" -}}
 {{- end -}}
-{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) -}}
 {{- range $i, $peer := $entry.peers -}}
 {{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
 {{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
@@ -342,6 +396,41 @@ and are not counted; see the chart README.
 {{- $total := add $api $worker 1 -}}
 {{- if gt (int64 $total) (int64 .) -}}
 {{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d (replicas plus maxSurge, times dbMaxConnections) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker)) -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Browser sign-in / OIDC (core ADR 0025). Mounted into the API pod only; never into worker or
+migrate pods. The checks repeat the schema for --skip-schema-validation and enforce cross-field
+provider CA and NetworkPolicy egress guards.
+*/ -}}
+{{- $auth := .Values.auth -}}
+{{- if $auth.enabled -}}
+{{- if not $auth.configMapName -}}
+{{- fail "auth.configMapName is required when auth.enabled is true (an existing ConfigMap holding the version-2 auth settings document)" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $auth.configKey))) (has (toString $auth.configKey) (list "." "..")) -}}
+{{- fail "auth.configKey must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
+{{- end -}}
+{{- if not $auth.loginKeysSecretName -}}
+{{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
+{{- end -}}
+{{- if $auth.providerCaBundle.enabled -}}
+{{- if not $auth.providerCaBundle.configMapName -}}
+{{- fail "auth.providerCaBundle.configMapName is required when auth.providerCaBundle.enabled is true (an existing ConfigMap holding the PEM CA bundle)" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $auth.providerCaBundle.key))) (has (toString $auth.providerCaBundle.key) (list "." "..")) -}}
+{{- fail "auth.providerCaBundle.key must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
+{{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
+{{- end -}}
+{{- else -}}
+{{- if $auth.providerCaBundle.enabled -}}
+{{- fail "auth.providerCaBundle.enabled cannot be true when auth.enabled is false" -}}
+{{- end -}}
+{{- if .Values.networkPolicy.api.oidc.to -}}
+{{- fail "networkPolicy.api.oidc.to must be empty when auth.enabled is false; remove OIDC egress peers or enable auth" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

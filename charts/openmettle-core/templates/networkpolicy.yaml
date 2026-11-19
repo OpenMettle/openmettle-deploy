@@ -24,7 +24,7 @@ spec:
     - Ingress
     - Egress
 ---
-{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "api" "ingressFrom" .Values.networkPolicy.api.ingressFrom "port" 8080) }}
+{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "api" "ingressFrom" .Values.networkPolicy.api.ingressFrom "port" 8080 "oidc" .Values.auth.enabled) }}
 ---
 {{ include "openmettle-core.networkPolicy" (dict "root" . "component" "worker") }}
 {{- if .Values.migration.enabled }}

@@ -3,7 +3,7 @@
   "title": "openmettle-core chart values",
   "type": "object",
   "additionalProperties": false,
-  "required": ["images", "database", "api", "worker", "migration", "networkPolicy", "storage", "ingress"],
+  "required": ["images", "database", "api", "worker", "migration", "networkPolicy", "storage", "ingress", "auth"],
   "properties": {
     "images": {
       "type": "object",
@@ -145,9 +145,19 @@
         "api": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ingressFrom"],
+          "required": ["ingressFrom", "oidc"],
           "properties": {
-            "ingressFrom": {"$ref": "#/$defs/networkPolicyPeers"}
+            "ingressFrom": {"$ref": "#/$defs/networkPolicyPeers"},
+            "oidc": {
+              "description": "OIDC provider peers reachable from the API pod only. Required while auth.enabled and networkPolicy.enabled are true; must be empty while auth.enabled is false.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "port"],
+              "properties": {
+                "to": {"$ref": "#/$defs/networkPolicyPeers"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            }
           }
         },
         "dns": {
@@ -240,6 +250,47 @@
           "className": {"minLength": 1},
           "hosts": {"minItems": 1},
           "tls": {"minItems": 1}
+        }
+      }
+    },
+    "auth": {
+      "description": "Optional browser sign-in / OIDC configuration mounted into the API pod only (core ADR 0025). Never mounted into worker or migrate pods.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "configMapName", "configKey", "loginKeysSecretName", "providerCaBundle"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "configKey": {"$ref": "#/$defs/configMapKey"},
+        "loginKeysSecretName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "providerCaBundle": {
+          "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/auth-ca/ca.crt in the API pod only.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "configMapName", "key"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "key": {"$ref": "#/$defs/configMapKey"}
+          },
+          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+          "then": {"properties": {"configMapName": {"minLength": 1}}}
+        }
+      },
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {
+        "properties": {
+          "configMapName": {"minLength": 1},
+          "loginKeysSecretName": {"minLength": 1}
+        }
+      },
+      "else": {
+        "properties": {
+          "providerCaBundle": {
+            "properties": {
+              "enabled": {"const": false}
+            }
+          }
         }
       }
     }

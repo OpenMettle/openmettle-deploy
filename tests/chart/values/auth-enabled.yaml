@@ -1,0 +1,12 @@
+# Synthetic overlay on minimal.yaml: browser sign-in / OIDC enabled alone (no artifacts volume,
+# no database CA, no optional provider CA) with default configKey (auth.json) and OIDC port (443).
+auth:
+  enabled: true
+  configMapName: example-auth-config
+  loginKeysSecretName: example-auth-login-keys
+networkPolicy:
+  api:
+    oidc:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.20/32

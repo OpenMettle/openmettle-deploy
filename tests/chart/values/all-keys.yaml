@@ -87,6 +87,17 @@ networkPolicy:
       - ipBlock:
           cidr: 192.0.2.0/24
           except: [192.0.2.128/25]
+    oidc:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: example-identity
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: example-oidc
+        - ipBlock:
+            cidr: 198.51.100.50/32
+      port: 8443
   dns:
     to:
       - ipBlock:
@@ -117,3 +128,13 @@ ingress:
   tls:
     - secretName: example-openmettle-tls
       hosts: [openmettle.example.test]
+# Reserved synthetic ConfigMap and Secret names for API-only browser sign-in / OIDC (I5).
+auth:
+  enabled: true
+  configMapName: example-auth-config
+  configKey: browser-auth.json
+  loginKeysSecretName: example-auth-login-keys
+  providerCaBundle:
+    enabled: true
+    configMapName: example-oidc-ca
+    key: idp-ca.pem

@@ -137,6 +137,12 @@ networkPolicy:
     # Peers (Kubernetes NetworkPolicyPeer) that may connect to the API on TCP 8080, for example an
     # ingress controller. Empty: no pod may connect. Kubelet probes come from the node, not a peer.
     ingressFrom: []
+    oidc:
+      # Required when auth.enabled and networkPolicy.enabled are true: OIDC provider peers that the
+      # API (and never worker or migrate) may reach on `port`. Must stay empty while auth.enabled is
+      # false so unused egress is never opened.
+      to: []
+      port: 443
   dns:
     # Peers that every component may query on UDP and TCP 53. The default matches the CoreDNS pods
     # of kubeadm (kind) and K3s. Rendering fails if this is empty while enabled.
@@ -184,3 +190,25 @@ ingress:
   hosts: []
   # Existing TLS Secrets ({secretName, hosts}); the chart never creates Secrets.
   tls: []
+
+auth:
+  # Optional browser sign-in / OIDC configuration mounted into the API pod only (core ADR 0025).
+  # Off by default: when false, OPENMETTLE_API_AUTH_CONFIG is unset and no auth files are mounted.
+  # The chart never creates ConfigMaps or Secrets, and never mounts auth config, login keys or the
+  # provider CA into worker or migrate pods.
+  enabled: false
+  # Existing ConfigMap holding a version-2 auth settings document (core ADR 0020). Projected
+  # read-only at /etc/openmettle/auth/auth.json and passed via OPENMETTLE_API_AUTH_CONFIG.
+  configMapName: ""
+  configKey: auth.json
+  # Existing Secret holding raw 32-byte login key files referenced by the auth document. Mounted
+  # read-only at /etc/openmettle/auth-keys (mode 0440, pod fsGroup 65532) in the API pod only.
+  loginKeysSecretName: ""
+  # Optional CA bundle for verifying private/cluster-CA OIDC providers (for example in-cluster
+  # Keycloak). When enabled, one key of an existing ConfigMap is mounted read-only at
+  # /etc/openmettle/auth-ca/ca.crt in the API pod only. Reference it via providers[].trust:
+  # {"roots": "bundle", "bundle_path": "/etc/openmettle/auth-ca/ca.crt"}.
+  providerCaBundle:
+    enabled: false
+    configMapName: ""
+    key: ca.crt
