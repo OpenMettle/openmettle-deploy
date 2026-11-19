@@ -824,7 +824,11 @@ class Smoke:
                                "--container", probe["container"], "--", *probe["command"],
                                check=False, timeout=PROBE_SECONDS + 60)
             outcome = probe_outcome(result.returncode, result.stdout, result.stderr, probe["http"])
-            _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']})")
+            if outcome == "inconclusive" or outcome == "unexpected-response":
+                detail = redacted_tail((result.stderr or result.stdout or "").strip(), self.passwords.values(), 200)
+                _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']}, rc={result.returncode}, detail={detail!r})")
+            else:
+                _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']})")
             results.append({key: probe[key] for key in ("name", "expect", "control")} | {"outcome": outcome})
         evaluate_probes(results)
         self.passed("NetworkPolicy enforced: DNS and database egress only, API ingress from the configured peer",
@@ -941,12 +945,13 @@ class Smoke:
         self.wait_for("release objects to be removed", lambda: not residue(), timeout=120)
         releases = json.loads(self.helm_run("list", "--output", "json").stdout)
         self.expect(releases == [], f"Helm still lists a release: {releases}")
-        # The test, not the chart, owns the URL Secrets: uninstall must leave them alone.
-        remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "secrets",
+        # The test, not the chart, owns the URL Secrets and namespace default-deny: uninstall leaves them alone.
+        remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "secrets,networkpolicies",
                                                 "--selector", RUN_LABEL)["items"])
-        self.expect(remaining == sorted(f"Secret/{SECRET[r]}" for r in ROLES),
-                    f"test-owned Secrets after uninstall: {remaining}")
-        self.passed("uninstall leaves no release objects", test_owned_secrets_remaining=remaining)
+        expected_owned = sorted([f"NetworkPolicy/{NAMESPACE_DENY}", *(f"Secret/{SECRET[r]}" for r in ROLES)])
+        self.expect(remaining == expected_owned,
+                    f"test-owned objects after uninstall: {remaining}")
+        self.passed("uninstall leaves no release objects", test_owned_remaining=remaining)
         self.report["result"] = "passed"
 
     def diagnostics(self):

@@ -448,9 +448,12 @@ class FakeCluster:
             return listing(self.items(smoke.expected_release_objects()))
         if args[:2] == ["get", smoke.OPTIONAL_KINDS]:
             return listing([])
-        if args[:2] in (["get", "secrets"], ["get", "endpointslices"]):
+        if args[:2] in (["get", "secrets"], ["get", "secrets,networkpolicies"], ["get", "endpointslices"]):
             if selector == smoke.RUN_LABEL:
-                return listing(self.items(f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES))
+                owned = [f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES]
+                if args[1] == "secrets,networkpolicies":
+                    owned.append(f"NetworkPolicy/{smoke.NAMESPACE_DENY}")
+                return listing(self.items(owned))
             return listing([])
         if args[:1] == ["logs"]:
             return ok("log line\n")
@@ -829,6 +832,11 @@ class OrchestrationTest(unittest.TestCase):
                 [smoke.RELEASE_KINDS],
                 lambda data: data["items"].append({"kind": "NetworkPolicy", "metadata": {"name": "leftover"}})),
                 "release objects to be removed"),
+            "default-deny removed by uninstall": (doctor_json(
+                ["get secrets,networkpolicies", smoke.RUN_LABEL],
+                lambda data: data.__setitem__("items", [i for i in data["items"]
+                                                        if i["metadata"]["name"] != smoke.NAMESPACE_DENY])),
+                "test-owned objects after uninstall:"),
             "scale ready replicas": (doctor_json([f"deployment {worker} --output=json"], lambda data: data["status"].__setitem__(
                 "readyReplicas", 1), when=revision(2)), "scale ready replicas"),
             "API pod replaced": (doctor_json(["app.kubernetes.io/component=api"], pod_status(
@@ -844,8 +852,10 @@ class OrchestrationTest(unittest.TestCase):
             "release listed after uninstall": (doctor_json(["list --output json"], lambda data: data.append(
                 {"name": smoke.RELEASE, "status": "uninstalling", "revision": "3"}),
                 when=lambda: not fake_ref().installed), "Helm still lists a release"),
-            "test-owned Secret removed": (doctor_json([f"--selector {smoke.RUN_LABEL} "], lambda data: data["items"].pop()),
-                                          "test-owned Secrets after uninstall"),
+            "test-owned Secret removed": (doctor_json(
+                [f"--selector {smoke.RUN_LABEL} "],
+                lambda data: data.__setitem__("items", [i for i in data["items"] if i["metadata"]["name"] != smoke.SECRET["api"]])),
+                "test-owned objects after uninstall:"),
         }
         # History changes only after the install was observed: compare against the first reading.
         readings = []

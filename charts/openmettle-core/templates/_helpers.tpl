@@ -148,6 +148,13 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- if not .Values.networkPolicy.dns.to -}}
 {{- fail "networkPolicy.dns.to must list at least one DNS peer when networkPolicy.enabled is true (an empty list would allow egress to every destination on port 53)" -}}
 {{- end -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) -}}
+{{- range $i, $peer := $entry.peers -}}
+{{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
+{{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- /*
 Peak while a rollout surges. Terminating pods keep their pools open for up to their grace period

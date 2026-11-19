@@ -35,7 +35,7 @@ The registry host is `openmettle-smoke.invalid`, which never resolves (RFC 6761)
 
 ## Fixtures and secrets
 
-- PostgreSQL runs in its own namespace (`openmettle-smoke-db`, labelled `app.kubernetes.io/name: postgres`) with core's pinned image (`POSTGRES_IMAGE`), `emptyDir` storage and TLS disabled (`sslmode=disable`). This is acceptable only for this fixture.
+- PostgreSQL runs in its own namespace (`openmettle-smoke-db`, with pods labelled `app.kubernetes.io/name: postgres`) with core's pinned image (`POSTGRES_IMAGE`), `emptyDir` storage and TLS disabled (`sslmode=disable`). This is acceptable only for this fixture.
 - The fixture also creates a namespace-level `default-deny` NetworkPolicy in `openmettle-smoke` (mirroring the owner's default-deny app namespaces) and a second, empty PostgreSQL Deployment `netpol-peer` in `openmettle-smoke-db` reusing `POSTGRES_IMAGE` and the fixture admin Secret. `netpol-peer` is not a configured database peer (so api/worker egress to it on 5432 must be denied) and is the sole configured `networkPolicy.api.ingressFrom` peer (so its `GET /readyz` must return 200 while `postgres`'s must be denied).
 - The fixture provisions `openmettle_owner`, `openmettle_api` and `openmettle_worker`, plus a database `openmettle` owned by the owner, as in core's README "Schema migrations" and `runtime/verify-migrate-image.sh`.
 - The test, not the chart, creates the three URL Secrets: `openmettle-owner-database` (migrate only), `openmettle-api-database` and `openmettle-worker-database`.
