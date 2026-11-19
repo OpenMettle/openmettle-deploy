@@ -60,7 +60,7 @@ jobs:
             "https://raw.githubusercontent.com/OpenMettle/openmettle-core/$CORE_COMMIT/runtime/process-contract.json"
           cmp "$RUNNER_TEMP/process-contract.json" "$fixture"
       - name: Kind smoke harness tests (no cluster), with core guards from the pinned commit
-        # The cluster run itself is kind-smoke.yml (manual dispatch and main only).
+        # The cluster run itself is kind-smoke.yml (path-filtered pull requests and main, and dispatch).
         run: |
           mkdir -p "$RUNNER_TEMP/core/tests/kubernetes"
           curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \

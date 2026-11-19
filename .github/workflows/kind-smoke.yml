@@ -2,10 +2,10 @@ name: Kind smoke
 # V1-32 I2: installs charts/openmettle-core on an ephemeral kind cluster classified dev, using
 # core images built from the pinned commit and referenced by digest. Images are built and loaded
 # locally; nothing is pushed, published or deployed to any other cluster.
-# Hosted minutes are billed while this repository is private, so the job runs only when the chart,
-# the harness, the Helm installer or this workflow changes: on pull requests (GitHub cannot
-# dispatch a workflow before it exists on the default branch), on merges to main, and on manual
-# dispatch. Other pull requests run only the cluster-free harness tests in checks.yml.
+# The repository is public, so hosted minutes are free. The job is path-filtered to changes that can
+# affect it (the chart, the harness, the Helm installer or this workflow): it runs on those pull
+# requests and pushes to main, and on manual dispatch. Every pull request also runs the cluster-free
+# harness tests in checks.yml.
 on:
   workflow_dispatch:
   pull_request:
@@ -46,6 +46,13 @@ jobs:
           ref: ${{ env.CORE_COMMIT }}
           path: core-src
           persist-credentials: false
+          # Full history, so that the next step can check the commit is on core's main.
+          fetch-depth: 0
+      - name: Require the pinned core commit on core main
+        # A commit reachable only from a fork or an unmerged branch is not an accepted core build.
+        run: |
+          git -C core-src fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          git -C core-src merge-base --is-ancestor "$CORE_COMMIT" origin/main
       - name: Install pinned kind and kubectl from core (SHA-256 verified)
         run: bash core-src/tests/kubernetes/install-tools.sh "$RUNNER_TEMP/k8s-tools"
       - name: Install pinned Helm (SHA-256 verified)
