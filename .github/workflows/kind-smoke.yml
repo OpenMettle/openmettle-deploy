@@ -2,11 +2,18 @@ name: Kind smoke
 # V1-32 I2: installs charts/openmettle-core on an ephemeral kind cluster classified dev, using
 # core images built from the pinned commit and referenced by digest. Images are built and loaded
 # locally; nothing is pushed, published or deployed to any other cluster.
-# Hosted minutes are billed while this repository is private, so the job runs on manual dispatch
-# and on merges to main that change the chart, the harness or this workflow. Pull requests run the
-# cluster-free harness tests in checks.yml instead.
+# Hosted minutes are billed while this repository is private, so the job runs only when the chart,
+# the harness, the Helm installer or this workflow changes: on pull requests (GitHub cannot
+# dispatch a workflow before it exists on the default branch), on merges to main, and on manual
+# dispatch. Other pull requests run only the cluster-free harness tests in checks.yml.
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - charts/openmettle-core/**
+      - tests/kind/**
+      - tests/chart/install-tools.sh
+      - .github/workflows/kind-smoke.yml
   push:
     branches: [main]
     paths:
