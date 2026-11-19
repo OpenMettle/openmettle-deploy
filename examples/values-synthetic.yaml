@@ -1,8 +1,9 @@
 # SYNTHETIC EXAMPLE. NOT INSTALLABLE. Do not copy real values into this file.
 #
-# A complete private overlay for charts/openmettle-core, showing every I4 and I5 option: database CA,
-# artifact volume, Ingress with TLS for a Traefik controller, the matching NetworkPolicy peers, an
-# API PodDisruptionBudget, and optional browser sign-in / OIDC mounts and egress (API only). Copy it
+# A complete private overlay for charts/openmettle-core, showing every I4, I5 and I6 option:
+# database CA, artifact volume, Ingress with TLS for a Traefik controller, the matching NetworkPolicy
+# peers, an API PodDisruptionBudget, optional browser sign-in / OIDC mounts and egress (API only),
+# and optional telemetry / OTLP trace export (API and worker only). Copy it
 # to a private location outside this repository (for example an ignored config/<site>.local.yaml or
 # a private configuration repository), replace each placeholder and render it with:
 #
@@ -96,6 +97,14 @@ networkPolicy:
     to:
       - ipBlock:
           cidr: 192.0.2.10/32
+  telemetry:
+    otlp:
+      # Documentation range (RFC 5737) standing in for the OTLP collector address (api and worker
+      # egress only, never migrate; default port 4318).
+      to:
+        - ipBlock:
+            cidr: 192.0.2.30/32
+      port: 4318
 
 auth:
   # Optional browser sign-in / OIDC configuration (off by default in the chart, mounted into api only).
@@ -111,3 +120,23 @@ auth:
     enabled: true
     configMapName: example-openmettle-oidc-ca
     key: ca.crt
+
+telemetry:
+  # Optional structured logging overrides for api, worker and migrate (core ADR 0024).
+  logging:
+    format: json
+    level: info
+  # Optional OTLP/HTTP protobuf trace export for api and worker only (off by default; core ADR 0026).
+  # Never exported from openmettle-migrate, and the chart never deploys a collector.
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+    # Explicit private CIDRs for in-cluster collectors (RFC 1918, CGNAT or ULA).
+    privateRanges:
+      - 10.43.0.0/16
+    # Optional CA bundle for verifying a private/cluster-CA collector certificate, mounted read-only
+    # at /etc/openmettle/otlp-ca/ca.crt in api and worker pods only.
+    caBundle:
+      enabled: true
+      configMapName: example-openmettle-otlp-ca
+      key: ca.crt

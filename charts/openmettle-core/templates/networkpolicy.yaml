@@ -24,9 +24,9 @@ spec:
     - Ingress
     - Egress
 ---
-{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "api" "ingressFrom" .Values.networkPolicy.api.ingressFrom "port" 8080 "oidc" .Values.auth.enabled) }}
+{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "api" "ingressFrom" .Values.networkPolicy.api.ingressFrom "port" 8080 "oidc" .Values.auth.enabled "otlp" .Values.telemetry.otlp.enabled) }}
 ---
-{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "worker") }}
+{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "worker" "otlp" .Values.telemetry.otlp.enabled) }}
 {{- if .Values.migration.enabled }}
 ---
 {{ include "openmettle-core.networkPolicy" (dict "root" . "component" "migrate" "annotations" (dict "helm.sh/hook" "pre-install,pre-upgrade" "helm.sh/hook-weight" "-10" "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded")) }}

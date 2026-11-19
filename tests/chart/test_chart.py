@@ -31,6 +31,8 @@ MATRIX = {
     "ingress-network-policy-disabled": ("ingress-network-policy-disabled.yaml",),
     "auth-enabled": ("auth-enabled.yaml",),
     "auth-network-policy-disabled": ("auth-network-policy-disabled.yaml",),
+    "telemetry-otlp-enabled": ("telemetry-otlp-enabled.yaml",),
+    "telemetry-network-policy-disabled": ("telemetry-network-policy-disabled.yaml",),
 }
 PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_"}
 PORT = {"api": 8080, "worker": 8081}
@@ -181,15 +183,17 @@ class PodPolicyTest(Rendered):
                     self.assertNotIn("hostPort", port)
 
     def test_only_known_volumes(self):
-        """Fails if a pod gains an unknown volume, auth volumes appear outside api, or a mount lacks a matching volume."""
+        """Fails if a pod gains an unknown volume, auth volumes appear outside api, otlp-ca appears on migrate, or a mount lacks a matching volume."""
         for _, role, pod in self.each_pod():
             vols = {v["name"]: v for v in pod.get("volumes", [])}
-            self.assertLessEqual(set(vols), {"artifacts", "db-ca"} | AUTH_VOLUMES)
+            self.assertLessEqual(set(vols), {"artifacts", "db-ca", "otlp-ca"} | AUTH_VOLUMES)
             if role != "api":
                 self.assertFalse(AUTH_VOLUMES & set(vols), f"{role} must never mount auth volumes")
+            if role == "migrate":
+                self.assertNotIn("otlp-ca", vols, "migrate must never mount otlp-ca")
             if "artifacts" in vols:
                 self.assertEqual(set(vols["artifacts"]), {"name", "persistentVolumeClaim"})
-            for cm_vol in ("db-ca", "auth-config", "auth-provider-ca"):
+            for cm_vol in ("db-ca", "auth-config", "auth-provider-ca", "otlp-ca"):
                 if cm_vol in vols:
                     self.assertEqual(set(vols[cm_vol]), {"name", "configMap"})
             if "auth-login-keys" in vols:
@@ -483,7 +487,7 @@ class MigrationHookTest(Rendered):
 class NetworkPolicyTest(Rendered):
     """Design §5: a chart-scoped deny-all plus DNS and database egress, and API ingress from configured peers."""
 
-    ENABLED = ("minimal", "all-keys", "migration-disabled", "auth-enabled")
+    ENABLED = ("minimal", "all-keys", "migration-disabled", "auth-enabled", "telemetry-otlp-enabled")
 
     def policies(self, name):
         return [d for d in self.renders[name] if d["kind"] == "NetworkPolicy"]
@@ -514,7 +518,7 @@ class NetworkPolicyTest(Rendered):
                     self.assertEqual(types, {"Ingress", "Egress"})
 
     def test_egress_is_dns_and_database_only(self):
-        """Fails if a component gains an unexpected egress rule, loses DNS/database egress, or OIDC egress leaks beyond api."""
+        """Fails if a component gains an unexpected egress rule, loses DNS/database egress, OIDC leaks beyond api, or OTLP leaks to migrate."""
         default_db = [{
             "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-database"}},
             "podSelector": {"matchLabels": {"app.kubernetes.io/name": "postgres"}},
@@ -524,15 +528,22 @@ class NetworkPolicyTest(Rendered):
              "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-oidc"}}},
             {"ipBlock": {"cidr": "198.51.100.50/32"}},
         ]
+        all_keys_otlp = [
+            {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-observability"}},
+             "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-alloy"}}},
+            {"ipBlock": {"cidr": "198.51.100.60/32"}},
+        ]
         expected = {
-            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None),
-            "auth-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, ([{"ipBlock": {"cidr": "192.0.2.20/32"}}], 443)),
+            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None, None),
+            "auth-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, ([{"ipBlock": {"cidr": "192.0.2.20/32"}}], 443), None),
+            "telemetry-otlp-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, None,
+                                       ([{"ipBlock": {"cidr": "192.0.2.30/32"}}], 4318)),
             "all-keys": ([{"ipBlock": {"cidr": "192.0.2.10/32"}},
                           {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-dns"}}}],
                          [{"ipBlock": {"cidr": "198.51.100.0/24"}}, {"ipBlock": {"cidr": "2001:db8::/64"}}],
-                         5433, (all_keys_oidc, 8443)),
+                         5433, (all_keys_oidc, 8443), (all_keys_otlp, 4319)),
         }
-        for name, (dns, database, port, api_oidc) in expected.items():
+        for name, (dns, database, port, api_oidc, otlp) in expected.items():
             roles = []
             for role, labels in pod_labels(self.renders[name]):
                 roles.append(role)
@@ -543,6 +554,9 @@ class NetworkPolicyTest(Rendered):
                     if role == "api" and api_oidc is not None:
                         oidc_peers, oidc_port = api_oidc
                         rules.append({"to": oidc_peers, "ports": [{"protocol": "TCP", "port": oidc_port}]})
+                    if role in ("api", "worker") and otlp is not None:
+                        otlp_peers, otlp_port = otlp
+                        rules.append({"to": otlp_peers, "ports": [{"protocol": "TCP", "port": otlp_port}]})
                     self.assertEqual(egress, rules)
             self.assertEqual(sorted(roles), ["api", "migrate", "worker"])
 
@@ -615,10 +629,11 @@ class NetworkPolicyTest(Rendered):
         self.assertEqual({d["kind"] for d in docs}, {"Deployment", "Service", "ServiceAccount", "Job"})
 
     def test_chart_defaults(self):
-        """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database or API peers."""
+        """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database, API or OTLP peers."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))["networkPolicy"]
         self.assertEqual(defaults, {"enabled": True, "api": {"ingressFrom": [], "oidc": {"to": [], "port": 443}},
-                                    "dns": {"to": DEFAULT_DNS_PEERS}, "database": {"to": [], "port": 5432}})
+                                    "dns": {"to": DEFAULT_DNS_PEERS}, "database": {"to": [], "port": 5432},
+                                    "telemetry": {"otlp": {"to": [], "port": 4318}}})
 
     def test_names_fit_in_63_characters(self):
         """Fails if an object name can exceed 63 characters at the longest fullname (Helm caps release names at 53)."""
@@ -635,6 +650,8 @@ AUTH_CONFIG_PATH = "/etc/openmettle/auth/auth.json"
 AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
 AUTH_CA_DIR = "/etc/openmettle/auth-ca"
 AUTH_VOLUMES = {"auth-config", "auth-login-keys", "auth-provider-ca"}
+OTLP_CA_DIR = "/etc/openmettle/otlp-ca"
+OTLP_CA_PATH = "/etc/openmettle/otlp-ca/ca.crt"
 I4_KINDS = {"PersistentVolumeClaim", "Ingress", "PodDisruptionBudget"}
 
 
@@ -647,10 +664,10 @@ def volumes(pod):
 
 
 class OptionalDefaultsTest(Rendered):
-    """I4 and I5 features are off by default and add nothing to a default render."""
+    """I4, I5 and I6 features are off by default and add nothing to a default render."""
 
     def test_chart_defaults(self):
-        """Fails if values.yaml enables or pre-fills the artifact volume, database CA, Ingress, API PDB or auth."""
+        """Fails if values.yaml enables or pre-fills the artifact volume, database CA, Ingress, API PDB, auth or telemetry."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
         self.assertEqual(defaults["database"]["caBundle"], {"enabled": False, "configMapName": "", "key": "ca.crt"})
         self.assertEqual(defaults["api"]["podDisruptionBudget"],
@@ -663,6 +680,16 @@ class OptionalDefaultsTest(Rendered):
             "enabled": False, "configMapName": "", "configKey": "auth.json", "loginKeysSecretName": "",
             "providerCaBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
         })
+        self.assertEqual(defaults["telemetry"], {
+            "logging": {"format": None, "level": None},
+            "otlp": {
+                "enabled": False,
+                "tracesEndpoint": "",
+                "privateRanges": [],
+                "caBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
+            },
+        })
+        self.assertEqual(defaults["networkPolicy"]["telemetry"], {"otlp": {"to": [], "port": 4318}})
 
     def test_defaults_render_no_optional_resource_volume_or_env(self):
         """Fails if a default render gains a PVC, Ingress, PDB, volume, mount, fsGroup or environment variable."""
@@ -911,6 +938,131 @@ class AuthTest(Rendered):
         self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
 
 
+class TelemetryTest(Rendered):
+    """telemetry logging (all roles, ADR 0024) and OTLP trace export (api/worker only, never migrate, ADR 0026)."""
+
+    def test_logging_overrides_reach_all_three_roles(self):
+        """Fails if telemetry.logging.{format,level} do not render for api, worker and migrate, or emit when null."""
+        cases = {
+            "all-keys": ("text", "debug"),
+            "telemetry-network-policy-disabled": ("text", "warn"),
+            "telemetry-otlp-enabled": (None, None),
+            "minimal": (None, None),
+        }
+        for name, (fmt, level) in cases.items():
+            for role, pod in pods(self.renders[name]):
+                with self.subTest(values=name, component=role):
+                    env = env_map(pod["containers"][0])
+                    if fmt is None:
+                        self.assertNotIn(PREFIX[role] + "LOG_FORMAT", env)
+                    else:
+                        self.assertEqual(env[PREFIX[role] + "LOG_FORMAT"], {"name": PREFIX[role] + "LOG_FORMAT", "value": fmt})
+                    if level is None:
+                        self.assertNotIn(PREFIX[role] + "LOG_LEVEL", env)
+                    else:
+                        self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"], {"name": PREFIX[role] + "LOG_LEVEL", "value": level})
+        # Independent format-only and level-only overrides, across every valid enum value.
+        for fmt in ("json", "text"):
+            docs = render(set_values=[f"telemetry.logging.format={fmt}"])
+            for role, pod in pods(docs):
+                env = env_map(pod["containers"][0])
+                self.assertEqual(env[PREFIX[role] + "LOG_FORMAT"]["value"], fmt)
+                self.assertNotIn(PREFIX[role] + "LOG_LEVEL", env)
+        for level in ("error", "warn", "info", "debug"):
+            docs = render(set_values=[f"telemetry.logging.level={level}"])
+            for role, pod in pods(docs):
+                env = env_map(pod["containers"][0])
+                self.assertNotIn(PREFIX[role] + "LOG_FORMAT", env)
+                self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"]["value"], level)
+
+    def test_otlp_env_and_optional_ca_mount_on_api_and_worker(self):
+        """Fails if api/worker OTLP env vars, comma-joined privateRanges or /etc/openmettle/otlp-ca mount drift."""
+        cases = {
+            "telemetry-otlp-enabled": (
+                "https://alloy.observability.example.test:4318/v1/traces", None, None,
+            ),
+            "telemetry-network-policy-disabled": (
+                "https://alloy.observability.example.test:4318/v1/traces",
+                "10.43.0.0/16",
+                ("example-otlp-ca", "ca.crt"),
+            ),
+            "all-keys": (
+                "https://alloy.observability.example.test:4319/v1/traces",
+                "10.43.0.0/16,fd00:10::/64",
+                ("example-otlp-ca", "collector-ca.pem"),
+            ),
+        }
+        for name, (endpoint, ranges, ca) in cases.items():
+            for role in ("api", "worker"):
+                with self.subTest(values=name, component=role):
+                    pod = find(self.renders[name], "Deployment", f"-{role}")["spec"]["template"]["spec"]
+                    container = pod["containers"][0]
+                    env = env_map(container)
+                    self.assertEqual(env[PREFIX[role] + "OTLP_TRACES_ENDPOINT"],
+                                     {"name": PREFIX[role] + "OTLP_TRACES_ENDPOINT", "value": endpoint})
+                    if ranges is None:
+                        self.assertNotIn(PREFIX[role] + "OTLP_PRIVATE_RANGES", env)
+                    else:
+                        self.assertEqual(env[PREFIX[role] + "OTLP_PRIVATE_RANGES"],
+                                         {"name": PREFIX[role] + "OTLP_PRIVATE_RANGES", "value": ranges})
+                    if ca is None:
+                        self.assertNotIn(PREFIX[role] + "OTLP_CA_FILE", env)
+                        self.assertNotIn("otlp-ca", volumes(pod))
+                        self.assertNotIn("otlp-ca", mounts(pod))
+                    else:
+                        ca_cm, ca_key = ca
+                        self.assertEqual(env[PREFIX[role] + "OTLP_CA_FILE"],
+                                         {"name": PREFIX[role] + "OTLP_CA_FILE", "value": OTLP_CA_PATH})
+                        self.assertEqual(volumes(pod)["otlp-ca"], {"name": "otlp-ca", "configMap": {
+                            "name": ca_cm, "items": [{"key": ca_key, "path": "ca.crt"}]}})
+                        self.assertEqual(mounts(pod)["otlp-ca"],
+                                         {"name": "otlp-ca", "mountPath": OTLP_CA_DIR, "readOnly": True})
+                    for mount in container.get("volumeMounts", []):
+                        self.assertNotIn("subPath", mount)
+
+    def test_sibling_mount_paths_never_overlap(self):
+        """Fails if any volume mount path is duplicated or nested inside another read-only mount directory."""
+        for name in ("all-keys", "telemetry-network-policy-disabled", "auth-enabled"):
+            for role, pod in pods(self.renders[name]):
+                with self.subTest(values=name, component=role):
+                    paths = [m["mountPath"].rstrip("/") for m in pod["containers"][0].get("volumeMounts", [])]
+                    self.assertEqual(len(paths), len(set(paths)), paths)
+                    for i, left in enumerate(paths):
+                        for j, right in enumerate(paths):
+                            if i != j:
+                                self.assertFalse(right.startswith(left + "/"), f"{right} nested under {left}")
+
+    def test_migrate_never_receives_otlp_env_ca_or_egress(self):
+        """Fails if migrate gets any OTLP_* env var, otlp-ca mount/volume, collector URL/CA reference or OTLP egress."""
+        for name in ("telemetry-otlp-enabled", "telemetry-network-policy-disabled", "all-keys"):
+            docs = self.renders[name]
+            with self.subTest(values=name):
+                job = find(docs, "Job", "-migrate")
+                pod = job["spec"]["template"]["spec"]
+                env_names = {e["name"] for e in pod["containers"][0]["env"]}
+                self.assertFalse([e for e in env_names if "OTLP" in e or "OTEL" in e], env_names)
+                self.assertNotIn("otlp-ca", volumes(pod))
+                self.assertNotIn("otlp-ca", mounts(pod))
+                migrate_docs = [d for d in docs if component(d) == "migrate"]
+                migrate_yaml = yaml.safe_dump_all(migrate_docs)
+                for ref in ("OTLP_", "OTEL_", "otlp-ca", "example-otlp-ca", "collector-ca.pem",
+                            "alloy.observability.example.test", "example-observability", "example-alloy",
+                            "192.0.2.30", "198.51.100.60"):
+                    self.assertNotIn(ref, migrate_yaml)
+
+    def test_no_ambient_otel_env_vars_in_any_render(self):
+        """Fails if any template emits an ambient OTEL_* variable (core ADR 0026 neutralizes them)."""
+        for _, _, pod in self.each_pod():
+            for container in containers(pod):
+                for entry in container.get("env", []):
+                    self.assertFalse(entry["name"].startswith("OTEL_"), entry["name"])
+
+    def test_telemetry_without_network_policy_renders_no_policies(self):
+        """Fails if enabling telemetry.otlp while networkPolicy.enabled=false still renders a NetworkPolicy."""
+        docs = self.renders["telemetry-network-policy-disabled"]
+        self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
+
+
 class ExampleOverlayTest(unittest.TestCase):
     """examples/values-synthetic.yaml renders standalone and stays synthetic."""
 
@@ -923,23 +1075,38 @@ class ExampleOverlayTest(unittest.TestCase):
         cls.docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
         cls.values = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
 
-    def test_shows_every_i4_and_i5_feature(self):
-        """Fails if the example stops demonstrating I4 (PVC, Ingress, PDB, db CA, ingress peer) or I5 (API-only auth & OIDC egress)."""
+    def test_shows_every_i4_i5_and_i6_feature(self):
+        """Fails if the example stops demonstrating I4 (PVC, Ingress, PDB, db CA), I5 (API auth & OIDC egress) or I6 (telemetry & OTLP)."""
         self.assertLessEqual(I4_KINDS, {d["kind"] for d in self.docs})
         for role, pod in pods(self.docs):
+            env = env_map(pod["containers"][0])
             self.assertIn("db-ca", volumes(pod), role)
+            self.assertEqual(env[PREFIX[role] + "LOG_FORMAT"]["value"], "json")
+            self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"]["value"], "info")
             if role == "api":
-                self.assertEqual(env_map(pod["containers"][0])["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
+                self.assertEqual(env["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
                 self.assertLessEqual(AUTH_VOLUMES, set(volumes(pod)))
             else:
                 self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
-                self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env_map(pod["containers"][0]))
+                self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
+            if role in ("api", "worker"):
+                self.assertEqual(env[PREFIX[role] + "OTLP_TRACES_ENDPOINT"]["value"],
+                                 "https://alloy.observability.example.test:4318/v1/traces")
+                self.assertEqual(env[PREFIX[role] + "OTLP_CA_FILE"]["value"], OTLP_CA_PATH)
+                self.assertEqual(env[PREFIX[role] + "OTLP_PRIVATE_RANGES"]["value"], "10.43.0.0/16")
+                self.assertIn("otlp-ca", volumes(pod), role)
+            else:
+                self.assertNotIn("otlp-ca", volumes(pod))
+                self.assertFalse([k for k in env if "OTLP" in k])
         api_np = find(self.docs, "NetworkPolicy", "-api")["spec"]
         self.assertTrue(api_np["ingress"])
-        self.assertEqual(len(api_np["egress"]), 3)
+        self.assertEqual(len(api_np["egress"]), 4)
         self.assertEqual(api_np["egress"][2]["ports"], [{"protocol": "TCP", "port": 443}])
-        for role in ("worker", "migrate"):
-            self.assertEqual(len(find(self.docs, "NetworkPolicy", f"-{role}")["spec"]["egress"]), 2)
+        self.assertEqual(api_np["egress"][3]["ports"], [{"protocol": "TCP", "port": 4318}])
+        worker_np = find(self.docs, "NetworkPolicy", "-worker")["spec"]
+        self.assertEqual(len(worker_np["egress"]), 3)
+        self.assertEqual(worker_np["egress"][2]["ports"], [{"protocol": "TCP", "port": 4318}])
+        self.assertEqual(len(find(self.docs, "NetworkPolicy", "-migrate")["spec"]["egress"]), 2)
 
     def test_values_are_synthetic(self):
         """Fails if the example names a non-reserved domain, a real digest or a non-documentation address."""
@@ -947,9 +1114,13 @@ class ExampleOverlayTest(unittest.TestCase):
         self.assertIn("SYNTHETIC EXAMPLE", text)
         for host in self.values["ingress"]["hosts"] + [self.values["images"][r]["registry"] for r in ("api", "worker", "migrate")]:
             self.assertTrue(host == "example" or host.endswith(".example"), host)
+        endpoint = self.values["telemetry"]["otlp"]["tracesEndpoint"]
+        self.assertIn(".example.test:", endpoint)
         for role in ("api", "worker", "migrate"):
             self.assertEqual(self.values["images"][role]["digest"], DIGEST)
-        for peer in self.values["networkPolicy"]["database"]["to"] + self.values["networkPolicy"]["api"]["oidc"]["to"]:
+        for peer in (self.values["networkPolicy"]["database"]["to"]
+                     + self.values["networkPolicy"]["api"]["oidc"]["to"]
+                     + self.values["networkPolicy"]["telemetry"]["otlp"]["to"]):
             self.assertTrue(peer["ipBlock"]["cidr"].startswith("192.0.2."))
         self.assertNotIn("oidc", self.values)
 
@@ -1219,6 +1390,196 @@ class NegativeCaseTest(unittest.TestCase):
          [SCHEMA, "additional properties 'protocol' not allowed"]),
         ("worker has no auth", ["worker.auth.enabled=true"], [],
          [SCHEMA, "additional properties 'auth' not allowed"]),
+        ("telemetry invalid log format", ["telemetry.logging.format=yaml"], [],
+         [SCHEMA, "/telemetry/logging/format"]),
+        ("telemetry invalid log format without schema", ["telemetry.logging.format=yaml"],
+         ["--skip-schema-validation"], ["telemetry.logging.format must be null"]),
+        ("telemetry trace log level refused", ["telemetry.logging.level=trace"], [],
+         [SCHEMA, "/telemetry/logging/level"]),
+        ("telemetry trace log level refused without schema", ["telemetry.logging.level=trace"],
+         ["--skip-schema-validation"], ["telemetry.logging.level must be null"]),
+        ("telemetry unknown log level", ["telemetry.logging.level=verbose"], [],
+         [SCHEMA, "/telemetry/logging/level"]),
+        ("telemetry OTLP enabled without tracesEndpoint", ["telemetry.otlp.enabled=true"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP enabled without tracesEndpoint without schema", ["telemetry.otlp.enabled=true"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint is required"]),
+        ("telemetry OTLP tracesEndpoint while disabled",
+         ["telemetry.otlp.tracesEndpoint=https://alloy.observability.example.test:4318/v1/traces"], [],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP tracesEndpoint while disabled without schema",
+         ["telemetry.otlp.tracesEndpoint=https://alloy.observability.example.test:4318/v1/traces"],
+         ["--skip-schema-validation"], ["telemetry.otlp.tracesEndpoint must be empty when telemetry.otlp.enabled is false"]),
+        ("telemetry OTLP http endpoint refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=http://alloy.observability.example.test:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP http endpoint refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=http://alloy.observability.example.test:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP IPv4 literal endpoint refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://127.0.0.1:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP IPv4 literal endpoint refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://127.0.0.1:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP IPv6 literal endpoint refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://[::1]:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP single-label host refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://localhost:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP uppercase host refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://Alloy.example.test:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint credentials refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://user@alloy.example.test:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint query refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces?x=1"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint fragment refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces#frag"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint percent-encoding refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/%74races"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint default port 443 refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:443/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint default port 443 refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:443/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["omit the default port 443"]),
+        ("telemetry OTLP endpoint dot-segment refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/../traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint missing path slash refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP endpoint port above 65535 refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:70000/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         ["must be 1-65535"]),
+        ("telemetry OTLP privateRanges while disabled", [],
+         ["--set-json", 'telemetry.otlp.privateRanges=["10.43.0.0/16"]'],
+         [SCHEMA, "/telemetry/otlp/privateRanges"]),
+        ("telemetry OTLP privateRanges while disabled without schema", [],
+         ["--set-json", 'telemetry.otlp.privateRanges=["10.43.0.0/16"]', "--skip-schema-validation"],
+         ["telemetry.otlp.privateRanges must be empty when telemetry.otlp.enabled is false"]),
+        ("telemetry OTLP privateRanges invalid CIDR with comma",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", 'telemetry.otlp.privateRanges=["10.43.0.0/16,10.44.0.0/16"]',
+          "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/privateRanges/0"]),
+        ("telemetry OTLP privateRanges invalid CIDR without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", 'telemetry.otlp.privateRanges=["10.43.0.0/16,10.44.0.0/16"]',
+          "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.privateRanges[0] must be a CIDR string"]),
+        ("telemetry OTLP privateRanges duplicate entry",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", 'telemetry.otlp.privateRanges=["10.43.0.0/16","10.43.0.0/16"]',
+          "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/privateRanges"]),
+        ("telemetry OTLP privateRanges duplicate entry without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", 'telemetry.otlp.privateRanges=["10.43.0.0/16","10.43.0.0/16"]',
+          "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.privateRanges contains duplicate entry"]),
+        ("telemetry OTLP privateRanges exceeds 32 entries",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", "telemetry.otlp.privateRanges=" + json.dumps([f"10.{i}.0.0/16" for i in range(33)]),
+          "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/privateRanges"]),
+        ("telemetry OTLP privateRanges exceeds 32 entries without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", "telemetry.otlp.privateRanges=" + json.dumps([f"10.{i}.0.0/16" for i in range(33)]),
+          "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.privateRanges accepts at most 32 CIDR entries"]),
+        ("telemetry OTLP CA enabled while OTLP disabled",
+         ["telemetry.otlp.caBundle.enabled=true", "telemetry.otlp.caBundle.configMapName=otlp-ca"], [],
+         [SCHEMA, "/telemetry/otlp/caBundle/enabled"]),
+        ("telemetry OTLP CA enabled while OTLP disabled without schema",
+         ["telemetry.otlp.caBundle.enabled=true", "telemetry.otlp.caBundle.configMapName=otlp-ca"],
+         ["--skip-schema-validation"], ["telemetry.otlp.caBundle.enabled cannot be true when telemetry.otlp.enabled is false"]),
+        ("telemetry OTLP CA enabled without configMapName",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces",
+          "telemetry.otlp.caBundle.enabled=true"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/caBundle/configMapName"]),
+        ("telemetry OTLP CA enabled without configMapName without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces",
+          "telemetry.otlp.caBundle.enabled=true"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.caBundle.configMapName is required"]),
+        ("telemetry OTLP CA key with path", ["telemetry.otlp.caBundle.key=../ca.crt"], [],
+         [SCHEMA, "/telemetry/otlp/caBundle/key"]),
+        ("telemetry OTLP CA key dot-dot", ["telemetry.otlp.caBundle.key=.."], [],
+         [SCHEMA, "/telemetry/otlp/caBundle/key"]),
+        ("telemetry OTLP CA key dot-dot without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces",
+          "telemetry.otlp.caBundle.enabled=true", "telemetry.otlp.caBundle.configMapName=otlp-ca",
+          "telemetry.otlp.caBundle.key=.."],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.caBundle.key must be a ConfigMap key"]),
+        ("telemetry OTLP CA bad ConfigMap name", ["telemetry.otlp.caBundle.configMapName=OTLP_CA"], [],
+         [SCHEMA, "/telemetry/otlp/caBundle/configMapName"]),
+        ("telemetry OTLP enabled without collector egress peers",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"], [],
+         ["networkPolicy.telemetry.otlp.to must list at least one OTLP collector peer"]),
+        ("telemetry OTLP enabled without collector egress peers without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--skip-schema-validation"], ["networkPolicy.telemetry.otlp.to must list at least one OTLP collector peer"]),
+        ("OTLP egress peers while OTLP disabled", [],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         ["networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false"]),
+        ("OTLP egress peers while OTLP and networkPolicy disabled", ["networkPolicy.enabled=false"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         ["networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false"]),
+        ("empty OTLP peer",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", "networkPolicy.telemetry.otlp.to=[{}]"], [SCHEMA, "/networkPolicy/telemetry/otlp/to/0"]),
+        ("empty OTLP peer without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://alloy.example.test:4318/v1/traces"],
+         ["--set-json", "networkPolicy.telemetry.otlp.to=[{}]", "--skip-schema-validation"],
+         ["networkPolicy.telemetry.otlp.to[0] must be a non-empty NetworkPolicyPeer object"]),
+        ("OTLP port 0 without schema", ["networkPolicy.telemetry.otlp.port=0"],
+         ["--skip-schema-validation"], ["networkPolicy.telemetry.otlp.port (0) must be an integer between 1 and 65535"]),
+        ("OTLP port 65536 without schema", ["networkPolicy.telemetry.otlp.port=65536"],
+         ["--skip-schema-validation"], ["networkPolicy.telemetry.otlp.port (65536) must be an integer between 1 and 65535"]),
+        ("OTLP port string without schema", [],
+         ["--set-string", "networkPolicy.telemetry.otlp.port=4318", "--skip-schema-validation"],
+         ["networkPolicy.telemetry.otlp.port must be an integer between 1 and 65535"]),
+        ("unknown telemetry key", ["telemetry.metrics.enabled=true"], [],
+         [SCHEMA, "additional properties 'metrics' not allowed"]),
+        ("unknown telemetry logging key", ["telemetry.logging.target=stdout"], [],
+         [SCHEMA, "additional properties 'target' not allowed"]),
+        ("unknown telemetry OTLP key", ["telemetry.otlp.protocol=grpc"], [],
+         [SCHEMA, "additional properties 'protocol' not allowed"]),
+        ("unknown telemetry OTLP caBundle key", ["telemetry.otlp.caBundle.mountPath=/tmp"], [],
+         [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        ("unknown networkPolicy telemetry key", ["networkPolicy.telemetry.metrics.port=9090"], [],
+         [SCHEMA, "additional properties 'metrics' not allowed"]),
+        ("unknown networkPolicy telemetry OTLP key", ["networkPolicy.telemetry.otlp.protocol=UDP"], [],
+         [SCHEMA, "additional properties 'protocol' not allowed"]),
+        ("migration has no telemetry", ["migration.telemetry.enabled=true"], [],
+         [SCHEMA, "additional properties 'telemetry' not allowed"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -1257,9 +1618,23 @@ class NegativeCaseTest(unittest.TestCase):
                            ["database.caBundle.configMapName=ca"],
                            ["ingress.className=traefik"],
                            ["auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys",
-                            "auth.providerCaBundle.configMapName=oidc-ca"]):
+                            "auth.providerCaBundle.configMapName=oidc-ca"],
+                           ["telemetry.otlp.caBundle.configMapName=otlp-ca"]):
             with self.subTest(values=set_values):
                 result = helm_template(set_values=set_values)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        # Canonical HTTPS OTLP endpoints (implicit 443, root path) and the 32-CIDR boundary render cleanly.
+        for extra in (
+            ["--set", "telemetry.otlp.enabled=true",
+             "--set", "telemetry.otlp.tracesEndpoint=https://alloy.observability.example.test/v1/traces",
+             "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+            ["--set", "telemetry.otlp.enabled=true",
+             "--set", "telemetry.otlp.tracesEndpoint=https://alloy.observability.example.test/",
+             "--set-json", "telemetry.otlp.privateRanges=" + json.dumps([f"10.{i}.0.0/16" for i in range(32)]),
+             "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+        ):
+            with self.subTest(extra=extra):
+                result = helm_template(extra=extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_chart_defaults_refuse_to_render(self):
@@ -1287,6 +1662,7 @@ class BoundsTest(unittest.TestCase):
         ("api.service.port", 1, 65535, []),
         ("networkPolicy.database.port", 1, 65535, []),
         ("networkPolicy.api.oidc.port", 1, 65535, []),
+        ("networkPolicy.telemetry.otlp.port", 1, 65535, []),
         ("migration.settings.connectTimeoutMs", 1, 60000, MIGRATION_ROOM),
         ("migration.settings.lockTimeoutMs", 1, 600000, MIGRATION_ROOM),
         ("migration.settings.statementTimeoutMs", 1, 3600000, MIGRATION_ROOM),
@@ -1355,6 +1731,19 @@ class YamlScalarTest(unittest.TestCase):
             "name": "123", "items": [{"key": "true", "path": "ca.crt"}]})
         oidc_peer = find(self.docs, "NetworkPolicy", "-api")["spec"]["egress"][2]["to"][0]
         self.assertEqual(oidc_peer["podSelector"]["matchLabels"], {"example.test/oidc": "true", "example.test/id": "456"})
+        for role, idx in (("api", 3), ("worker", 2)):
+            pod = find(self.docs, "Deployment", f"-{role}")["spec"]["template"]["spec"]
+            self.assertEqual(volumes(pod)["otlp-ca"]["configMap"], {
+                "name": "321", "items": [{"key": "false", "path": "ca.crt"}]})
+            otlp_peer = find(self.docs, "NetworkPolicy", f"-{role}")["spec"]["egress"][idx]["to"][0]
+            self.assertEqual(otlp_peer["podSelector"]["matchLabels"], {"example.test/otlp": "true", "example.test/id": "789"})
+            env = env_map(pod["containers"][0])
+            for key in ("LOG_FORMAT", "LOG_LEVEL", "OTLP_TRACES_ENDPOINT", "OTLP_CA_FILE", "OTLP_PRIVATE_RANGES"):
+                self.assertIsInstance(env[PREFIX[role] + key]["value"], str)
+        migrate_pod = find(self.docs, "Job", "-migrate")["spec"]["template"]["spec"]
+        self.assertNotIn("otlp-ca", volumes(migrate_pod))
+        for key in ("LOG_FORMAT", "LOG_LEVEL"):
+            self.assertIsInstance(env_map(migrate_pod["containers"][0])[PREFIX["migrate"] + key]["value"], str)
 
 
 class ContractDriftTest(unittest.TestCase):

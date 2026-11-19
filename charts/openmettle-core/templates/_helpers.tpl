@@ -93,9 +93,9 @@ securityContext:
 {{- end -}}
 
 {{/*
-Fixed in-pod paths. The database URL's sslrootcert must name the CA file exactly. Auth paths are
-non-overlapping sibling directories under /etc/openmettle so read-only ConfigMap mounts never block
-nested mountpoints under containerd/runc.
+Fixed in-pod paths. The database URL's sslrootcert must name the CA file exactly. Auth and OTLP CA
+paths are non-overlapping sibling directories under /etc/openmettle so read-only ConfigMap mounts
+never block nested mountpoints under containerd/runc.
 */}}
 {{- define "openmettle-core.artifactsMountPath" -}}/var/lib/openmettle/artifacts{{- end -}}
 {{- define "openmettle-core.databaseCaDirectory" -}}/etc/openmettle/db-ca{{- end -}}
@@ -103,6 +103,8 @@ nested mountpoints under containerd/runc.
 {{- define "openmettle-core.authConfigPath" -}}/etc/openmettle/auth/auth.json{{- end -}}
 {{- define "openmettle-core.authLoginKeysDirectory" -}}/etc/openmettle/auth-keys{{- end -}}
 {{- define "openmettle-core.authProviderCaDirectory" -}}/etc/openmettle/auth-ca{{- end -}}
+{{- define "openmettle-core.otlpCaDirectory" -}}/etc/openmettle/otlp-ca{{- end -}}
+{{- define "openmettle-core.otlpCaPath" -}}/etc/openmettle/otlp-ca/ca.crt{{- end -}}
 
 {{/* Arguments: the root context. Name of the claim the artifact volume mounts. */}}
 {{- define "openmettle-core.artifactsClaimName" -}}
@@ -110,18 +112,20 @@ nested mountpoints under containerd/runc.
 {{- end -}}
 
 {{/*
-Volumes and mounts for one pod. Arguments: dict "root" $ "artifacts" <bool> "auth" <bool>. The
-database CA is mounted into every component (api, worker, migrate) when enabled; the artifact
-volume only where "artifacts" is true (api and worker); auth config, login keys and optional
-provider CA only where "auth" is true (api only). Each helper renders nothing when no volume
-applies.
+Volumes and mounts for one pod. Arguments: dict "root" $ "artifacts" <bool> "auth" <bool> "otlp"
+<bool>. The database CA is mounted into every component (api, worker, migrate) when enabled; the
+artifact volume only where "artifacts" is true (api and worker); auth config, login keys and
+optional provider CA only where "auth" is true (api only); optional OTLP CA bundle only where
+"otlp" is true (api and worker, never migrate). Each helper renders nothing when no volume applies.
 */}}
 {{- define "openmettle-core.volumes" -}}
 {{- $ca := .root.Values.database.caBundle -}}
 {{- $auth := .root.Values.auth -}}
+{{- $otlp := .root.Values.telemetry.otlp -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
-{{- if or $ca.enabled .artifacts $mountAuth }}
+{{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa }}
 volumes:
   {{- if .artifacts }}
   - name: artifacts
@@ -157,15 +161,25 @@ volumes:
         - key: {{ $auth.providerCaBundle.key | quote }}
           path: ca.crt
   {{- end }}
+  {{- if $mountOtlpCa }}
+  - name: otlp-ca
+    configMap:
+      name: {{ required "telemetry.otlp.caBundle.configMapName is required when telemetry.otlp.caBundle.enabled is true" $otlp.caBundle.configMapName | quote }}
+      items:
+        - key: {{ $otlp.caBundle.key | quote }}
+          path: ca.crt
+  {{- end }}
 {{- end }}
 {{- end -}}
 
 {{- define "openmettle-core.volumeMounts" -}}
 {{- $ca := .root.Values.database.caBundle -}}
 {{- $auth := .root.Values.auth -}}
+{{- $otlp := .root.Values.telemetry.otlp -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
-{{- if or $ca.enabled .artifacts $mountAuth }}
+{{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa }}
 volumeMounts:
   {{- if .artifacts }}
   - name: artifacts
@@ -187,6 +201,11 @@ volumeMounts:
   {{- if $mountProviderCa }}
   - name: auth-provider-ca
     mountPath: {{ include "openmettle-core.authProviderCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountOtlpCa }}
+  - name: otlp-ca
+    mountPath: {{ include "openmettle-core.otlpCaDirectory" . | quote }}
     readOnly: true
   {{- end }}
 {{- end }}
@@ -260,7 +279,7 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- if not .Values.networkPolicy.dns.to -}}
 {{- fail "networkPolicy.dns.to must list at least one DNS peer when networkPolicy.enabled is true (an empty list would allow egress to every destination on port 53)" -}}
 {{- end -}}
-{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
 {{- range $i, $peer := $entry.peers -}}
 {{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
 {{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
@@ -431,6 +450,96 @@ provider CA and NetworkPolicy egress guards.
 {{- end -}}
 {{- if .Values.networkPolicy.api.oidc.to -}}
 {{- fail "networkPolicy.api.oidc.to must be empty when auth.enabled is false; remove OIDC egress peers or enable auth" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Telemetry logging (core ADR 0024) and OTLP trace export (core ADR 0026). Logging overrides apply to
+api, worker and migrate; OTLP settings, CA bundle mount and NetworkPolicy egress apply to api and
+worker only (never migrate). The checks repeat the schema for --skip-schema-validation and enforce
+cross-field CA, CIDR, port and NetworkPolicy guards.
+*/ -}}
+{{- $logging := .Values.telemetry.logging -}}
+{{- if not (kindIs "invalid" $logging.format) -}}
+{{- if or (not (kindIs "string" $logging.format)) (not (has $logging.format (list "json" "text"))) -}}
+{{- fail "telemetry.logging.format must be null, \"json\" or \"text\"" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" $logging.level) -}}
+{{- if or (not (kindIs "string" $logging.level)) (not (has $logging.level (list "error" "warn" "info" "debug"))) -}}
+{{- fail "telemetry.logging.level must be null, \"error\", \"warn\", \"info\" or \"debug\" (\"trace\" is refused by core ADR 0024)" -}}
+{{- end -}}
+{{- end -}}
+{{- $otlpPort := .Values.networkPolicy.telemetry.otlp.port -}}
+{{- if not (or (kindIs "int" $otlpPort) (kindIs "int64" $otlpPort) (kindIs "float64" $otlpPort)) -}}
+{{- fail "networkPolicy.telemetry.otlp.port must be an integer between 1 and 65535" -}}
+{{- end -}}
+{{- if or (ne (float64 (int64 $otlpPort)) (float64 $otlpPort)) (lt (int64 $otlpPort) 1) (gt (int64 $otlpPort) 65535) -}}
+{{- fail (printf "networkPolicy.telemetry.otlp.port (%v) must be an integer between 1 and 65535" $otlpPort) -}}
+{{- end -}}
+{{- $otlp := .Values.telemetry.otlp -}}
+{{- if $otlp.enabled -}}
+{{- if or (not (kindIs "string" $otlp.tracesEndpoint)) (not $otlp.tracesEndpoint) -}}
+{{- fail "telemetry.otlp.tracesEndpoint is required when telemetry.otlp.enabled is true (a canonical https:// URL with a DNS host)" -}}
+{{- end -}}
+{{- $endpoint := $otlp.tracesEndpoint -}}
+{{- $endpointPattern := "^https://([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(:[1-9][0-9]{0,4})?/[-A-Za-z0-9._~!$&'()*+,;=:/]*$" -}}
+{{- if or (gt (len $endpoint) 2048) (not (regexMatch $endpointPattern $endpoint)) (regexMatch "^https://[0-9.]+(:|/)" $endpoint) (regexMatch "/\\.\\.?(/|$)" $endpoint) -}}
+{{- fail "telemetry.otlp.tracesEndpoint must be a canonical https:// URL with a lowercase DNS host (no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments)" -}}
+{{- end -}}
+{{- $authority := index (splitList "/" (trimPrefix "https://" $endpoint)) 0 -}}
+{{- $authorityParts := splitList ":" $authority -}}
+{{- $endpointHost := index $authorityParts 0 -}}
+{{- if gt (len $endpointHost) 253 -}}
+{{- fail "telemetry.otlp.tracesEndpoint hostname must be at most 253 characters" -}}
+{{- end -}}
+{{- if gt (len $authorityParts) 1 -}}
+{{- $endpointPort := int64 (atoi (index $authorityParts 1)) -}}
+{{- if or (lt $endpointPort 1) (gt $endpointPort 65535) (eq $endpointPort 443) -}}
+{{- fail (printf "telemetry.otlp.tracesEndpoint port (%d) must be 1-65535 and omit the default port 443" $endpointPort) -}}
+{{- end -}}
+{{- end -}}
+{{- if $otlp.privateRanges -}}
+{{- if not (kindIs "slice" $otlp.privateRanges) -}}
+{{- fail "telemetry.otlp.privateRanges must be a list of CIDR strings" -}}
+{{- end -}}
+{{- if gt (len $otlp.privateRanges) 32 -}}
+{{- fail (printf "telemetry.otlp.privateRanges accepts at most 32 CIDR entries (found %d)" (len $otlp.privateRanges)) -}}
+{{- end -}}
+{{- $seenRanges := dict -}}
+{{- $cidrPattern := "^([0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}|[0-9a-fA-F:.]*:[0-9a-fA-F:.]*/[0-9]{1,3})$" -}}
+{{- range $i, $cidr := $otlp.privateRanges -}}
+{{- if or (not (kindIs "string" $cidr)) (not (regexMatch $cidrPattern $cidr)) -}}
+{{- fail (printf "telemetry.otlp.privateRanges[%d] must be a CIDR string (<ip>/<prefix> with no commas or whitespace)" $i) -}}
+{{- end -}}
+{{- if hasKey $seenRanges $cidr -}}
+{{- fail (printf "telemetry.otlp.privateRanges contains duplicate entry %q" $cidr) -}}
+{{- end -}}
+{{- $_ := set $seenRanges $cidr true -}}
+{{- end -}}
+{{- end -}}
+{{- if $otlp.caBundle.enabled -}}
+{{- if not $otlp.caBundle.configMapName -}}
+{{- fail "telemetry.otlp.caBundle.configMapName is required when telemetry.otlp.caBundle.enabled is true (an existing ConfigMap holding the PEM CA bundle)" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $otlp.caBundle.key))) (has (toString $otlp.caBundle.key) (list "." "..")) -}}
+{{- fail "telemetry.otlp.caBundle.key must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.telemetry.otlp.to) -}}
+{{- fail "networkPolicy.telemetry.otlp.to must list at least one OTLP collector peer when telemetry.otlp.enabled and networkPolicy.enabled are true (an empty list would block trace export or allow egress to every destination)" -}}
+{{- end -}}
+{{- else -}}
+{{- if $otlp.tracesEndpoint -}}
+{{- fail "telemetry.otlp.tracesEndpoint must be empty when telemetry.otlp.enabled is false; clear tracesEndpoint or enable telemetry.otlp" -}}
+{{- end -}}
+{{- if $otlp.privateRanges -}}
+{{- fail "telemetry.otlp.privateRanges must be empty when telemetry.otlp.enabled is false; clear privateRanges or enable telemetry.otlp" -}}
+{{- end -}}
+{{- if $otlp.caBundle.enabled -}}
+{{- fail "telemetry.otlp.caBundle.enabled cannot be true when telemetry.otlp.enabled is false" -}}
+{{- end -}}
+{{- if .Values.networkPolicy.telemetry.otlp.to -}}
+{{- fail "networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false; remove OTLP egress peers or enable telemetry.otlp" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

@@ -30,6 +30,8 @@ matrix=(
   "openmettle ingress-network-policy-disabled.yaml"
   "openmettle auth-enabled.yaml"
   "openmettle auth-network-policy-disabled.yaml"
+  "openmettle telemetry-otlp-enabled.yaml"
+  "openmettle telemetry-network-policy-disabled.yaml"
   "123 yaml-ambiguous.yaml"
 )
 # Standalone private-overlay examples, rendered without minimal.yaml.

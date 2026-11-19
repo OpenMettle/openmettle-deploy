@@ -58,7 +58,7 @@ spec:
       serviceAccountName: {{ $serviceAccountName | quote }}
       automountServiceAccountToken: false
       enableServiceLinks: false
-      {{- $volumes := dict "root" . "artifacts" false "auth" false }}
+      {{- $volumes := dict "root" . "artifacts" false "auth" false "otlp" false }}
       {{- include "openmettle-core.podSecurityContext" (dict "storage" false "auth" false) | nindent 6 }}
       {{- with .Values.images.pullSecrets }}
       imagePullSecrets:
@@ -79,6 +79,14 @@ spec:
               value: {{ int64 $migration.settings.lockTimeoutMs | quote }}
             - name: OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS
               value: {{ int64 $migration.settings.statementTimeoutMs | quote }}
+            {{- if not (kindIs "invalid" .Values.telemetry.logging.format) }}
+            - name: OPENMETTLE_MIGRATE_LOG_FORMAT
+              value: {{ .Values.telemetry.logging.format | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .Values.telemetry.logging.level) }}
+            - name: OPENMETTLE_MIGRATE_LOG_LEVEL
+              value: {{ .Values.telemetry.logging.level | quote }}
+            {{- end }}
           {{- with $migration.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

@@ -10,6 +10,8 @@ Arguments: dict "root" $ "component" "api|worker" "port" <container port>
 {{- $prefix := printf "OPENMETTLE_%s_" (upper $component) -}}
 {{- $context := dict "root" $root "component" $component -}}
 {{- $auth := and (eq $component "api") $root.Values.auth.enabled -}}
+{{- $logging := $root.Values.telemetry.logging -}}
+{{- $otlp := $root.Values.telemetry.otlp -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,7 +42,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ int64 $values.terminationGracePeriodSeconds }}
-      {{- $volumes := dict "root" $root "artifacts" $root.Values.storage.artifacts.enabled "auth" $auth }}
+      {{- $volumes := dict "root" $root "artifacts" $root.Values.storage.artifacts.enabled "auth" $auth "otlp" $otlp.enabled }}
       {{- include "openmettle-core.podSecurityContext" (dict "storage" $root.Values.storage.artifacts.enabled "auth" $auth) | nindent 6 }}
       {{- with $root.Values.images.pullSecrets }}
       imagePullSecrets:
@@ -67,6 +69,26 @@ spec:
               value: {{ int64 $settings.dbTimeoutMs | quote }}
             - name: {{ $prefix }}SHUTDOWN_TIMEOUT_MS
               value: {{ int64 $settings.shutdownTimeoutMs | quote }}
+            {{- if not (kindIs "invalid" $logging.format) }}
+            - name: {{ $prefix }}LOG_FORMAT
+              value: {{ $logging.format | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" $logging.level) }}
+            - name: {{ $prefix }}LOG_LEVEL
+              value: {{ $logging.level | quote }}
+            {{- end }}
+            {{- if $otlp.enabled }}
+            - name: {{ $prefix }}OTLP_TRACES_ENDPOINT
+              value: {{ $otlp.tracesEndpoint | quote }}
+            {{- if $otlp.caBundle.enabled }}
+            - name: {{ $prefix }}OTLP_CA_FILE
+              value: {{ include "openmettle-core.otlpCaPath" $root | quote }}
+            {{- end }}
+            {{- if $otlp.privateRanges }}
+            - name: {{ $prefix }}OTLP_PRIVATE_RANGES
+              value: {{ join "," $otlp.privateRanges | quote }}
+            {{- end }}
+            {{- end }}
             {{- if $auth }}
             - name: OPENMETTLE_API_AUTH_CONFIG
               value: {{ include "openmettle-core.authConfigPath" $root | quote }}

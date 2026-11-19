@@ -34,6 +34,13 @@ networkPolicy:
           matchLabels:
             example.test/enabled: "true"
             example.test/id: "123"
+  telemetry:
+    otlp:
+      to:
+        - podSelector:
+            matchLabels:
+              example.test/otlp: "true"
+              example.test/id: "789"
 auth:
   enabled: true
   configMapName: "789"
@@ -43,3 +50,16 @@ auth:
     enabled: true
     configMapName: "123"
     key: "true"
+telemetry:
+  logging:
+    format: json
+    level: warn
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+    privateRanges:
+      - 10.43.0.0/16
+    caBundle:
+      enabled: true
+      configMapName: "321"
+      key: "false"
