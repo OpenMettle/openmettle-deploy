@@ -1,0 +1,98 @@
+{{- /*
+Schema migration (core ADR 0003): once per release, before new API and worker pods roll out.
+Hooks run before ordinary release resources, so the migrate ServiceAccount is a hook too, at a
+lower weight. There is deliberately no pre-rollback hook: migrations are forward-only. Only the
+migrator refuses a newer schema; the API and worker do not check it, so a rollback relies on core
+ADR 0003's rule that each migration stays compatible with the previous release.
+*/ -}}
+{{- if .Values.migration.enabled }}
+{{- $migration := .Values.migration }}
+{{- $context := dict "root" . "component" "migrate" "serviceAccount" $migration.serviceAccount }}
+{{- $serviceAccountName := include "openmettle-core.serviceAccountName" $context }}
+{{- if $migration.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $serviceAccountName | quote }}
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+  {{- /* Hook annotations take precedence over user annotations with the same key. */}}
+  {{- $hook := dict "helm.sh/hook" "pre-install,pre-upgrade" "helm.sh/hook-weight" "-10" "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded" }}
+  annotations:
+    {{- toYaml (merge $hook (deepCopy $migration.serviceAccount.annotations)) | nindent 4 }}
+automountServiceAccountToken: false
+---
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "openmettle-core.fullname" . }}-migrate
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: {{ int64 $migration.activeDeadlineSeconds }}
+  podFailurePolicy:
+    rules:
+      # Exit 78 is invalid configuration; retrying cannot succeed. Exit 1 (for example a
+      # lock timeout) may be retried within backoffLimit.
+      - action: FailJob
+        onExitCodes:
+          containerName: migrate
+          operator: In
+          values: [78]
+  template:
+    metadata:
+      labels:
+        {{- include "openmettle-core.labels" $context | nindent 8 }}
+      {{- with $migration.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $serviceAccountName | quote }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- include "openmettle-core.podSecurityContext" . | nindent 6 }}
+      {{- with .Values.images.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "openmettle-core.image" (dict "name" "migrate" "image" .Values.images.migrate) | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy | quote }}
+          env:
+            - name: OPENMETTLE_MIGRATE_DATABASE_URL
+              {{- include "openmettle-core.databaseUrlEnv" (dict "name" "migrate" "ref" .Values.database.migrate) | nindent 14 }}
+            - name: OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS
+              value: {{ int64 $migration.settings.connectTimeoutMs | quote }}
+            - name: OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS
+              value: {{ int64 $migration.settings.lockTimeoutMs | quote }}
+            - name: OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS
+              value: {{ int64 $migration.settings.statementTimeoutMs | quote }}
+          {{- with $migration.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- include "openmettle-core.containerSecurityContext" . | nindent 10 }}
+      {{- with $migration.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $migration.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $migration.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

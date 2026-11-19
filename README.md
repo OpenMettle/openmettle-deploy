@@ -1,6 +1,8 @@
 # OpenMettle deploy
 
-Generic Kubernetes/Helm packaging for the [accepted architecture](https://github.com/OpenMettle/openmettle-core/blob/main/ARCHITECTURE-v1.md). **Bootstrap only:** chart metadata and package boundaries are present; there are no workload templates or installable services yet. V1-32 owns the core Helm implementation and V1-20 owns the qualified optional GPU profile.
+Generic Kubernetes/Helm packaging for the [accepted architecture](https://github.com/OpenMettle/openmettle-core/blob/main/ARCHITECTURE-v1.md). V1-32 owns the core Helm implementation and V1-20 owns the qualified optional GPU profile.
+
+**Status:** `charts/openmettle-core` has its render contract (V1-32 I1): API and worker Deployments, the API Service, per-component ServiceAccounts, a migration hook Job, a strict values schema and render-time tests. It has not been installed on any cluster. Cluster smoke testing, NetworkPolicy, storage and ingress follow in later increments; see the [chart README](charts/openmettle-core/README.md#pending).
 
 ## Package boundaries
 
@@ -12,9 +14,11 @@ Generic Kubernetes/Helm packaging for the [accepted architecture](https://github
 
 ```sh
 python3 scripts/check_repository.py
+bash tests/chart/render.sh                      # helm lint, render matrix, kubeconform
+python3 -m unittest discover -s tests/chart -v  # chart policy tests; needs PyYAML
 ```
 
-The bootstrap CI checks repository hygiene. Add a pinned Helm toolchain, lint/render/schema checks and the CPU-only/optional-package render matrix when workload templates arrive. No successful cluster deployment, backup or restore is implied by this scaffold. Keep local values in ignored `config/*.local.yaml` or an external private configuration repository.
+CI checks repository hygiene and runs the chart `render` job: SHA-256-verified Helm and kubeconform (`tests/chart/install-tools.sh`, linux/amd64), the commands above, and a byte comparison of the core contract fixture with the pinned core commit. Locally, the scripts use `helm` and `kubeconform` from `PATH` (or `HELM` and `KUBECONFORM`). kubeconform downloads schemas from the pinned source at run time. No successful cluster deployment, backup or restore is implied. Keep local values in ignored `config/*.local.yaml` or an external private configuration repository.
 
 ## Operations
 

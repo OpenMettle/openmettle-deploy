@@ -21,3 +21,40 @@ jobs:
           persist-credentials: false
       - name: Check repository hygiene
         run: python3 scripts/check_repository.py
+
+  render:
+    # V1-32 I1: render contract only. Nothing is installed on a cluster, pushed or published.
+    name: Chart render contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # openmettle-core commit whose runtime/process-contract.json is copied under tests/fixtures.
+      CORE_COMMIT: 5cd8a9dcdd31989eb09adb425115e3d187a5d0e7
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Lint shell scripts
+        run: shellcheck tests/chart/install-tools.sh tests/chart/render.sh
+      - name: Install pinned Helm and kubeconform (SHA-256 verified)
+        run: |
+          bash tests/chart/install-tools.sh "$RUNNER_TEMP/chart-tools"
+          echo "$RUNNER_TEMP/chart-tools" >> "$GITHUB_PATH"
+      - name: Install test-only PyYAML (hash pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check --require-hashes \
+            --only-binary :all: --no-deps -r tests/chart/requirements.txt
+      - name: Lint, render matrix and kubeconform
+        run: bash tests/chart/render.sh
+      - name: Policy, negative-case and contract tests
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tests/chart -v
+      - name: Verify core contract fixture against the pinned commit
+        run: |
+          fixture="tests/fixtures/core-${CORE_COMMIT:0:7}/process-contract.json"
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
+            --output "$RUNNER_TEMP/process-contract.json" \
+            "https://raw.githubusercontent.com/OpenMettle/openmettle-core/$CORE_COMMIT/runtime/process-contract.json"
+          cmp "$RUNNER_TEMP/process-contract.json" "$fixture"

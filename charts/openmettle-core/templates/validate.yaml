@@ -1,0 +1,2 @@
+{{- /* Emits nothing; fails the render when a cross-field guard is violated. */ -}}
+{{- include "openmettle-core.validate" . -}}
