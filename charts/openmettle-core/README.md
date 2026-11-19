@@ -1,6 +1,6 @@
 # openmettle-core chart
 
-CPU-only packaging for the OpenMettle core API, worker and schema migration. This is V1-32 increment I1, the **render contract**: templates, the values schema, security defaults and render-time tests. The chart has not been installed on any cluster yet. A successful render is not application acceptance or qualification.
+CPU-only packaging for the OpenMettle core API, worker and schema migration. Increment I1 of V1-32 is the **render contract**: templates, the values schema, security defaults and render-time tests. I2 adds a **kind install smoke test** ([`tests/kind`](../../tests/kind/README.md)). No smoke run has passed yet; see [Validation](#validation). Neither a render nor a smoke run is application acceptance or qualification.
 
 ## What it renders
 
@@ -99,11 +99,29 @@ bash tests/chart/render.sh                    # helm lint, render matrix, kubeco
 python3 -m unittest discover -s tests/chart -v  # policy, negative-case and contract tests
 ```
 
-Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim; `render.sh` fails on any other Helm version. The chart sets no `kubeVersion` floor. The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim; `render.sh` fails on any other Helm version. The chart sets no `kubeVersion` floor.
+
+### Kind smoke test (I2)
+
+[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `5cd8a9d`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
+
+| Item | Smoke-tested |
+| --- | --- |
+| api, worker and migrate images install by digest | Yes (digest read back from the node's containerd) |
+| Migration hook completes before the Deployments roll out | Yes |
+| API and worker Ready; `/readyz` 200 | Yes |
+| Worker scales to 2 while the API stays at 1 | Yes, through `worker.replicas` |
+| No optional package present | Yes |
+| Same-digest `helm upgrade` reruns migrate as a no-op and stays Ready | Yes |
+| `helm uninstall` leaves no release objects | Yes |
+| App namespace enforces Pod Security `restricted` | Yes |
+| NetworkPolicy, storage, ingress, registry pulls, multi-node | No (I3, I4 or the owner's qualification) |
+
+The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on manual dispatch and on merges to `main` that touch the chart or the harness. **No run has passed yet**, so these items are designed but unverified until one does. Pull requests run only the harness's cluster-free tests. The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
-- **I2:** kind smoke test: install with migrations, readiness, worker scaling, idempotent upgrade and clean uninstall. Also confirms hook ordering under Helm 4.3 `--wait`.
+- **I2:** a passing dispatched kind smoke run. The harness and workflow exist, but the run is unverified (see [Kind smoke test](#kind-smoke-test-i2)). A passing run also confirms hook ordering under Helm 4.3 `--wait=watcher`.
 - **I3:** NetworkPolicies (chart-scoped deny-all, per-component allows).
 - **I4:** artifact PVC, database CA mount, Ingress and TLS, PodDisruptionBudget, a synthetic example profile and overlay documentation. All will be off by default.
 - **I5 / V1-04:** OIDC and auth settings, login key mounts, a `--check-auth-config` hook and identity-provider egress. No auth values are accepted yet.

@@ -1,0 +1,66 @@
+name: Kind smoke
+# V1-32 I2: installs charts/openmettle-core on an ephemeral kind cluster classified dev, using
+# core images built from the pinned commit and referenced by digest. Images are built and loaded
+# locally; nothing is pushed, published or deployed to any other cluster.
+# Hosted minutes are billed while this repository is private, so the job runs on manual dispatch
+# and on merges to main that change the chart, the harness or this workflow. Pull requests run the
+# cluster-free harness tests in checks.yml instead.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - charts/openmettle-core/**
+      - tests/kind/**
+      - tests/chart/install-tools.sh
+      - .github/workflows/kind-smoke.yml
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  kind-smoke:
+    name: Chart install on ephemeral kind (dev)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Must equal smoke.py CORE_COMMIT and checks.yml (unit-tested).
+      CORE_COMMIT: 5cd8a9dcdd31989eb09adb425115e3d187a5d0e7
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Check out pinned openmettle-core
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          repository: OpenMettle/openmettle-core
+          ref: ${{ env.CORE_COMMIT }}
+          path: core-src
+          persist-credentials: false
+      - name: Install pinned kind and kubectl from core (SHA-256 verified)
+        run: bash core-src/tests/kubernetes/install-tools.sh "$RUNNER_TEMP/k8s-tools"
+      - name: Install pinned Helm (SHA-256 verified)
+        run: bash tests/chart/install-tools.sh "$RUNNER_TEMP/chart-tools"
+      - name: Harness tests with the imported core guards (no cluster)
+        env:
+          OPENMETTLE_CORE_DIR: core-src
+          HELM: ${{ runner.temp }}/chart-tools/helm
+        run: python3 -m unittest discover -s tests/kind -v
+      - name: Install the chart on ephemeral kind
+        env:
+          OPENMETTLE_K8S_QUALIFICATION: isolated-dev
+          OPENMETTLE_K8S_DOCKER_CONTEXT: default
+        run: >-
+          python3 tests/kind/smoke.py
+          --core-dir core-src
+          --tools-dir "$RUNNER_TEMP/k8s-tools"
+          --helm-dir "$RUNNER_TEMP/chart-tools"
+          --report "$RUNNER_TEMP/kind-smoke.json"
+      - name: Publish the non-secret summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/kind-smoke.json" ]; then
+            { echo '```json'; cat "$RUNNER_TEMP/kind-smoke.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
