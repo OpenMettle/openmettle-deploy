@@ -22,6 +22,7 @@ import queue
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -59,12 +60,15 @@ SECRET = {"api": "openmettle-api-database", "worker": "openmettle-worker-databas
           "migrate": "openmettle-owner-database"}
 DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "openmettle_owner"}
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
-# Helm 4 has no `list --all`; these status filters together list releases in every state.
-HELM_EVERY_STATUS = ("--deployed", "--failed", "--pending", "--superseded", "--uninstalled", "--uninstalling")
 MIGRATION_DEADLINE_SECONDS = 120
 OPTIONAL_KINDS = "networkpolicies,ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
 RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets"
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
+# Stderr kept in a failure message, as core's Runner keeps; redacted before it is truncated.
+STDERR_TAIL = 2000
+DIAGNOSTIC_TAIL = {"stdout": 6000, "stderr": 2000}
+# Termination signals that must still run cleanup (SIGINT already raises KeyboardInterrupt).
+CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 PSA_DENIAL = 'violates PodSecurity "restricted'
 SUMMARY_KEYS = {"result", "classification", "core_commit", "cluster", "release", "namespace",
                 "tools", "images", "checks", "error", "cleanup_errors"}
@@ -89,11 +93,18 @@ def check_core_checkout(head: str, porcelain: str) -> None:
 
 
 def core_checkout_state(core_dir: Path) -> tuple:
-    """(HEAD, `git status --porcelain`) of the core checkout, read before any core code runs."""
+    """(HEAD, `git status --porcelain --ignored`) of the core checkout, read before any core code runs.
+
+    Ignored files count as changes because they would enter the Docker build context. Any git
+    error refuses rather than reading as a clean checkout.
+    """
     def git(*args):
-        return subprocess.run(["git", "-C", str(core_dir), *args], capture_output=True, text=True,
-                              timeout=60, check=False).stdout
-    return git("rev-parse", "HEAD"), git("status", "--porcelain")
+        result = subprocess.run(["git", "-C", str(core_dir), *args], capture_output=True, text=True,
+                                timeout=60, check=False)
+        if result.returncode:
+            raise Refusal(f"git {' '.join(args)} failed in {core_dir} (exit {result.returncode})")
+        return result.stdout
+    return git("rev-parse", "HEAD"), git("status", "--porcelain", "--ignored")
 
 
 def load_core(core_dir: Path):
@@ -289,9 +300,14 @@ def job_completions(events: list, job: str) -> list:
 
 
 def images_reported_present(events: list, references: list) -> list:
-    """References that kubelet reported as already present (pullPolicy Never, nothing pulled)."""
+    """References that kubelet reported as already present (pullPolicy Never, nothing pulled).
+
+    A `Pulled` event also reports a real pull ("Successfully pulled image ..."); only the
+    "already present" message counts.
+    """
     messages = [e.get("message", "") for e in events if e.get("reason") == "Pulled"]
-    return sorted(ref for ref in references if any(f'"{ref}"' in m for m in messages))
+    return sorted(ref for ref in references
+                  if any(m.startswith(f'Container image "{ref}" already present') for m in messages))
 
 
 def object_names(items: list) -> list:
@@ -326,10 +342,20 @@ def assert_no_secrets(text: str, values) -> None:
 
 
 def redact(text: str, values) -> str:
+    """Replace every whole secret value. Redact before truncating: a cut can split a value."""
     for value in values:
         if value:
             text = text.replace(value, "[redacted]")
     return text
+
+
+def redacted_tail(text: str, values, limit: int) -> str:
+    return redact(text, values)[-limit:]
+
+
+def ctr_image_names(output: str) -> set:
+    """Image names from `ctr images ls` output."""
+    return {line.split()[0] for line in output.splitlines()[1:] if line.split()}
 
 
 def build_summary(report: dict) -> dict:
@@ -398,7 +424,7 @@ class Smoke:
         self.values = workdir / "values.json"
         self.env = smoke_environment(
             core.child_environment(environ, self.kubeconfig, self.context, tools_dir), workdir, helm_dir)
-        self.run = core.Runner(self.env)
+        self.runner = core.Runner(self.env)
         context = f"kind-{self.name}"
         self.kubectl = ["kubectl", "--kubeconfig", str(self.kubeconfig), "--context", context]
         self.helm = ["helm", "--kubeconfig", str(self.kubeconfig), "--kube-context", context,
@@ -417,6 +443,17 @@ class Smoke:
             "images": {}, "checks": []}
 
     # helpers
+    def run(self, args, *, input=None, check=True, timeout=600):
+        """core's Runner, but the exit status is checked here so that the whole stderr is redacted
+        before it is truncated. core's Runner keeps only the last 2000 characters, which can split
+        a fixture password so that whole-value redaction misses the remaining part."""
+        result = self.runner(args, input=input, check=False, timeout=timeout)
+        if check and result.returncode != 0:
+            detail = redacted_tail(result.stderr.strip(), self.passwords.values(), STDERR_TAIL)
+            raise self.core.QualificationFailure(
+                f"{' '.join(args[:4])} ... exited {result.returncode}: {detail}")
+        return result
+
     def kube(self, *args, input=None, check=True, timeout=300):
         return self.run([*self.kubectl, *args], input=input, check=check, timeout=timeout)
 
@@ -491,9 +528,10 @@ class Smoke:
     def build_images(self):
         for role in ROLES:
             _log(f"building {self.tags[role]} from core {CORE_COMMIT[:7]} (local only; never pushed)")
-            self.built_images.append(self.tags[role])
             self.run(["docker", "build", "--builder", "default", "--target", role,
                       "--tag", self.tags[role], str(self.core_dir)], timeout=1800)
+            # docker tags only a successful build; cleanup removes only images that exist.
+            self.built_images.append(self.tags[role])
 
     def create_cluster(self):
         _log(f"creating kind cluster {self.name} (dev, temporary kubeconfig)")
@@ -522,7 +560,9 @@ class Smoke:
             digest = parse_ctr_digest(listing, self.tags[role])
             reference = digest_reference(role, digest)
             before = self.cri_image_id(reference, check=False)
-            if before is None:
+            # Add the name unless containerd already holds it. CRI resolving the reference first
+            # does not prove the name exists, and the check below reads the name.
+            if reference not in ctr_image_names(listing):
                 self.node_exec("ctr", "--namespace=k8s.io", "images", "tag", self.tags[role], reference)
             alias = parse_ctr_digest(self.node_exec("ctr", "--namespace=k8s.io", "images", "ls").stdout,
                                      reference)
@@ -639,10 +679,16 @@ class Smoke:
                                                 "deployments,services,serviceaccounts,jobs,configmaps,secrets",
                                                 "--selector", f"app.kubernetes.io/instance={RELEASE}")["items"])
         self.expect(inventory == expected_release_objects(), f"release objects: {inventory}")
+        # Every non-hook object Helm manages, read back live (hooks are not in the manifest).
+        manifest = self.helm_run("get", "manifest", RELEASE).stdout
+        live = json.loads(self.kube("--namespace", APP_NAMESPACE, "get", "--filename", "-", "--output=json",
+                                    input=manifest).stdout)
+        managed = object_names(live["items"] if live.get("kind") == "List" else [live])
+        self.expect(managed == expected_release_objects(), f"release manifest objects: {managed}")
         optional = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", OPTIONAL_KINDS)["items"])
         self.expect(not optional, f"optional objects present: {optional}")
-        releases = json.loads(self.run([*self.helm[:5], "list", "--all-namespaces", *HELM_EVERY_STATUS,
-                                        "--output", "json"]).stdout)
+        # Helm 4 `list` shows releases in every status by default.
+        releases = json.loads(self.run([*self.helm[:5], "list", "--all-namespaces", "--output", "json"]).stdout)
         self.expect([r["name"] for r in releases] == [RELEASE], f"other Helm releases: {releases}")
         all_pods = self.kube_json("--namespace", APP_NAMESPACE, "get", "pods")["items"]
         components = sorted({p["metadata"].get("labels", {}).get("app.kubernetes.io/component", "")
@@ -702,7 +748,7 @@ class Smoke:
                                                 "--selector", f"kubernetes.io/service-name={FULLNAME}-api")["items"])
             return left
         self.wait_for("release objects to be removed", lambda: not residue(), timeout=120)
-        releases = json.loads(self.helm_run("list", *HELM_EVERY_STATUS, "--output", "json").stdout)
+        releases = json.loads(self.helm_run("list", "--output", "json").stdout)
         self.expect(releases == [], f"Helm still lists a release: {releases}")
         # The test, not the chart, owns the URL Secrets: uninstall must leave them alone.
         remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "secrets",
@@ -724,7 +770,8 @@ class Smoke:
                 result = self.kube(*args, check=False, timeout=60)
             except (subprocess.TimeoutExpired, OSError):
                 continue
-            print(redact(result.stdout[-6000:] + result.stderr[-2000:], self.passwords.values()),
+            print(redacted_tail(result.stdout, self.passwords.values(), DIAGNOSTIC_TAIL["stdout"])
+                  + redacted_tail(result.stderr, self.passwords.values(), DIAGNOSTIC_TAIL["stderr"]),
                   file=sys.stderr)
 
     def cleanup(self) -> list:
@@ -742,6 +789,24 @@ class Smoke:
             except Exception as exc:  # noqa: BLE001 - attempt every owned resource
                 failures.append(f"{' '.join(command)}: {type(exc).__name__}")
         return failures
+
+
+def install_cleanup_handlers() -> dict:
+    """Turn SIGTERM and SIGHUP into KeyboardInterrupt so that main() still cleans up.
+
+    The first signal interrupts the run; later ones are ignored so that they cannot cut cleanup
+    short. SIGINT keeps Python's default, so a second Ctrl-C can still abort cleanup.
+    """
+    def interrupt(signum, _frame):
+        for sig in CLEANUP_SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+    return {sig: signal.signal(sig, interrupt) for sig in CLEANUP_SIGNALS}
+
+
+def restore_handlers(previous: dict) -> None:
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
 
 
 def parse_args(argv=None):
@@ -781,6 +846,7 @@ def main(argv=None) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return 3
     status = 1
+    previous_handlers = install_cleanup_handlers()
     try:
         smoke.build_images()
         smoke.create_cluster()
@@ -788,6 +854,10 @@ def main(argv=None) -> int:
         smoke.deploy_fixtures()
         smoke.scenario()
         status = 0
+    except KeyboardInterrupt as exc:  # SIGINT, or SIGTERM/SIGHUP through the handler
+        smoke.report["result"] = "failed"
+        smoke.report["error"] = f"interrupted: {exc or 'SIGINT'}"
+        print(f"smoke {smoke.report['error']}; cleaning up", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - every failure is reported, diagnosed and cleaned up
         smoke.report["result"] = "failed"
         detail = str(exc) if isinstance(exc, failures) else f"{type(exc).__name__}: {exc}"
@@ -795,18 +865,21 @@ def main(argv=None) -> int:
         print(f"smoke failed: {smoke.report['error']}", file=sys.stderr)
         smoke.diagnostics()
     finally:
-        cleanup_failures = smoke.cleanup()
-        if cleanup_failures:
-            status = 1
-            smoke.report["result"] = "failed"
-            smoke.report["cleanup_errors"] = cleanup_failures
-            _log(f"cleanup failed; temporary kubeconfig retained for recovery in {workdir}")
-        else:
-            shutil.rmtree(workdir, ignore_errors=True)
-        if args.report:
-            text = json.dumps(build_summary(smoke.report), indent=2) + "\n"
-            assert_no_secrets(text, smoke.passwords.values())
-            args.report.write_text(text)
+        try:
+            cleanup_failures = smoke.cleanup()
+            if cleanup_failures:
+                status = 1
+                smoke.report["result"] = "failed"
+                smoke.report["cleanup_errors"] = cleanup_failures
+                _log(f"cleanup failed; temporary kubeconfig retained for recovery in {workdir}")
+            else:
+                shutil.rmtree(workdir, ignore_errors=True)
+            if args.report:
+                text = json.dumps(build_summary(smoke.report), indent=2) + "\n"
+                assert_no_secrets(text, smoke.passwords.values())
+                args.report.write_text(text)
+        finally:
+            restore_handlers(previous_handlers)
     return status
 
 

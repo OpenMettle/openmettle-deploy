@@ -1,14 +1,17 @@
 """Cluster-free tests for the kind smoke harness (tests/kind/smoke.py).
 
-They cover guards, digest parsing, fixture and values derivation, event evaluation and the
-published summary. They do not create a cluster and are not evidence that the chart installs;
-only a dispatched `kind-smoke` run is. Set OPENMETTLE_CORE_DIR to a directory holding core's
+They cover guards, digest parsing, fixture and values derivation, event evaluation, the
+published summary and the orchestration (ordering, refusals, cleanup, redaction and every scenario
+assertion) against a recording fake cluster. They do not create a cluster and are not evidence that
+the chart installs; only a `kind-smoke` workflow run is. Set OPENMETTLE_CORE_DIR to a directory holding core's
 tests/kubernetes/qualify.py at CORE_COMMIT to also exercise the imported core guards. CI does.
 """
+import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -123,13 +126,6 @@ class MainRefusalTest(unittest.TestCase):
         popen.assert_not_called()
         self.assertFalse(report.exists())
 
-    def test_core_checkout_state_reads_git(self):
-        if shutil.which("git") is None:
-            self.skipTest("git not on PATH")
-        head, porcelain = smoke.core_checkout_state(ROOT)
-        self.assertRegex(head.strip(), r"^[0-9a-f]{40}$")
-        self.assertIsInstance(porcelain, str)
-
     def test_arguments_must_be_directories(self):
         with mock.patch("sys.stderr"):
             with self.assertRaises(SystemExit):
@@ -141,6 +137,661 @@ class MainRefusalTest(unittest.TestCase):
         args = smoke.parse_args(["--core-dir", str(self.tmp), "--tools-dir", str(self.tmp)])
         self.assertTrue(args.core_dir.is_absolute())
         self.assertIsNone(args.helm_dir)
+
+
+def git(directory, *args):
+    subprocess.run(["git", "-C", str(directory), "-c", "core.hooksPath=/dev/null", "-c", "user.name=smoke",
+                    "-c", "user.email=smoke@example.invalid", "-c", "commit.gpgsign=false", *args],
+                   check=True, capture_output=True, text=True)
+
+
+@unittest.skipIf(shutil.which("git") is None, "git not on PATH")
+class CoreCheckoutStateTest(unittest.TestCase):
+    """core_checkout_state reads HEAD and every change, including ignored files, and fails closed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        git(self.tmp, "init", "--quiet")
+        (self.tmp / ".gitignore").write_text("build/\n")
+        git(self.tmp, "add", ".gitignore")
+        git(self.tmp, "commit", "--quiet", "--message", "fixture")
+
+    def test_clean_checkout(self):
+        head, porcelain = smoke.core_checkout_state(self.tmp)
+        self.assertRegex(head.strip(), r"^[0-9a-f]{40}$")
+        self.assertEqual(porcelain, "")
+
+    def test_ignored_and_untracked_files_are_changes(self):
+        for path in ("build/context.txt", "untracked.txt"):
+            with self.subTest(path=path):
+                (self.tmp / path).parent.mkdir(exist_ok=True)
+                (self.tmp / path).write_text("x")
+                _, porcelain = smoke.core_checkout_state(self.tmp)
+                self.assertIn(path.split("/")[0], porcelain)
+                with self.assertRaisesRegex(smoke.Refusal, "local changes"):
+                    smoke.check_core_checkout(smoke.CORE_COMMIT, porcelain)
+                (self.tmp / path).unlink()
+
+    def test_git_errors_refuse(self):
+        not_a_repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, not_a_repo)
+        with self.assertRaisesRegex(smoke.Refusal, "rev-parse HEAD failed"):
+            smoke.core_checkout_state(not_a_repo)
+        failing = [mock.Mock(returncode=0, stdout=smoke.CORE_COMMIT + "\n"), mock.Mock(returncode=128, stdout="")]
+        with mock.patch.object(smoke.subprocess, "run", side_effect=failing), \
+                self.assertRaisesRegex(smoke.Refusal, "status --porcelain --ignored failed"):
+            smoke.core_checkout_state(self.tmp)
+
+
+# --- Orchestration against a recording fake cluster ----------------------------------------------
+
+IMAGE_ID = {role: "sha256:" + "f" * 63 + str(i) for i, role in enumerate(smoke.ROLES, start=1)}
+MUTATING = (("helm", "install"), ("helm", "upgrade"), ("helm", "uninstall"), ("kubectl", "apply"))
+
+
+class FakeCluster:
+    """Answers every command smoke.py runs as a healthy kind cluster would, and records them.
+
+    `doctors` rewrite single observations; each is called as doctor(args, result) and may return a
+    replacement result. `unknown` collects commands the fake does not model.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.unknown = []
+        self.doctors = []
+        self.passwords = {}
+        self.namespaces = {}
+        self.ctr = {}
+        self.built = set()
+        self.name = None
+        self.revision = 0
+        self.installed = False
+        self.replicas = {"api": 1, "worker": 1}
+        self.generation = {"api": 1, "worker": 1}
+        self.readyz = 200
+        self.core = self.make_core()
+
+    def make_core(self):
+        fake = self
+
+        class Refusal(Exception):
+            pass
+
+        class QualificationFailure(Exception):
+            pass
+
+        def check_cluster_identity(config, nodes, label, name):
+            fake.calls.append(["IDENTITY"])
+            if config.get("current-context") != f"kind-{name}" or nodes != [f"{name}-control-plane"] \
+                    or label != name:
+                raise Refusal("identity mismatch")
+
+        def runner(env):
+            return fake
+
+        return mock.Mock(
+            spec=list(smoke.CORE_IMPORTS), KIND_VERSION="v0", KUBECTL_VERSION="v0", NODE_IMAGE="node",
+            POSTGRES_IMAGE="postgres@sha256:" + "e" * 64, Refusal=Refusal, QualificationFailure=QualificationFailure,
+            Runner=runner, http_get=lambda port, path: (fake.readyz, ""),
+            check_opt_in=lambda environ: "default", check_tools=lambda run: None,
+            check_docker_context=lambda run, context: None, check_cluster_absent=lambda run, name: None,
+            check_cluster_identity=check_cluster_identity,
+            child_environment=lambda environ, kubeconfig, context, tools: dict(environ))
+
+    # Runner protocol: the same signature and failure message as core's Runner.
+    def __call__(self, args, *, input=None, check=True, timeout=600):
+        args = list(args)
+        self.calls.append(args)
+        returncode, stdout, stderr = self.respond(args, input)
+        result = subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        for doctor in self.doctors:
+            result = doctor(args, result) or result
+        if check and result.returncode != 0:
+            raise self.core.QualificationFailure(
+                f"{' '.join(args[:4])} ... exited {result.returncode}: {result.stderr.strip()[-2000:]}")
+        return result
+
+    def commands(self, *prefix):
+        """Recorded commands, with kubectl and helm connection flags removed, that start with prefix."""
+        return [c for c in map(self.strip, self.calls) if c[:len(prefix)] == list(prefix)]
+
+    @staticmethod
+    def strip(args):
+        if args[0] == "kubectl" and "--context" in args:
+            return ["kubectl", *args[args.index("--context") + 2:]]
+        if args[0] == "kubectl" and "--kubeconfig" in args:
+            return ["kubectl", *args[args.index("--kubeconfig") + 2:]]
+        if args[0] == "helm" and "--kube-context" in args:
+            rest = args[args.index("--kube-context") + 2:]
+            return ["helm", *(rest[2:] if rest[:1] == ["--namespace"] else rest)]
+        return args
+
+    # responses
+    def respond(self, args, input):
+        if args[:2] == ["helm", "version"]:
+            return 0, "v4.3.0\n", ""
+        if args[:2] == ["docker", "build"]:
+            self.built.add(args[args.index("--tag") + 1])
+            return 0, "", ""
+        if args[:3] == ["docker", "image", "rm"]:
+            return (0, "", "") if args[3] in self.built else (1, "", f"No such image: {args[3]}")
+        if args[:3] == ["kind", "create", "cluster"]:
+            self.name = args[args.index("--name") + 1]
+            Path(args[args.index("--kubeconfig") + 1]).write_text("synthetic")
+            return 0, "", ""
+        if args[:3] == ["kind", "load", "docker-image"]:
+            role = args[3].split("/")[2].split(":")[0]
+            self.ctr[args[3]] = DIGEST[role]
+            self.ctr[f"import-2026-11-19@{DIGEST[role]}"] = DIGEST[role]
+            return 0, "", ""
+        if args[:3] == ["kind", "delete", "cluster"]:
+            return 0, "", ""
+        if args[:2] == ["docker", "inspect"]:
+            return 0, f"{self.name}\n", ""
+        if args[:2] == ["docker", "exec"]:
+            return self.node(args[3:])
+        if args[0] == "kubectl":
+            return self.kubectl(self.strip(args)[1:], input)
+        if args[0] == "helm":
+            return self.helm(self.strip(args)[1:])
+        self.unknown.append(args)
+        return 1, "", "unmodelled command"
+
+    def node(self, args):
+        if args[:4] == ["ctr", "--namespace=k8s.io", "images", "ls"]:
+            rows = [f"{name} application/vnd.oci.image.index.v1+json {digest} 40 MiB linux/amd64 -"
+                    for name, digest in sorted(self.ctr.items())]
+            return 0, "\n".join(["REF TYPE DIGEST SIZE PLATFORMS LABELS", *rows]) + "\n", ""
+        if args[:4] == ["ctr", "--namespace=k8s.io", "images", "tag"]:
+            if args[5] in self.ctr:
+                return 1, "", "image already exists"
+            self.ctr[args[5]] = self.ctr[args[4]]
+            return 0, "", ""
+        if args[:2] == ["crictl", "inspecti"]:
+            digest = self.ctr.get(args[-1])
+            if digest is None:
+                return 1, "", "no such image"
+            role = next(r for r in smoke.ROLES if DIGEST[r] == digest)
+            return 0, json.dumps({"status": {"id": IMAGE_ID[role]}}), ""
+        if args[:2] == ["crictl", "ps"]:
+            role = args[args.index("--id") + 1].split("-")[1]
+            return 0, json.dumps({"containers": [{"id": "c", "imageRef": IMAGE_ID[role]}]}), ""
+        self.unknown.append(args)
+        return 1, "", "unmodelled node command"
+
+    def pod(self, component, index):
+        name = f"{smoke.FULLNAME}-{component}-{index}"
+        return {"metadata": {"name": name, "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
+                                                      "app.kubernetes.io/component": component}},
+                "spec": {"containers": [{"name": component, "imagePullPolicy": "Never",
+                                         "image": smoke.digest_reference(component, DIGEST[component]),
+                                         "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}]},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                           "containerStatuses": [{"restartCount": 0, "containerID": f"containerd://cid-{component}-"
+                                                                                    f"{index}",
+                                                  "imageID": f"import-2026-11-19@{DIGEST[component]}"}]}}
+
+    def pods(self, component=None):
+        if not self.installed:
+            return []
+        components = [component] if component else list(smoke.WORKLOADS)
+        return [self.pod(c, i) for c in components if c in self.replicas for i in range(self.replicas[c])]
+
+    @staticmethod
+    def items(names):
+        return [{"kind": n.split("/")[0], "metadata": {"name": n.split("/")[1]}} for n in names]
+
+    def kubectl(self, args, input):
+        ok = lambda data: (0, json.dumps(data) if not isinstance(data, str) else data, "")  # noqa: E731
+        listing = lambda items: ok({"kind": "List", "items": items})  # noqa: E731
+        if args[:2] == ["config", "view"]:
+            return ok({"current-context": f"kind-{self.name}", "contexts": [{"name": f"kind-{self.name}"}]})
+        if args[:2] == ["get", "nodes"]:
+            return listing([{"metadata": {"name": f"{self.name}-control-plane"}}])
+        if args[:2] == ["get", "namespace"]:
+            if args[2] not in self.namespaces:
+                return 1, "", f'namespaces "{args[2]}" not found'
+            return ok({"metadata": {"name": args[2], "labels": self.namespaces[args[2]]}})
+        if args[:3] == ["apply", "--filename", "-"]:
+            for item in json.loads(input)["items"]:
+                if item["kind"] == "Namespace":
+                    self.namespaces[item["metadata"]["name"]] = item["metadata"]["labels"]
+                if item["metadata"]["name"] == "postgres-fixture":
+                    self.passwords["admin"] = item["stringData"]["admin-password"]
+                if item["kind"] == "Secret" and "url" in item.get("stringData", {}):
+                    role = next(r for r in smoke.ROLES if smoke.SECRET[r] == item["metadata"]["name"])
+                    self.passwords[role] = item["stringData"]["url"].split(":")[2].split("@")[0]
+            return 0, "applied", ""
+        if args[:2] == ["create", "--dry-run=server"]:
+            return 1, "", f'pods "psa-probe" is forbidden: {smoke.PSA_DENIAL}:latest": allowPrivilegeEscalation'
+        if args[:1] != ["--namespace"]:
+            if args[:3] == ["get", "pods", "--all-namespaces"]:
+                return ok("NAME READY\n")
+            self.unknown.append(args)
+            return 1, "", "unmodelled kubectl command"
+        namespace, args = args[1], args[2:]
+        if namespace == smoke.DB_NAMESPACE:
+            if args[:2] == ["rollout", "status"]:
+                return 0, "rolled out", ""
+            if args[:1] == ["exec"]:
+                return 0, "20261101000000|t|aa|2026-11-19 10:01:00\n20261102000000|t|bb|2026-11-19 10:01:00\n", ""
+            if args[:2] == ["get", "events"]:
+                return ok("No events")
+        selector = args[args.index("--selector") + 1] if "--selector" in args else ""
+        if args[:2] == ["get", "deployment"]:
+            component = args[2].rsplit("-", 1)[1]
+            return ok({"metadata": {"name": args[2], "generation": self.generation[component],
+                                    "creationTimestamp": "2026-11-19T10:01:30Z"},
+                       "status": {"readyReplicas": self.replicas[component]}})
+        if args[:2] == ["get", "pods"]:
+            component = selector.partition("app.kubernetes.io/component=")[2] or None
+            return listing(self.pods(component))
+        if args[:2] == ["get", "job"]:
+            return ok("")
+        if args[:2] == ["get", "events"] and "--sort-by=.lastTimestamp" in args:
+            return ok("LAST SEEN TYPE REASON\n")
+        if args[:2] == ["get", "events"]:
+            selectors = args[args.index("--field-selector") + 1] if "--field-selector" in args else ""
+            if selectors == "involvedObject.kind=Job":
+                return listing([{"reason": "Completed", "lastTimestamp": f"2026-11-19T10:0{r}:00Z", "message": "",
+                                 "involvedObject": {"kind": "Job", "name": f"{smoke.FULLNAME}-migrate",
+                                                    "uid": f"job-{r}"}} for r in range(1, self.revision + 1)])
+            if selectors == "reason=Pulled":
+                return listing([{"reason": "Pulled", "message": f'Container image '
+                                 f'"{smoke.digest_reference(r, DIGEST[r])}" already present on machine'}
+                                for r in smoke.ROLES])
+        if args[:1] == ["get"] and args[1] in ("deployments,services,serviceaccounts,jobs,configmaps,secrets",
+                                               smoke.RELEASE_KINDS):
+            return listing(self.items(smoke.expected_release_objects()) if self.installed else [])
+        if args[:3] == ["get", "--filename", "-"]:
+            return listing(self.items(smoke.expected_release_objects()))
+        if args[:2] == ["get", smoke.OPTIONAL_KINDS]:
+            return listing([])
+        if args[:2] in (["get", "secrets"], ["get", "endpointslices"]):
+            if selector == smoke.RUN_LABEL:
+                return listing(self.items(f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES))
+            return listing([])
+        if args[:1] == ["logs"]:
+            return ok("log line\n")
+        self.unknown.append(args)
+        return 1, "", "unmodelled kubectl command"
+
+    def helm(self, args):
+        if args[0] in ("install", "upgrade"):
+            values = json.loads(Path(args[args.index("--values") + 1]).read_text())
+            replicas = values["worker"]["replicas"]
+            if self.installed and replicas != self.replicas["worker"]:
+                self.generation["worker"] += 1
+            self.replicas["worker"] = replicas
+            self.installed, self.revision = True, self.revision + 1
+            return 0, "", ""
+        if args[:1] == ["list"]:
+            return 0, json.dumps([{"name": smoke.RELEASE, "status": "deployed", "revision": str(self.revision)}]
+                                 if self.installed else []), ""
+        if args[:2] == ["get", "manifest"]:
+            return 0, "---\n# Source: openmettle-core/templates/api-service.yaml\n", ""
+        if args[:1] == ["uninstall"]:
+            self.installed = False
+            return 0, "", ""
+        self.unknown.append(args)
+        return 1, "", "unmodelled helm command"
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class FakePortForward:
+    def __init__(self, kubectl, env, target, port):
+        self.port = port
+
+    def close(self):
+        pass
+
+
+def matches(args, match):
+    """True if the command line contains every substring in `match`."""
+    line = " ".join(args)
+    return all(m in line for m in match)
+
+
+def doctor_json(match, mutate, when=lambda: True):
+    """A doctor that rewrites the successful JSON output of commands matching `match`."""
+    def doctor(args, result):
+        if result.returncode or not matches(args, match) or not when():
+            return None
+        try:
+            data = json.loads(result.stdout)
+        except ValueError:
+            return None
+        mutate(data)
+        return subprocess.CompletedProcess(args, result.returncode, json.dumps(data), result.stderr)
+    return doctor
+
+
+def doctor_output(match, returncode=0, stdout="", stderr=""):
+    def doctor(args, result):
+        if matches(args, match):
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+    return doctor
+
+
+class OrchestrationTest(unittest.TestCase):
+    """main() and Smoke against a recording fake cluster: ordering, refusals, cleanup and reporting."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.fake = FakeCluster()
+
+    def run_main(self):
+        """Run main() against the fake; return (exit status, report, stderr)."""
+        report = self.tmp / "report.json"
+        report.unlink(missing_ok=True)
+        stderr = io.StringIO()
+        with mock.patch.object(smoke, "core_checkout_state", return_value=(smoke.CORE_COMMIT, "")), \
+                mock.patch.object(smoke, "load_core", return_value=self.fake.core), \
+                mock.patch.object(smoke, "PortForward", FakePortForward), \
+                mock.patch.object(smoke, "time", FakeClock()), \
+                mock.patch.object(smoke.subprocess, "run", side_effect=AssertionError("real subprocess")), \
+                mock.patch.object(smoke.subprocess, "Popen", side_effect=AssertionError("real subprocess")), \
+                mock.patch("sys.stderr", stderr):
+            status = smoke.main(["--core-dir", str(self.tmp), "--report", str(report)])
+        return status, json.loads(report.read_text()), stderr.getvalue()
+
+    def assert_cleaned_up(self, built=smoke.ROLES, cluster=True):
+        deleted = [c[4] for c in self.fake.commands("kind", "delete", "cluster", "--name")]
+        self.assertEqual(deleted, [self.fake.name] if cluster else [])
+        removed = [c[3] for c in self.fake.commands("docker", "image", "rm")]
+        self.assertEqual(sorted(removed), sorted(r for r in self.fake.built if r.split("/")[2].split(":")[0] in built))
+        self.assertEqual(len(removed), len(built))
+
+    def test_passes_on_a_healthy_cluster(self):
+        status, report, _ = self.run_main()
+        self.assertEqual(self.fake.unknown, [])
+        self.assertEqual((status, report["result"]), (0, "passed"), report.get("error"))
+        self.assertEqual(len(report["checks"]), 8)
+        self.assertNotIn("error", report)
+        self.assert_cleaned_up()
+        self.assertEqual([c[1:3] for c in self.fake.commands("helm") if c[1] in ("install", "upgrade", "uninstall")],
+                         [["install", smoke.RELEASE], ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE],
+                          ["uninstall", smoke.RELEASE]])
+        for role in smoke.ROLES:
+            self.assertEqual(report["images"][role], {"reference": smoke.digest_reference(role, DIGEST[role]),
+                                                      "cri_image_id": IMAGE_ID[role],
+                                                      "resolved_before_alias": False})
+
+    def test_identity_is_verified_immediately_before_every_mutation(self):
+        """Only verify_identity's own namespace-ownership reads may separate it from the change."""
+        self.run_main()
+        mutations = 0
+        previous = None
+        for call in map(FakeCluster.strip, self.fake.calls):
+            if tuple(call[:2]) in MUTATING:
+                self.assertEqual(previous, ["IDENTITY"], f"{call[:2]} ran without an identity check just before")
+                mutations += 1
+            if call[:3] != ["kubectl", "get", "namespace"]:
+                previous = call
+        self.assertEqual(mutations, 5)  # apply, install, upgrade, upgrade, uninstall
+
+    def test_namespace_from_another_run_is_refused_before_any_change(self):
+        self.fake.namespaces[smoke.APP_NAMESPACE] = {smoke.RUN_LABEL: "ffffffff"}
+        status, report, _ = self.run_main()
+        self.assertEqual(status, 1)
+        self.assertIn(f"namespace {smoke.APP_NAMESPACE} was not created by this run", report["error"])
+        self.assertEqual([c for c in self.fake.calls if tuple(FakeCluster.strip(c)[:2]) in MUTATING], [])
+        self.assert_cleaned_up()
+
+    def test_failure_exits_1_cleans_up_and_reports_a_redacted_error(self):
+        """The password straddles the 2000-character tail core's Runner would keep."""
+        def fail_rollout(args, result):
+            if "rollout" in args:
+                password = self.fake.passwords["api"]
+                stderr = "A" * 100 + password + "B" * (smoke.STDERR_TAIL - 16)
+                return subprocess.CompletedProcess(args, 1, "", stderr)
+        self.fake.doctors.append(fail_rollout)
+        status, report, stderr = self.run_main()
+        self.assertEqual((status, report["result"]), (1, "failed"))
+        self.assertRegex(report["error"], r"exited 1: A+\[redacted\]B+$")
+        for password in self.fake.passwords.values():
+            self.assertNotIn(password[16:], json.dumps(report))
+            self.assertNotIn(password[16:], stderr)
+        self.assert_cleaned_up()
+        self.assertEqual(len(self.fake.commands("kubectl", "--namespace", smoke.APP_NAMESPACE, "logs")), 1)
+
+    def test_a_failure_message_quoting_an_observation_is_redacted(self):
+        def leak(args, result):
+            if args[-3:] == ["list", "--output", "json"]:
+                return subprocess.CompletedProcess(args, 0, json.dumps(
+                    [{"name": self.fake.passwords["migrate"], "status": "deployed", "revision": "1"}]), "")
+        self.fake.doctors.append(leak)
+        status, report, stderr = self.run_main()
+        self.assertEqual(status, 1)
+        self.assertIn("unexpected Helm release state: [{'name': '[redacted]'", report["error"])
+        self.assertNotIn(self.fake.passwords["migrate"], stderr)
+
+    def test_diagnostics_are_redacted_before_truncation(self):
+        def leak(args, result):
+            if "logs" in args:
+                password = self.fake.passwords["worker"]
+                stdout = "A" * 100 + password + "B" * (smoke.DIAGNOSTIC_TAIL["stdout"] - 16)
+                stderr = "C" * 100 + password + "D" * (smoke.DIAGNOSTIC_TAIL["stderr"] - 16)
+                return subprocess.CompletedProcess(args, 0, stdout, stderr)
+        self.fake.doctors += [leak, doctor_output(["--field-selector", "reason=Pulled"], stdout=json.dumps(
+            {"items": []}))]
+        status, _, stderr = self.run_main()
+        self.assertEqual(status, 1)
+        password = self.fake.passwords["worker"]
+        self.assertIn("B" * 100, stderr)
+        self.assertNotIn(password[16:], stderr)
+
+    def test_published_report_passes_the_secret_guard(self):
+        with mock.patch.object(smoke, "assert_no_secrets", wraps=smoke.assert_no_secrets) as guard:
+            status, report, _ = self.run_main()
+        self.assertEqual(status, 0)
+        (text, values), _ = guard.call_args
+        self.assertEqual(json.loads(text), report)
+        self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
+        self.assertEqual(len(self.fake.passwords), 4)
+
+    def test_cleanup_failure_fails_a_passing_run(self):
+        self.fake.doctors.append(doctor_output(["kind", "delete"], returncode=1))
+        status, report, _ = self.run_main()
+        self.assertEqual((status, report["result"]), (1, "failed"))
+        self.assertEqual(report["cleanup_errors"], [f"kind delete cluster --name {self.fake.name} --kubeconfig "
+                                                    f"{self.fake.calls[-4][-1]}: failed"])
+
+    def test_build_failure_removes_only_built_images(self):
+        self.fake.doctors.append(doctor_output(["build", "worker"], returncode=1, stderr="build failed"))
+        status, report, _ = self.run_main()
+        self.assertEqual(status, 1)
+        self.assertIn("docker build", report["error"])
+        self.assertNotIn("cleanup_errors", report)
+        self.assertEqual(self.fake.commands("kind", "create"), [])
+        self.assert_cleaned_up(built=("api",), cluster=False)
+
+    def test_termination_signals_still_clean_up(self):
+        for sig in smoke.CLEANUP_SIGNALS:
+            with self.subTest(signal=sig.name):
+                self.fake = FakeCluster()
+                before = signal.getsignal(sig)
+
+                def terminate(args, result, sig=sig):
+                    if args[:3] == ["kind", "load", "docker-image"]:
+                        signal.raise_signal(sig)
+                self.fake.doctors.append(terminate)
+                status, report, _ = self.run_main()
+                self.assertEqual((status, report["error"]), (1, f"interrupted: {sig.name}"))
+                self.assertEqual(len(self.fake.commands("kind", "load")), 1)
+                self.assert_cleaned_up()
+                self.assertIs(signal.getsignal(sig), before)
+
+    def test_existing_digest_name_is_not_tagged_again(self):
+        """A digest name containerd already holds is used as is (resolved_before_alias)."""
+        def preloaded(args, result):
+            if args[:3] == ["kind", "load", "docker-image"] and "api" in args[3]:
+                self.fake.ctr[smoke.digest_reference("api", DIGEST["api"])] = DIGEST["api"]
+        self.fake.doctors.append(preloaded)
+        status, report, _ = self.run_main()
+        self.assertEqual(status, 0, report.get("error"))
+        self.assertTrue(report["images"]["api"]["resolved_before_alias"])
+        tagged = [c[-1] for c in self.fake.commands("docker", "exec") if c[5:7] == ["images", "tag"]]
+        self.assertEqual(tagged, [smoke.digest_reference(r, DIGEST[r]) for r in ("worker", "migrate")])
+
+    def test_reference_resolving_before_the_name_exists_is_still_named(self):
+        """CRI resolving the digest reference does not mean containerd holds that name."""
+        reference = smoke.digest_reference("api", DIGEST["api"])
+
+        def resolves_early(args, result):
+            if args[-2:] == ["json", reference]:
+                return subprocess.CompletedProcess(args, 0, json.dumps({"status": {"id": IMAGE_ID["api"]}}), "")
+        self.fake.doctors.append(resolves_early)
+        status, report, _ = self.run_main()
+        self.assertEqual(status, 0, report.get("error"))
+        self.assertTrue(report["images"]["api"]["resolved_before_alias"])
+        tagged = [c[-1] for c in self.fake.commands("docker", "exec") if c[5:7] == ["images", "tag"]]
+        self.assertEqual(tagged, [smoke.digest_reference(r, DIGEST[r]) for r in smoke.ROLES])
+
+    def test_each_assertion_fails_on_a_doctored_observation(self):
+        fake_ref = lambda: self.fake  # noqa: E731 - doctors read the fake of the current subtest
+        revision = lambda n: (lambda: fake_ref().revision == n)  # noqa: E731
+        other = "sha256:" + "9" * 64
+        api, worker = f"{smoke.FULLNAME}-api", f"{smoke.FULLNAME}-worker"
+
+        def first_item(key, value):
+            return lambda data: data["items"][0].__setitem__(key, value)
+
+        def pod_status(update):
+            return lambda data: [update(p) for p in data["items"]]
+
+        def alias_elsewhere(args, result):
+            if args[-2:] == ["images", "ls"] and "@sha256" in result.stdout:
+                lines = [line.replace(f" {DIGEST['api']} ", f" {other} ")
+                         if line.startswith(smoke.REGISTRY) and "@" in line.split()[0] else line
+                         for line in result.stdout.splitlines()]
+                return subprocess.CompletedProcess(args, 0, "\n".join(lines), "")
+
+        def migrate_completed_late(data):
+            data["metadata"]["creationTimestamp"] = "2026-11-19T10:00:00Z"
+
+        def job_events(keep):
+            return doctor_json(["involvedObject.kind=Job"], lambda data: data.__setitem__(
+                "items", [e for e in data["items"] if keep(e)]))
+
+        cases = {
+            "digest name points elsewhere": (alias_elsewhere, "digest name does not point at"),
+            "digest reference resolves elsewhere": (doctor_json(
+                ["inspecti", smoke.digest_reference("api", DIGEST["api"])],
+                lambda data: data["status"].__setitem__("id", other)), "resolves to a different image"),
+            "release revision": (doctor_json(["list --output json"], lambda data: data[0].__setitem__(
+                "revision", "9")), "unexpected Helm release state"),
+            "pod not Ready": (doctor_json(["get pods --selector"], pod_status(lambda p: p["status"].__setitem__(
+                "conditions", [{"type": "Ready", "status": "False"}]))), "pod is not Ready"),
+            "container restarted": (doctor_json(["get pods --selector"], pod_status(
+                lambda p: p["status"]["containerStatuses"][0].__setitem__("restartCount", 1))),
+                "container restarted"),
+            "pull policy": (doctor_json(["get pods --selector"], pod_status(
+                lambda p: p["spec"]["containers"][0].__setitem__("imagePullPolicy", "IfNotPresent"))),
+                "with pullPolicy Never"),
+            "tag reference": (doctor_json(["get pods --selector"], pod_status(
+                lambda p: p["spec"]["containers"][0].__setitem__("image", "x:latest"))), "with pullPolicy Never"),
+            "no container id": (doctor_json(["get pods --selector"], pod_status(
+                lambda p: p["status"]["containerStatuses"][0].pop("containerID"))), "has no containerd id"),
+            "running image id": (doctor_json(["ps", "--id"], lambda data: data["containers"][0].__setitem__(
+                "imageRef", other)), "container runs image"),
+            "migrate Job remains": (doctor_output(["get job", "--ignore-not-found"], stdout="job.batch/x\n"),
+                                    "migrate Job remains"),
+            "readyz": (lambda args, result: setattr(fake_ref(), "readyz", 503), "API /readyz 200"),
+            "install ready replicas": (doctor_json([f"deployment {worker} --output=json"], lambda data: data["status"].__setitem__(
+                "readyReplicas", 0), when=revision(1)), "install ready replicas"),
+            "two completions on install": (doctor_json(["involvedObject.kind=Job"], lambda data: data["items"].append(
+                {**data["items"][0], "involvedObject": {**data["items"][0]["involvedObject"], "uid": "extra"}})),
+                "expected one completed migrate Job after install"),
+            "failed migration": (doctor_output(["exec", "deployment/postgres"], stdout="1|f|aa|t\n"),
+                                 "failed entry"),
+            "no migration history": (doctor_output(["exec", "deployment/postgres"], stdout=""),
+                                     "migration history is empty"),
+            "migrate after Deployments": (doctor_json([f"deployment {api} --output=json"], migrate_completed_late),
+                                          "completed after the Deployments"),
+            "image pulled": (doctor_json(["reason=Pulled"], first_item(
+                "message", f'Successfully pulled image "{smoke.digest_reference("api", DIGEST["api"])}"')),
+                "did not report every digest reference"),
+            "migrate pods linger": (doctor_json(["app.kubernetes.io/component=migrate"], lambda data: data.__setitem__(
+                "items", [fake_ref().pod("api", 9)])), "migrate hook pods to be removed"),
+            "extra release object": (doctor_json(["deployments,services,serviceaccounts,jobs,configmaps,secrets"],
+                                                 lambda data: data["items"].append(
+                                                     {"kind": "ConfigMap", "metadata": {"name": "x"}})),
+                                     "release objects:"),
+            "extra manifest object": (doctor_json(["get --filename -"], lambda data: data[
+                "items"].append({"kind": "NetworkPolicy", "metadata": {"name": "x"}})), "release manifest objects"),
+            "optional object": (doctor_json([smoke.OPTIONAL_KINDS], lambda data: data["items"].append(
+                {"kind": "Ingress", "metadata": {"name": "x"}})), "optional objects present"),
+            "other release": (doctor_json(["list --all-namespaces --output json"], lambda data: data.append(
+                {"name": "other", "status": "failed", "revision": "1"})), "other Helm releases"),
+            "foreign pod": (doctor_json(["get pods --output=json"], lambda data: data["items"].append(
+                {**fake_ref().pod("api", 5), "metadata": {"name": "x", "labels": {}}})), "pods outside api/worker"),
+            "optional resource": (doctor_json(["get pods --output=json"], pod_status(
+                lambda p: p["spec"]["containers"][0]["resources"]["requests"].__setitem__("nvidia.com/gpu", "1"))),
+                "pods request optional resources"),
+            "namespace not restricted": (doctor_json([f"namespace {smoke.APP_NAMESPACE} --output=json"], lambda data: data[
+                "metadata"]["labels"].__setitem__("pod-security.kubernetes.io/enforce", "baseline"),
+                when=lambda: fake_ref().revision == 1 and fake_ref().installed), "does not enforce restricted"),
+            "probe admitted": (doctor_output(["--dry-run=server"], returncode=0, stdout="pod/psa-probe created"),
+                               "was not rejected"),
+            "scale ready replicas": (doctor_json([f"deployment {worker} --output=json"], lambda data: data["status"].__setitem__(
+                "readyReplicas", 1), when=revision(2)), "scale ready replicas"),
+            "API pod replaced": (doctor_json(["app.kubernetes.io/component=api"], pod_status(
+                lambda p: p["metadata"].__setitem__("name", "replaced")), when=revision(2)), "API pod was replaced"),
+            "upgrade skipped migrate": (job_events(lambda e: e["involvedObject"]["uid"] != "job-2"),
+                                        "^upgrade did not run the migrate hook"),
+            "repeated upgrade skipped migrate": (job_events(lambda e: e["involvedObject"]["uid"] != "job-3"),
+                                                 "repeated upgrade did not run the migrate hook"),
+            "identical upgrade rolled": (doctor_json([f"deployment {worker} --output=json"], lambda data: data[
+                "metadata"].__setitem__("generation", 7), when=revision(3)), "identical upgrade replaced pods"),
+            "uninstall residue": (doctor_json([smoke.RELEASE_KINDS], lambda data: data["items"].append(
+                {"kind": "Pod", "metadata": {"name": "x"}})), "release objects to be removed"),
+            "release listed after uninstall": (doctor_json(["list --output json"], lambda data: data.append(
+                {"name": smoke.RELEASE, "status": "uninstalling", "revision": "3"}),
+                when=lambda: not fake_ref().installed), "Helm still lists a release"),
+            "test-owned Secret removed": (doctor_json([f"--selector {smoke.RUN_LABEL} "], lambda data: data["items"].pop()),
+                                          "test-owned Secrets after uninstall"),
+        }
+        # History changes only after the install was observed: compare against the first reading.
+        readings = []
+
+        def history_changes(args, result):
+            if "deployment/postgres" in args and "exec" in args:
+                readings.append(1)
+                if len(readings) > 1:
+                    return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
+
+        def history_changes_on_repeat(args, result):
+            if "deployment/postgres" in args and "exec" in args and fake_ref().revision == 3:
+                return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
+        cases["upgrade changed history"] = (history_changes, "migration history changed on a same-digest upgrade")
+        cases["repeated upgrade changed history"] = (history_changes_on_repeat,
+                                                     "migration history changed on a repeated upgrade")
+        for name, (doctor, message) in cases.items():
+            with self.subTest(name):
+                self.fake = FakeCluster()
+                self.fake.doctors.append(doctor)
+                readings.clear()
+                status, report, _ = self.run_main()
+                self.assertEqual((status, report["result"]), (1, "failed"))
+                if message.startswith("^"):
+                    self.assertRegex(report["error"], message)
+                else:
+                    self.assertIn(message, report["error"])
+                self.assert_cleaned_up()
 
 
 class EnvironmentTest(unittest.TestCase):
@@ -196,9 +847,13 @@ class DigestTest(unittest.TestCase):
             with self.subTest(role=role, digest=digest), self.assertRaises(smoke.SmokeFailure):
                 smoke.digest_reference(role, digest)
 
-    def test_registry_never_resolves(self):
+    def test_every_reference_uses_a_registry_that_never_resolves(self):
         """RFC 6761 .invalid: a mistaken pull can never reach a real registry."""
-        self.assertTrue(smoke.REGISTRY.endswith(".invalid"))
+        hosts = {smoke.tag_reference(r, "0a1b2c3d").split("/")[0] for r in smoke.ROLES}
+        hosts |= {smoke.digest_reference(r, DIGEST[r]).split("/")[0] for r in smoke.ROLES}
+        hosts |= {image["registry"] for role, image in smoke.smoke_values(DIGEST, 1)["images"].items()
+                  if role in smoke.ROLES}
+        self.assertEqual(hosts, {"openmettle-smoke.invalid"})
 
 
 class ValuesTest(unittest.TestCase):
@@ -237,8 +892,16 @@ class ValuesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for role in smoke.ROLES:
             self.assertIn(f'image: "{smoke.digest_reference(role, DIGEST[role])}"', result.stdout)
-        for name in smoke.expected_release_objects():
-            self.assertIn(f"name: {name.split('/')[1]}\n", result.stdout.replace('"', ""))
+        # The non-hook objects the chart renders are exactly what the smoke expects in the release.
+        rendered = []
+        for document in result.stdout.split("\n---"):
+            if "helm.sh/hook:" in document:
+                continue
+            kind = re.search(r"^kind: (\S+)$", document, re.MULTILINE)
+            name = re.search(r"^  name: \"?([^\"\n]+)\"?$", document, re.MULTILINE)
+            if kind:
+                rendered.append(f"{kind.group(1)}/{name.group(1)}")
+        self.assertEqual(sorted(rendered), smoke.expected_release_objects())
 
 
 class FixtureTest(unittest.TestCase):
@@ -311,6 +974,12 @@ class EvaluationTest(unittest.TestCase):
                   event("Failed", message=f'Container image "{refs[2]}" is not present with pull policy of Never')]
         self.assertEqual(smoke.images_reported_present(events, refs), sorted(refs[:2]))
 
+    def test_a_real_pull_is_not_already_present(self):
+        ref = smoke.digest_reference("api", DIGEST["api"])
+        pulled = [event("Pulled", message=f'Successfully pulled image "{ref}" in 1.2s (1.2s including waiting). '
+                                          "Image size: 42 bytes.")]
+        self.assertEqual(smoke.images_reported_present(pulled, [ref]), [])
+
     def test_unexpected_resources_flags_devices_and_claims(self):
         pod = {"spec": {"containers": [{"resources": {"requests": {"cpu": "1", "memory": "1Mi"},
                                                       "limits": {"nvidia.com/gpu": "1"}}}],
@@ -321,10 +990,7 @@ class EvaluationTest(unittest.TestCase):
         clean = {"spec": {"containers": [{"resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}]}}
         self.assertEqual(smoke.unexpected_resources([clean]), [])
 
-    def test_release_objects(self):
-        self.assertEqual(smoke.expected_release_objects(), [
-            "Deployment/openmettle-core-api", "Deployment/openmettle-core-worker", "Service/openmettle-core-api",
-            "ServiceAccount/openmettle-core-api", "ServiceAccount/openmettle-core-worker"])
+    def test_object_names(self):
         items = [{"kind": "Service", "metadata": {"name": "b"}}, {"kind": "Deployment", "metadata": {"name": "a"}}]
         self.assertEqual(smoke.object_names(items), ["Deployment/a", "Service/b"])
 
@@ -364,6 +1030,20 @@ class SummaryTest(unittest.TestCase):
         with self.assertRaises(smoke.SmokeFailure):
             smoke.build_summary(extra)
 
+    def test_redacts_before_truncating(self):
+        """A password straddling the cut must not leave its tail in the output."""
+        password = PASSWORDS["api"]
+        text = "A" * 100 + password + "B" * (2000 - 16)
+        self.assertEqual(len(text) - 2000, 116)  # the cut falls inside the password
+        tail = smoke.redacted_tail(text, PASSWORDS.values(), 2000)
+        self.assertNotIn(password[16:], tail)
+        self.assertEqual(len(tail), 2000)
+
+    def test_ctr_image_names(self):
+        self.assertEqual(smoke.ctr_image_names(CTR_LISTING), {
+            f"import-2026-11-19@{DIGEST['api']}", *(f"openmettle-smoke.invalid/openmettle/{r}:smoke-0a1b2c3d"
+                                                   for r in smoke.ROLES)})
+
     def test_secret_guard_and_redaction(self):
         with self.assertRaises(smoke.SmokeFailure):
             smoke.assert_no_secrets(f"error: {PASSWORDS['api']}", PASSWORDS.values())
@@ -391,9 +1071,7 @@ class CoreGuardTest(unittest.TestCase):
     def setUpClass(cls):
         cls.core = smoke.load_core(Path(CORE_DIR))
 
-    def test_imports_and_pins(self):
-        for name in smoke.CORE_IMPORTS:
-            self.assertTrue(hasattr(self.core, name), name)
+    def test_pins(self):
         self.assertRegex(self.core.NODE_IMAGE, r"^kindest/node:v[0-9.]+@sha256:[0-9a-f]{64}$")
         self.assertRegex(self.core.POSTGRES_IMAGE, r"@sha256:[0-9a-f]{64}$")
 
@@ -444,10 +1122,6 @@ class CoreGuardTest(unittest.TestCase):
             self.core.check_cluster_identity(config, ["worker-1"], name, name)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CriContainerImageIdTests(unittest.TestCase):
     ID = "sha256:" + "a" * 64
 
@@ -465,3 +1139,7 @@ class CriContainerImageIdTests(unittest.TestCase):
             with self.subTest(output=output[:40]):
                 with self.assertRaises(smoke.SmokeFailure):
                     smoke.parse_cri_container_image_id(output)
+
+
+if __name__ == "__main__":
+    unittest.main()
