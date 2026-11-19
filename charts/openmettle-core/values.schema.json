@@ -3,7 +3,7 @@
   "title": "openmettle-core chart values",
   "type": "object",
   "additionalProperties": false,
-  "required": ["images", "database", "api", "worker", "migration", "networkPolicy"],
+  "required": ["images", "database", "api", "worker", "migration", "networkPolicy", "storage", "ingress"],
   "properties": {
     "images": {
       "type": "object",
@@ -29,7 +29,20 @@
         "api": {"$ref": "#/$defs/secretKeyRef"},
         "worker": {"$ref": "#/$defs/secretKeyRef"},
         "migrate": {"$ref": "#/$defs/secretKeyRef"},
-        "connectionBudget": {"type": ["integer", "null"], "minimum": 1}
+        "connectionBudget": {"type": ["integer", "null"], "minimum": 1},
+        "caBundle": {
+          "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/db-ca/ca.crt in api, worker and migrate pods.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "configMapName", "key"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "key": {"$ref": "#/$defs/configMapKey"}
+          },
+          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+          "then": {"properties": {"configMapName": {"minLength": 1}}}
+        }
       }
     },
     "api": {
@@ -37,7 +50,7 @@
       "additionalProperties": false,
       "required": [
         "replicas", "resources", "serviceAccount", "settings", "terminationGracePeriodSeconds",
-        "strategy", "service", "podAnnotations", "nodeSelector", "tolerations", "affinity"
+        "strategy", "service", "podDisruptionBudget", "podAnnotations", "nodeSelector", "tolerations", "affinity"
       ],
       "properties": {
         "replicas": {"$ref": "#/$defs/replicas"},
@@ -52,6 +65,17 @@
           "required": ["port"],
           "properties": {
             "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        },
+        "podDisruptionBudget": {
+          "description": "Rendering fails unless exactly one of minAvailable or maxUnavailable is set while enabled, api.replicas >= 2 and one voluntary eviction stays allowed.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "minAvailable": {"$ref": "#/$defs/optionalIntOrPercent"},
+            "maxUnavailable": {"$ref": "#/$defs/optionalIntOrPercent"}
           }
         },
         "podAnnotations": {"$ref": "#/$defs/stringMap"},
@@ -144,9 +168,105 @@
           }
         }
       }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifacts"],
+      "properties": {
+        "artifacts": {
+          "description": "Read-write volume at /var/lib/openmettle/artifacts in api and worker pods. Rendering fails unless exactly one of existingClaim or size is set while enabled; storageClassName and annotations apply to the chart-owned PVC only.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "existingClaim", "size", "accessModes", "annotations"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "existingClaim": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "size": {
+              "description": "Kubernetes quantity with a binary or decimal unit, for example 10Gi.",
+              "type": "string",
+              "pattern": "^([1-9][0-9]*(\\.[0-9]+)?(k|Ki|M|Mi|G|Gi|T|Ti|P|Pi|E|Ei))?$"
+            },
+            "accessModes": {
+              "description": "Both api and worker mount the claim, so ReadWriteOncePod and ReadOnlyMany are not accepted.",
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"enum": ["ReadWriteOnce", "ReadWriteMany"]}
+            },
+            "storageClassName": {
+              "anyOf": [{"type": "null"}, {"const": ""}, {"$ref": "#/$defs/dnsSubdomain"}]
+            },
+            "annotations": {"$ref": "#/$defs/stringMap"}
+          }
+        }
+      }
+    },
+    "ingress": {
+      "description": "Rendering fails unless className is set, hosts is non-empty and every host is covered by tls while enabled.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "className", "annotations", "hosts", "tls"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "className": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "annotations": {"$ref": "#/$defs/stringMap"},
+        "hosts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/hostname"}
+        },
+        "tls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["secretName", "hosts"],
+            "properties": {
+              "secretName": {"$ref": "#/$defs/dnsSubdomain"},
+              "hosts": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"$ref": "#/$defs/hostname"}
+              }
+            }
+          }
+        }
+      },
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {
+        "properties": {
+          "className": {"minLength": 1},
+          "hosts": {"minItems": 1},
+          "tls": {"minItems": 1}
+        }
+      }
     }
   },
   "$defs": {
+    "hostname": {
+      "description": "Lowercase DNS name with at least two labels; no wildcard, port or IP address.",
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+      "not": {"pattern": "^[0-9.]+$"}
+    },
+    "configMapKey": {
+      "description": "A ConfigMap data key: no path separator, and not . or ..",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^[-._a-zA-Z0-9]+$",
+      "not": {"enum": [".", ".."]}
+    },
+    "optionalIntOrPercent": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 0},
+        {"type": "string", "pattern": "^(100|[1-9]?[0-9])%$"}
+      ]
+    },
     "dnsSubdomain": {
       "type": "string",
       "maxLength": 253,

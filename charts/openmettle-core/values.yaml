@@ -37,6 +37,14 @@ database:
   # (api.replicas + api.maxSurge) * api.dbMaxConnections
   #   + (worker.replicas + worker.maxSurge) * worker.dbMaxConnections + 1 (migrator) exceeds it.
   connectionBudget: null
+  # Optional CA bundle for verifying PostgreSQL server certificates. When enabled, one key of an
+  # existing ConfigMap (the chart never creates ConfigMaps or Secrets) is mounted read-only at
+  # /etc/openmettle/db-ca/ca.crt in api, worker and migrate pods. No environment variable is set:
+  # reference the file in each URL: ?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt
+  caBundle:
+    enabled: false
+    configMapName: ""
+    key: ca.crt
 
 api:
   replicas: 1
@@ -62,6 +70,14 @@ api:
     maxUnavailable: 0
   service:
     port: 8080
+  # Optional PodDisruptionBudget for the API. Off by default so a single-replica install never
+  # blocks node drains. When enabled, set exactly one of minAvailable or maxUnavailable (an integer
+  # or a percentage such as "50%"). Rendering fails unless api.replicas >= 2 and the budget still
+  # allows at least one voluntary eviction.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: null
+    maxUnavailable: null
   podAnnotations: {}
   nodeSelector: {}
   tolerations: []
@@ -136,3 +152,35 @@ networkPolicy:
     # Rendering fails if this is empty while enabled, because an empty list would allow any destination.
     to: []
     port: 5432
+
+storage:
+  # Optional artifact volume, mounted read-write at /var/lib/openmettle/artifacts in api and worker
+  # pods (never in the migration Job). Core does not read this path yet (V1-15); see README.
+  # When enabled, set exactly one of existingClaim or size.
+  artifacts:
+    enabled: false
+    # Name of an existing PersistentVolumeClaim in the release namespace; the chart renders no PVC.
+    existingClaim: ""
+    # Size of a chart-owned PVC <fullname>-artifacts. Helm keeps it on uninstall (resource-policy).
+    size: ""
+    # Chart-owned PVC only. ReadWriteOnce needs api and worker on one node; use ReadWriteMany otherwise.
+    accessModes: [ReadWriteOnce]
+    # Chart-owned PVC only. null: the cluster's default StorageClass. "": no class (static binding).
+    storageClassName: null
+    # Chart-owned PVC only.
+    annotations: {}
+
+ingress:
+  # Optional networking.k8s.io/v1 Ingress for the API Service. Before enabling it, configure the
+  # ingress controller so that its logs and traces never record request targets (paths and query
+  # strings), cookies or request bodies (see README "Ingress and TLS"). Rendering fails unless
+  # className is set, tls covers every host and, while networkPolicy.enabled is true,
+  # networkPolicy.api.ingressFrom lists the ingress controller.
+  enabled: false
+  className: ""
+  annotations: {}
+  # Dedicated application hostnames (lowercase DNS names; no wildcard or IP address). Every path is
+  # routed to the API Service unmodified (path "/", pathType Prefix).
+  hosts: []
+  # Existing TLS Secrets ({secretName, hosts}); the chart never creates Secrets.
+  tls: []

@@ -1,0 +1,45 @@
+{{- /*
+Optional Ingress for the API Service (HTTPS only). validate.yaml requires className, at least one
+host, a TLS entry covering every host and, under the chart's NetworkPolicies, an ingress-controller
+peer in networkPolicy.api.ingressFrom. Every path is routed unmodified: core's login routes compare
+the original request path (core ADRs 0017 and 0018), so the chart adds no rewrite. Access-log,
+body-size and TLS settings belong to the controller; see the chart README "Ingress and TLS".
+*/ -}}
+{{- $ingress := .Values.ingress }}
+{{- if $ingress.enabled }}
+{{- $context := dict "root" . "component" "api" }}
+{{- $service := printf "%s-api" (include "openmettle-core.fullname" .) }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $service }}
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+  {{- with $ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ $ingress.className | quote }}
+  tls:
+    {{- range $ingress.tls }}
+    - secretName: {{ .secretName | quote }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}
+  rules:
+    {{- range $ingress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $service }}
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

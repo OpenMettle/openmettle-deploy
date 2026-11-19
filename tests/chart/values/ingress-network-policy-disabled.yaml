@@ -1,0 +1,15 @@
+# Synthetic overlay on minimal.yaml: an Ingress without the chart's NetworkPolicies, so
+# networkPolicy.api.ingressFrom is not required. Reserved example.test hostnames only.
+networkPolicy:
+  enabled: false
+  database:
+    to: []
+ingress:
+  enabled: true
+  className: example-ingress
+  hosts: [openmettle.example.test, api.openmettle.example.test]
+  tls:
+    - secretName: example-openmettle-tls
+      hosts: [openmettle.example.test]
+    - secretName: example-openmettle-api-tls
+      hosts: [api.openmettle.example.test]

@@ -1,0 +1,25 @@
+{{- /*
+Optional API PodDisruptionBudget. validate.yaml requires exactly one of minAvailable or
+maxUnavailable, api.replicas >= 2 and at least one allowed voluntary eviction. AlwaysAllow lets
+drains evict pods that are not Ready, so an unhealthy API never blocks node maintenance.
+*/ -}}
+{{- $pdb := .Values.api.podDisruptionBudget }}
+{{- if $pdb.enabled }}
+{{- $context := dict "root" . "component" "api" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "openmettle-core.fullname" . }}-api
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+spec:
+  {{- if not (kindIs "invalid" $pdb.minAvailable) }}
+  minAvailable: {{ ternary ($pdb.minAvailable | quote) (int64 $pdb.minAvailable) (kindIs "string" $pdb.minAvailable) }}
+  {{- else }}
+  maxUnavailable: {{ ternary ($pdb.maxUnavailable | quote) (int64 $pdb.maxUnavailable) (kindIs "string" $pdb.maxUnavailable) }}
+  {{- end }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "openmettle-core.selectorLabels" $context | nindent 6 }}
+{{- end }}
