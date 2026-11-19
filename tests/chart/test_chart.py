@@ -31,12 +31,20 @@ ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job"}
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
 IMAGE = re.compile(r"^(?:[a-z0-9.-]+(?::[0-9]+)?/)?[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
 HOOK = "helm.sh/hook"
-# Defaults from core src/migrate.rs at the pinned commit (Settings::parse).
-CORE_MIGRATE_DEFAULTS = {"CONNECT_TIMEOUT_MS": "5000", "LOCK_TIMEOUT_MS": "15000", "STATEMENT_TIMEOUT_MS": "300000"}
+HOOK_DELETE = "helm.sh/hook-delete-policy"
+SCHEMA_ERROR = "values don't meet the specifications of the schema"
+DIGEST = "sha256:" + "0" * 64
+# Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
+# from core src/lib.rs and src/migrate.rs at 5cd8a9d; this test does not read core.
+DEFAULT_ENV = {
+    "api": {"BIND": "0.0.0.0:8080", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
+    "worker": {"BIND": "0.0.0.0:8081", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
+    "migrate": {"CONNECT_TIMEOUT_MS": "5000", "LOCK_TIMEOUT_MS": "15000", "STATEMENT_TIMEOUT_MS": "300000"},
+}
 
 
-def helm_template(overlays=(), set_values=(), extra=()):
-    args = [HELM, "template", RELEASE, str(CHART), "-f", str(VALUES / "minimal.yaml")]
+def helm_template(overlays=(), set_values=(), extra=(), release=RELEASE):
+    args = [HELM, "template", release, str(CHART), "-f", str(VALUES / "minimal.yaml")]
     for overlay in overlays:
         args += ["-f", str(VALUES / overlay)]
     for value in set_values:
@@ -45,8 +53,8 @@ def helm_template(overlays=(), set_values=(), extra=()):
     return subprocess.run(args, capture_output=True, text=True, timeout=120, check=False)
 
 
-def render(overlays=(), set_values=()):
-    result = helm_template(overlays, set_values)
+def render(overlays=(), set_values=(), release=RELEASE):
+    result = helm_template(overlays, set_values, release=release)
     if result.returncode != 0:
         raise AssertionError(f"helm template failed: {result.stderr}")
     return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
@@ -157,6 +165,30 @@ class PodPolicyTest(Rendered):
                 name = image.split("@", 1)[0]
                 self.assertNotIn(":", name.split("/")[-1], "tag present")
 
+    def test_exact_image_references(self):
+        """Fails if the image helper drops or reorders the registry, repository or digest."""
+        expected = {
+            ("minimal", "api"): f"registry.example.test/openmettle/api@{DIGEST}",
+            ("minimal", "worker"): f"registry.example.test/openmettle/worker@{DIGEST}",
+            ("minimal", "migrate"): f"registry.example.test/openmettle/migrate@{DIGEST}",
+            ("all-keys", "api"): f"registry.example.test:5000/openmettle/api@{DIGEST}",
+        }
+        for (name, role), image in expected.items():
+            with self.subTest(values=name, component=role):
+                pod = dict(pods(self.renders[name]))[role]
+                self.assertEqual(pod["containers"][0]["image"], image)
+        docs = render(set_values=["images.worker.registry="])
+        worker = find(docs, "Deployment", "-worker")["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(worker["image"], f"openmettle/worker@{DIGEST}")
+
+    def test_pull_policy_follows_values(self):
+        """Fails if imagePullPolicy is hard-coded instead of taken from images.pullPolicy."""
+        for name, policy in (("minimal", "IfNotPresent"), ("all-keys", "Never")):
+            for _, pod in pods(self.renders[name]):
+                for container in containers(pod):
+                    with self.subTest(values=name, container=container["name"]):
+                        self.assertEqual(container["imagePullPolicy"], policy)
+
     def test_no_device_resources(self):
         """Fails if any resource other than cpu, memory or ephemeral-storage is requested."""
         for _, _, pod in self.each_pod():
@@ -218,6 +250,12 @@ class ReleasePolicyTest(Rendered):
         self.assertEqual(find(self.renders["minimal"], "Service", "-api")["spec"]["ports"][0]["port"], 8080)
         self.assertEqual(find(self.renders["all-keys"], "Service", "-api")["spec"]["ports"][0]["port"], 80)
 
+    def test_service_is_cluster_ip(self):
+        """Fails if the API Service type becomes NodePort, LoadBalancer or anything but ClusterIP."""
+        for name, docs in self.renders.items():
+            with self.subTest(values=name):
+                self.assertEqual(find(docs, "Service", "-api")["spec"]["type"], "ClusterIP")
+
     def test_owner_credential_only_in_migration_job(self):
         """Fails if the migrate (owner) Secret is referenced outside the Job, or a role reads another's Secret."""
         for name, docs in self.renders.items():
@@ -245,11 +283,15 @@ class ReleasePolicyTest(Rendered):
                 self.assertEqual(env[PREFIX[role] + key]["value"], value)
             self.assertEqual(env[PREFIX[role] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]["key"], keys[role])
 
-    def test_migrate_defaults_match_core(self):
-        """Fails if values.yaml migration settings drift from core src/migrate.rs defaults."""
-        env = env_map(find(self.renders["minimal"], "Job", "-migrate")["spec"]["template"]["spec"]["containers"][0])
-        for key, value in CORE_MIGRATE_DEFAULTS.items():
-            self.assertEqual(env["OPENMETTLE_MIGRATE_" + key]["value"], value)
+    def test_default_environment(self):
+        """Fails if any default env value in values.yaml changes from DEFAULT_ENV, or a variable is added or dropped."""
+        for role, pod in pods(self.renders["minimal"]):
+            with self.subTest(component=role):
+                env = env_map(pod["containers"][0])
+                url = env.pop(PREFIX[role] + "DATABASE_URL")
+                self.assertEqual(set(url), {"name", "valueFrom"})
+                values = {name[len(PREFIX[role]):]: entry.get("value") for name, entry in env.items()}
+                self.assertEqual(values, DEFAULT_ENV[role])
 
     def test_readiness_timeout_covers_database_timeout(self):
         """Fails if readiness timeoutSeconds is not ceil(dbTimeoutMs / 1000) + 1."""
@@ -275,6 +317,19 @@ class ReleasePolicyTest(Rendered):
         self.assertEqual(pod["imagePullSecrets"], [{"name": "example-pull-secret"}])
         self.assertEqual(api["spec"]["template"]["metadata"]["annotations"], {"example.test/note": "synthetic"})
 
+    def test_migration_scheduling_values(self):
+        """Fails if migration nodeSelector, tolerations, affinity or podAnnotations do not reach the hook pod."""
+        template = find(self.renders["all-keys"], "Job", "-migrate")["spec"]["template"]
+        pod = template["spec"]
+        self.assertEqual(template["metadata"]["annotations"], {"example.test/note": "migrate"})
+        self.assertEqual(pod["nodeSelector"], {"example.test/pool": "migrate"})
+        self.assertEqual(pod["tolerations"], [{"key": "example.test/dedicated", "operator": "Exists", "effect": "NoSchedule"}])
+        self.assertIn("nodeAffinity", pod["affinity"])
+        minimal = find(self.renders["minimal"], "Job", "-migrate")["spec"]["template"]
+        self.assertNotIn("annotations", minimal["metadata"])
+        for field in ("nodeSelector", "tolerations", "affinity"):
+            self.assertNotIn(field, minimal["spec"])
+
 
 class MigrationHookTest(Rendered):
     def test_job_is_a_pre_install_and_pre_upgrade_hook(self):
@@ -283,7 +338,7 @@ class MigrationHookTest(Rendered):
             with self.subTest(values=name):
                 annotations = find(self.renders[name], "Job", "-migrate")["metadata"]["annotations"]
                 self.assertEqual(annotations[HOOK], "pre-install,pre-upgrade")
-                self.assertEqual(annotations["helm.sh/hook-delete-policy"], "before-hook-creation,hook-succeeded")
+                self.assertEqual(annotations[HOOK_DELETE], "before-hook-creation,hook-succeeded")
                 self.assertEqual(annotations["helm.sh/hook-weight"], "0")
 
     def test_service_account_hook_runs_first(self):
@@ -297,6 +352,14 @@ class MigrationHookTest(Rendered):
                 self.assertLess(int(account["metadata"]["annotations"]["helm.sh/hook-weight"]),
                                 int(job["metadata"]["annotations"]["helm.sh/hook-weight"]))
                 self.assertEqual(job["spec"]["template"]["spec"]["serviceAccountName"], account["metadata"]["name"])
+
+    def test_service_account_hook_delete_policy(self):
+        """Fails if the migrate ServiceAccount's delete policy or weight changes."""
+        for name in ("minimal", "all-keys"):
+            with self.subTest(values=name):
+                annotations = find(self.renders[name], "ServiceAccount", "-migrate")["metadata"]["annotations"]
+                self.assertEqual(annotations[HOOK_DELETE], "before-hook-creation,hook-succeeded")
+                self.assertEqual(annotations["helm.sh/hook-weight"], "-10")
 
     def test_no_rollback_hook_and_no_other_hooks(self):
         """Fails if any resource gains a rollback hook, or a non-migration resource becomes a hook."""
@@ -337,7 +400,8 @@ class MigrationHookTest(Rendered):
 class NegativeCaseTest(unittest.TestCase):
     """Each case must fail to render with the intended message."""
 
-    SCHEMA = "values don't meet the specifications of the schema"
+    SCHEMA = SCHEMA_ERROR
+    FULL = f"{RELEASE}-openmettle-core"
     CASES = [
         # (name, --set values, extra args, expected message fragments)
         ("missing api digest", ["images.api.digest="], [], ["images.api.digest is required"]),
@@ -376,6 +440,23 @@ class NegativeCaseTest(unittest.TestCase):
          ["worker.serviceAccount.name is required when serviceAccount.create is false"]),
         ("migrate shared default ServiceAccount", ["migration.serviceAccount.create=false"], [],
          ["migration.serviceAccount.name is required when serviceAccount.create is false"]),
+        ("api named default", ["api.serviceAccount.name=default"], [],
+         ['api.serviceAccount.name must not be "default"']),
+        ("existing worker account named default", ["worker.serviceAccount.create=false", "worker.serviceAccount.name=default"], [],
+         ['worker.serviceAccount.name must not be "default"']),
+        ("migrate named default", ["migration.serviceAccount.name=default"], [],
+         ['migration.serviceAccount.name must not be "default"']),
+        ("api and worker share", ["api.serviceAccount.name=shared", "worker.serviceAccount.name=shared"], [],
+         ['api and worker resolve to the same ServiceAccount "shared"']),
+        ("migrate takes the api account", [f"migration.serviceAccount.name={FULL}-api"], [],
+         [f'api and migration resolve to the same ServiceAccount "{FULL}-api"']),
+        ("migrate takes an existing worker account",
+         ["worker.serviceAccount.create=false", "worker.serviceAccount.name=shared", "migration.serviceAccount.name=shared"], [],
+         ['worker and migration resolve to the same ServiceAccount "shared"']),
+        ("deadline equal to one attempt", ["migration.activeDeadlineSeconds=320"], [],
+         ["migration.activeDeadlineSeconds (320 s) must exceed connectTimeoutMs + lockTimeoutMs + statementTimeoutMs (320000 ms)"]),
+        ("deadline below a raised statement timeout", ["migration.settings.statementTimeoutMs=900000"], [],
+         ["migration.activeDeadlineSeconds (900 s) must exceed", "(920000 ms)"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -390,7 +471,10 @@ class NegativeCaseTest(unittest.TestCase):
     def test_boundaries_render(self):
         """Fails if a guard rejects the boundary value it should accept (off-by-one)."""
         for set_values in (["database.connectionBudget=17"], ["api.terminationGracePeriodSeconds=6"],
-                           ["api.settings.dbMaxConnections=64"], ["api.strategy.maxSurge=0", "api.strategy.maxUnavailable=1"]):
+                           ["api.settings.dbMaxConnections=64"], ["api.strategy.maxSurge=0", "api.strategy.maxUnavailable=1"],
+                           ["migration.activeDeadlineSeconds=321"],
+                           # An unused migrate account name is not checked when migration is disabled.
+                           ["migration.enabled=false", "migration.serviceAccount.name=default"]):
             with self.subTest(values=set_values):
                 result = helm_template(set_values=set_values)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -400,6 +484,81 @@ class NegativeCaseTest(unittest.TestCase):
         result = subprocess.run([HELM, "template", RELEASE, str(CHART)], capture_output=True, text=True, timeout=120, check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is required", result.stderr)
+
+
+class BoundsTest(unittest.TestCase):
+    """Every bounded api, worker and migration value accepts its limits and rejects one beyond."""
+
+    # (values path, minimum, maximum or None, other values needed for the limits to render)
+    MIGRATION_ROOM = ["migration.activeDeadlineSeconds=4261"]  # exceeds 60000 + 600000 + 3600000 ms
+    BOUNDS = [
+        *[(f"{role}.{path}", low, high, extra) for role in ("api", "worker") for path, low, high, extra in (
+            ("settings.dbMaxConnections", 1, 64, []),
+            ("settings.dbTimeoutMs", 1, 30000, []),
+            ("settings.shutdownTimeoutMs", 1, 60000, [f"{role}.terminationGracePeriodSeconds=61"]),
+            ("terminationGracePeriodSeconds", 1, None, [f"{role}.settings.shutdownTimeoutMs=1"]),
+            ("replicas", 0, None, []),
+            ("strategy.maxSurge", 0, None, [f"{role}.strategy.maxUnavailable=1"]),
+            ("strategy.maxUnavailable", 0, None, []),
+        )],
+        ("api.service.port", 1, 65535, []),
+        ("migration.settings.connectTimeoutMs", 1, 60000, MIGRATION_ROOM),
+        ("migration.settings.lockTimeoutMs", 1, 600000, MIGRATION_ROOM),
+        ("migration.settings.statementTimeoutMs", 1, 3600000, MIGRATION_ROOM),
+        ("migration.activeDeadlineSeconds", 1, None, [f"migration.settings.{key}=1" for key in
+                                                     ("connectTimeoutMs", "lockTimeoutMs", "statementTimeoutMs")]),
+    ]
+
+    def test_limits_render_and_values_beyond_fail_schema(self):
+        """Fails if a schema minimum or maximum is removed, loosened or tightened."""
+        for path, low, high, extra in self.BOUNDS:
+            accept = [low] + ([high] if high is not None else [])
+            reject = [low - 1] + ([high + 1] if high is not None else [])
+            for value in accept:
+                with self.subTest(path=path, value=value, expect="render"):
+                    result = helm_template(set_values=extra + [f"{path}={value}"])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for value in reject:
+                with self.subTest(path=path, value=value, expect="schema error"):
+                    result = helm_template(set_values=extra + [f"{path}={value}"])
+                    self.assertNotEqual(result.returncode, 0, f"{path}={value} rendered")
+                    self.assertIn(SCHEMA_ERROR, result.stderr)
+                    self.assertIn("/" + path.replace(".", "/"), result.stderr)
+
+
+class YamlScalarTest(unittest.TestCase):
+    """Schema-valid names that YAML reads as int, bool or null must render as strings."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.docs = render(("yaml-ambiguous.yaml",), release="123")
+
+    def test_labels_are_strings(self):
+        """Fails if the release name (instance label) or another label value is emitted unquoted."""
+        for doc in self.docs:
+            pod_labels = doc.get("spec", {}).get("template", {}).get("metadata", {}).get("labels", {})
+            for labels in (doc["metadata"]["labels"], pod_labels):
+                for key, value in labels.items():
+                    self.assertIsInstance(value, str, f"{doc['kind']} {key}")
+            self.assertEqual(doc["metadata"]["labels"]["app.kubernetes.io/instance"], "123")
+
+    def test_names_and_keys_are_strings(self):
+        """Fails if a ServiceAccount, pull Secret, Secret name or Secret key is emitted unquoted."""
+        accounts = sorted(d["metadata"]["name"] for d in self.docs if d["kind"] == "ServiceAccount")
+        self.assertEqual(accounts, ["555", "null"])
+        expected = {
+            "api": ("555", "456", "123"),
+            "worker": ("true", "openmettle-worker-database", "false"),
+            "migrate": ("null", "openmettle-owner-database", "null"),
+        }
+        for role, pod in pods(self.docs):
+            with self.subTest(component=role):
+                account, secret, key = expected[role]
+                self.assertEqual(pod["serviceAccountName"], account)
+                self.assertEqual(pod["imagePullSecrets"], [{"name": "true"}])
+                ref = env_map(pod["containers"][0])[PREFIX[role] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]
+                self.assertEqual(ref, {"name": secret, "key": key})
+                self.assertIsInstance(pod["containers"][0]["imagePullPolicy"], str)
 
 
 class ContractDriftTest(unittest.TestCase):

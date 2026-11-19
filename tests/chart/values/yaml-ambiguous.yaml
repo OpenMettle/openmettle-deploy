@@ -1,0 +1,22 @@
+# Synthetic overlay on minimal.yaml: schema-valid names that YAML would read as an integer,
+# boolean or null if a template emitted them unquoted. Render with the release name "123".
+images:
+  pullSecrets: ["true"]
+database:
+  api:
+    existingSecret: "456"
+    key: "123"
+  worker:
+    key: "false"
+  migrate:
+    key: "null"
+api:
+  serviceAccount:
+    name: "555"
+worker:
+  serviceAccount:
+    create: false
+    name: "true"
+migration:
+  serviceAccount:
+    name: "null"

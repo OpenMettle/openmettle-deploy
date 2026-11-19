@@ -16,27 +16,37 @@ KUBERNETES_VERSION=1.37.0
 SCHEMA_COMMIT=11639286f15b208b6c7f1f93bc2c1a70f42cfbcb
 schema_location="https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json"
 
-# Each entry is a space-separated list of overlays applied on top of minimal.yaml.
+# The Helm version the tests were written against (tests/chart/install-tools.sh).
+HELM_VERSION=v4.3.0
+
+# Each entry is a release name followed by overlays applied on top of minimal.yaml.
 matrix=(
-  ""
-  "all-keys.yaml"
-  "migration-disabled.yaml"
+  "openmettle"
+  "openmettle all-keys.yaml"
+  "openmettle migration-disabled.yaml"
+  "123 yaml-ambiguous.yaml"
 )
 
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
-"$helm" version --short
+helm_version=$("$helm" version --template '{{ .Version }}')
+if [ "$helm_version" != "$HELM_VERSION" ]; then
+  echo "Expected Helm $HELM_VERSION, found $helm_version." >&2
+  exit 1
+fi
+echo "Helm $helm_version"
 "$kubeconform" -v
 for entry in "${matrix[@]}"; do
+  read -r -a fields <<< "$entry"
+  release=${fields[0]}
   args=(-f "$values/minimal.yaml")
-  for overlay in $entry; do
+  for overlay in "${fields[@]:1}"; do
     args+=(-f "$values/$overlay")
   done
-  name=${entry:-minimal}
-  echo "== $name"
+  echo "== $entry"
   "$helm" lint --strict "$chart" "${args[@]}"
-  "$helm" template openmettle "$chart" "${args[@]}" > "$out/rendered.yaml"
+  "$helm" template "$release" "$chart" "${args[@]}" > "$out/rendered.yaml"
   "$kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
     -schema-location "$schema_location" "$out/rendered.yaml"
 done

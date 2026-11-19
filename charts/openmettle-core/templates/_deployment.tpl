@@ -35,7 +35,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "openmettle-core.serviceAccountName" (merge (dict "serviceAccount" $values.serviceAccount) $context) }}
+      serviceAccountName: {{ include "openmettle-core.serviceAccountName" (merge (dict "serviceAccount" $values.serviceAccount) $context) | quote }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ int64 $values.terminationGracePeriodSeconds }}
@@ -43,13 +43,13 @@ spec:
       {{- with $root.Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
-        - name: {{ . }}
+        - name: {{ . | quote }}
         {{- end }}
       {{- end }}
       containers:
         - name: {{ $component }}
           image: {{ include "openmettle-core.image" (dict "name" $component "image" (index $root.Values.images $component)) | quote }}
-          imagePullPolicy: {{ $root.Values.images.pullPolicy }}
+          imagePullPolicy: {{ $root.Values.images.pullPolicy | quote }}
           ports:
             - name: http
               containerPort: {{ .port }}

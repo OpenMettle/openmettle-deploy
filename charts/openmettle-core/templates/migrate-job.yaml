@@ -1,8 +1,9 @@
 {{- /*
 Schema migration (core ADR 0003): once per release, before new API and worker pods roll out.
 Hooks run before ordinary release resources, so the migrate ServiceAccount is a hook too, at a
-lower weight. There is deliberately no pre-rollback hook: migrations are forward-only and an
-older binary refuses a newer schema.
+lower weight. There is deliberately no pre-rollback hook: migrations are forward-only. Only the
+migrator refuses a newer schema; the API and worker do not check it, so a rollback relies on core
+ADR 0003's rule that each migration stays compatible with the previous release.
 */ -}}
 {{- if .Values.migration.enabled }}
 {{- $migration := .Values.migration }}
@@ -12,7 +13,7 @@ older binary refuses a newer schema.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ $serviceAccountName }}
+  name: {{ $serviceAccountName | quote }}
   labels:
     {{- include "openmettle-core.labels" $context | nindent 4 }}
   {{- /* Hook annotations take precedence over user annotations with the same key. */}}
@@ -48,22 +49,26 @@ spec:
     metadata:
       labels:
         {{- include "openmettle-core.labels" $context | nindent 8 }}
+      {{- with $migration.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       restartPolicy: Never
-      serviceAccountName: {{ $serviceAccountName }}
+      serviceAccountName: {{ $serviceAccountName | quote }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       {{- include "openmettle-core.podSecurityContext" . | nindent 6 }}
       {{- with .Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
-        - name: {{ . }}
+        - name: {{ . | quote }}
         {{- end }}
       {{- end }}
       containers:
         - name: migrate
           image: {{ include "openmettle-core.image" (dict "name" "migrate" "image" .Values.images.migrate) | quote }}
-          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          imagePullPolicy: {{ .Values.images.pullPolicy | quote }}
           env:
             - name: OPENMETTLE_MIGRATE_DATABASE_URL
               {{- include "openmettle-core.databaseUrlEnv" (dict "name" "migrate" "ref" .Values.database.migrate) | nindent 14 }}
@@ -78,4 +83,16 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- include "openmettle-core.containerSecurityContext" . | nindent 10 }}
+      {{- with $migration.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $migration.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $migration.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 {{- end }}

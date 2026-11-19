@@ -83,7 +83,10 @@
     "migration": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "settings", "activeDeadlineSeconds", "resources", "serviceAccount"],
+      "required": [
+        "enabled", "settings", "activeDeadlineSeconds", "resources", "serviceAccount",
+        "podAnnotations", "nodeSelector", "tolerations", "affinity"
+      ],
       "properties": {
         "enabled": {"type": "boolean"},
         "settings": {
@@ -96,9 +99,17 @@
             "statementTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 3600000}
           }
         },
-        "activeDeadlineSeconds": {"type": "integer", "minimum": 1},
+        "activeDeadlineSeconds": {
+          "description": "Seconds; rendering fails unless it exceeds connectTimeoutMs + lockTimeoutMs + statementTimeoutMs.",
+          "type": "integer",
+          "minimum": 1
+        },
         "resources": {"$ref": "#/$defs/resources"},
-        "serviceAccount": {"$ref": "#/$defs/serviceAccount"}
+        "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
+        "podAnnotations": {"$ref": "#/$defs/stringMap"},
+        "nodeSelector": {"$ref": "#/$defs/stringMap"},
+        "tolerations": {"$ref": "#/$defs/tolerations"},
+        "affinity": {"$ref": "#/$defs/affinity"}
       }
     }
   },

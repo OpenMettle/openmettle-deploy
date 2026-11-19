@@ -99,9 +99,16 @@ migration:
     connectTimeoutMs: 5000
     lockTimeoutMs: 15000
     statementTimeoutMs: 300000
+  # Job deadline in seconds. Must exceed connectTimeoutMs + lockTimeoutMs + statementTimeoutMs;
+  # rendering fails otherwise. Give Helm a --timeout of at least this value (see README).
   activeDeadlineSeconds: 900
   resources: {}
   serviceAccount:
     create: true
     name: ""
     annotations: {}
+  # Scheduling for the hook pod, for example to tolerate the same taints as api and worker.
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

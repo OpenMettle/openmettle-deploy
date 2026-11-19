@@ -22,7 +22,7 @@ if [ "$(id -u)" = 0 ]; then
   echo "Refusing to run as root." >&2
   exit 2
 fi
-if [ -e "$dest" ] && [ -n "$(ls -A "$dest")" ]; then
+if [ -e "$dest" ] && [ -n "$(ls -A -- "$dest")" ]; then
   echo "Refusing to write into non-empty $dest." >&2
   exit 2
 fi
@@ -33,7 +33,7 @@ trap 'rm -rf "$work"' EXIT
 # Verify the archive digest before extracting exactly one named member.
 fetch() {
   local name="$1" url="$2" sha="$3" member="$4"
-  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 \
+  curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
     --output "$work/$name.tar.gz" "$url"
   echo "$sha  $work/$name.tar.gz" | sha256sum --check --strict --quiet -
   mkdir "$work/$name"

@@ -18,4 +18,6 @@ None of these is part of the chart or any image, and none is redistributed. Chec
 | PyYAML | 6.0.3 | https://pypi.org/project/PyYAML/6.0.3/ (https://github.com/yaml/pyyaml) | MIT | Test-only YAML parsing in `tests/chart`. Hash-pinned CPython 3.12 manylinux x86_64 wheel in `tests/chart/requirements.txt`, installed into a CI virtual environment. Local runs here used PyYAML 6.0 |
 | OpenMettle core process contract | commit `5cd8a9dcdd31989eb09adb425115e3d187a5d0e7` | https://github.com/OpenMettle/openmettle-core `runtime/process-contract.json` | MIT | Unmodified test fixture in `tests/fixtures/core-5cd8a9d/`; CI compares it byte for byte with the pinned commit |
 
+CI also uses `shellcheck`, `python3` and `pip` (to create the PyYAML virtual environment) as preinstalled on the GitHub-hosted `ubuntu-24.04` runner image. Their versions are not pinned and change when GitHub updates the image.
+
 The chart's Helm template helpers follow common Helm chart conventions (`helm create` naming and labels) and were written for OpenMettle; no third-party chart source is copied.

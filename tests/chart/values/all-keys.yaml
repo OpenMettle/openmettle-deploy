@@ -58,3 +58,13 @@ migration:
   serviceAccount:
     create: true
     annotations: {example.test/role: migrate}
+  podAnnotations: {example.test/note: migrate}
+  nodeSelector: {example.test/pool: migrate}
+  tolerations:
+    - {key: example.test/dedicated, operator: Exists, effect: NoSchedule}
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: kubernetes.io/arch, operator: In, values: [amd64]}

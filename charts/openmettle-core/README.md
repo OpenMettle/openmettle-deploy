@@ -17,7 +17,7 @@ CPU-only packaging for the OpenMettle core API, worker and schema migration. Thi
 
 ## Values contract
 
-[`values.schema.json`](values.schema.json) (JSON Schema draft 2020-12) rejects unknown keys at every level, so an unsupported key such as `oidc:` fails the render instead of being ignored. `affinity` is the only pass-through: its top-level keys are checked and Kubernetes validates the nested structure. Integer bounds copy core's (`src/lib.rs`, `src/migrate.rs`).
+[`values.schema.json`](values.schema.json) (JSON Schema draft 2020-12) rejects unknown keys at every level, so an unsupported key such as `oidc:` fails the render instead of being ignored. `affinity` is the only pass-through: its top-level keys are checked and Kubernetes validates the nested structure. Integer bounds copy core's (`src/lib.rs`, `src/migrate.rs`). The schema also rejects the `global` key that Helm passes to subcharts, so this chart cannot be used as a subchart. This is by design: core is installed as its own release.
 
 The chart refuses to render until you supply:
 
@@ -33,7 +33,7 @@ The chart refuses to render until you supply:
 | `database.connectionBudget` | `null` | Optional; see [Connection budget](#connection-budget) |
 | `api.replicas`, `worker.replicas` | `1` | Independent |
 | `api.resources`, `worker.resources` | requests `100m` CPU, `64Mi` | Core's contract examples, not qualified sizing. Only `cpu`, `memory` and `ephemeral-storage` are accepted. |
-| `<component>.serviceAccount.{create,name,annotations}` | `true`, `""`, `{}` | `name` is required when `create` is false; components never share a ServiceAccount |
+| `<component>.serviceAccount.{create,name,annotations}` | `true`, `""`, `{}` | `name` is required when `create` is false. Rendering fails if two components (including the migration, when enabled) resolve to the same name, or if any name is `default` |
 | `<component>.settings.dbMaxConnections` | `4` | `OPENMETTLE_<ROLE>_DB_MAX_CONNECTIONS`, 1–64 |
 | `<component>.settings.dbTimeoutMs` | `2000` | `OPENMETTLE_<ROLE>_DB_TIMEOUT_MS`, 1–30000 |
 | `<component>.settings.shutdownTimeoutMs` | `5000` | `OPENMETTLE_<ROLE>_SHUTDOWN_TIMEOUT_MS`, 1–60000 |
@@ -45,8 +45,9 @@ The chart refuses to render until you supply:
 | `migration.settings.connectTimeoutMs` | `5000` | `OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS`, 1–60000 |
 | `migration.settings.lockTimeoutMs` | `15000` | `OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS`, 1–600000 |
 | `migration.settings.statementTimeoutMs` | `300000` | `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS`, 1–3600000 |
-| `migration.activeDeadlineSeconds` | `900` | Job deadline |
+| `migration.activeDeadlineSeconds` | `900` | Job deadline. Must exceed `connectTimeoutMs + lockTimeoutMs + statementTimeoutMs`; rendering fails otherwise. Pass a Helm `--timeout` of at least this value; see [Schema migration](#schema-migration) |
 | `migration.resources`, `migration.serviceAccount` | `{}`, created | As above |
+| `migration.{podAnnotations,nodeSelector,tolerations,affinity}` | empty | Scheduling for the hook pod, for example on tainted nodes |
 
 `<component>` is `api` or `worker`; `<ROLE>` is `API` or `WORKER`.
 
@@ -60,7 +61,7 @@ Core ADR 0003 bounds PostgreSQL connections at the server. When `database.connec
 
 `(api.replicas + api.maxSurge) × api.dbMaxConnections + (worker.replicas + worker.maxSurge) × worker.dbMaxConnections + 1 (migrator) ≤ connectionBudget`.
 
-Set it to the connections available to this release, after subtracting reserved and administrative or backup headroom. The check covers configured pools only. Enforce each role's share in PostgreSQL with `CONNECTION LIMIT`; the chart does not manage roles.
+Set it to the connections available to this release, after subtracting reserved and administrative or backup headroom. The check covers configured pools only. It also excludes Terminating pods: during a rollout, a replaced pod keeps its pool open while it drains, for up to `terminationGracePeriodSeconds`, so the actual peak can briefly exceed the computed one. Leave headroom for that. Enforce each role's share in PostgreSQL with `CONNECTION LIMIT`; the chart does not manage roles.
 
 ## Security defaults
 
@@ -77,9 +78,15 @@ These are fixed and are not values:
 Core runs migrations once per release, before new API and worker pods start (core ADR 0003). The chart does this with a Helm hook Job:
 
 - `helm.sh/hook: pre-install,pre-upgrade`. Helm creates or updates the Deployments only after the Job succeeds. Hooks run before ordinary resources, so the migrate ServiceAccount is a hook too, at a lower weight.
-- `before-hook-creation,hook-succeeded` delete policy. A successful run leaves nothing behind. A failed Job and its ServiceAccount stay for diagnosis, and the next install or upgrade replaces them.
+- `before-hook-creation,hook-succeeded` delete policy on both hooks. A successful run leaves nothing behind. When the Job fails, Helm 4.3 still deletes the hooks that completed before it and carry `hook-succeeded` (`pkg/action/hooks.go`). The migrate ServiceAccount is therefore removed, and only the failed Job and its pods stay for diagnosis. The next install or upgrade recreates the ServiceAccount and replaces the Job.
 - `restartPolicy: Never`, `backoffLimit: 2`, `activeDeadlineSeconds` from values. A `podFailurePolicy` fails the Job immediately on exit 78 (invalid configuration). Exit 1, for example a lock timeout, may retry.
-- **No rollback hook.** Migrations are forward-only, and an older binary refuses a newer schema. Recovery from a bad release is a corrective forward release or a restore (V1-30/V1-31), not `helm rollback` across a schema change.
+- `activeDeadlineSeconds` must exceed `connectTimeoutMs + lockTimeoutMs + statementTimeoutMs`, or rendering fails. One attempt connects, waits for locks and then runs statements, so a smaller deadline would end a long statement before its configured timeout. This is a lower bound only: migrations with several long statements, and retries, need more.
+- `migration.{nodeSelector,tolerations,affinity,podAnnotations}` schedule the hook pod independently of api and worker.
+- **No rollback hook.** Migrations are forward-only, and `helm rollback` runs no migration. Only the migrator refuses a database at a newer schema version. The API and worker do not check the schema version; core ADR 0003 lists a schema-compatibility readiness gate as not yet covered. A rollback to the previous release therefore relies on ADR 0003's rule that each migration stays compatible with the previous release's API and worker. Nothing guarantees compatibility further back. Recovery from a bad release is a corrective forward release or a restore (V1-30/V1-31).
+
+**Helm timeout.** Helm waits for each hook only for `--timeout`, which defaults to 300 s, while the Job deadline defaults to 900 s. Give `helm install` and `helm upgrade` a `--timeout` of at least `migration.activeDeadlineSeconds` (for the defaults, `--timeout 15m`). If Helm's timeout expires first, Helm marks the release failed and deletes the migrate ServiceAccount as described above, while the Job keeps running. The running pod may still finish, but the Job cannot create a retry pod without its ServiceAccount. Re-running the install or upgrade deletes and replaces the Job, which stops any pod still running. This is recoverable: each migration runs in one transaction, so an interrupted run leaves no partial migration, and the next run continues from the last committed version.
+
+**Sidecar injection.** If a service mesh or another admission webhook injects a long-running sidecar into the hook pod, the pod does not finish when the migrate container exits. The Job then never completes and Helm waits until its timeout. Exclude the hook pod from injection, for example with `migration.podAnnotations` if your mesh supports an opt-out annotation. This has not been tested with any mesh.
 
 `helm template` and `--dry-run` do not run hooks. `--no-hooks` skips the migration, and the new pods then start against the old schema.
 
@@ -92,7 +99,7 @@ bash tests/chart/render.sh                    # helm lint, render matrix, kubeco
 python3 -m unittest discover -s tests/chart -v  # policy, negative-case and contract tests
 ```
 
-Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim. The chart sets no `kubeVersion` floor. The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim; `render.sh` fails on any other Helm version. The chart sets no `kubeVersion` floor. The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
