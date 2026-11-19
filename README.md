@@ -2,7 +2,7 @@
 
 Generic Kubernetes/Helm packaging for the [accepted architecture](https://github.com/OpenMettle/openmettle-core/blob/main/ARCHITECTURE-v1.md). V1-32 owns the core Helm implementation and V1-20 owns the qualified optional GPU profile.
 
-**Status:** `charts/openmettle-core` has its render contract (V1-32 I1): API and worker Deployments, the API Service, per-component ServiceAccounts, a migration hook Job, a strict values schema and render-time tests. A kind install smoke test (I2, [`tests/kind`](tests/kind/README.md)) passed on [a pull-request run](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) of the merge of `b8f2d79` into `main`; it has not yet run on `main`. NetworkPolicy, storage and ingress follow in later increments; see the [chart README](charts/openmettle-core/README.md#pending).
+**Status:** `charts/openmettle-core` has its render contract (V1-32 I1), kind install smoke test (I2, [`tests/kind`](tests/kind/README.md)), and NetworkPolicies (I3): API and worker Deployments, the API Service, per-component ServiceAccounts, a migration hook Job and egress NetworkPolicy hook, chart-scoped deny-all and per-component NetworkPolicies, a strict values schema and render-time tests. The I2 kind smoke test passed on [a pull-request run](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) of the merge of `b8f2d79` into `main`; hosted kind execution for I3 NetworkPolicy enforcement is pending pull-request CI. Storage and ingress follow in later increments; see the [chart README](charts/openmettle-core/README.md#pending).
 
 ## Package boundaries
 

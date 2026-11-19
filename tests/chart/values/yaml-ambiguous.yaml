@@ -20,3 +20,10 @@ worker:
 migration:
   serviceAccount:
     name: "null"
+networkPolicy:
+  database:
+    to:
+      - podSelector:
+          matchLabels:
+            example.test/enabled: "true"
+            example.test/id: "123"

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2 smoke test).
+"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2/I3 smoke test).
 
 Test harness only; not an installer. It builds core's api, worker and migrate images from a
 pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
 migration hook, readiness, worker scaling, an idempotent upgrade, uninstall, absence of optional
-packages and Pod Security `restricted` enforcement. Every assertion reads live cluster, Helm or
-database state. Core's process-contract assertions are not repeated (core tests/kubernetes).
+packages, Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion
+reads live cluster, Helm or database state. Core's process-contract assertions are not repeated
+(core tests/kubernetes).
 
 Safety guards, tool and image pins are imported from core tests/kubernetes/qualify.py at
 CORE_COMMIT; see tests/kind/README.md. Requires Python 3.10+, docker, the pinned kind and
@@ -61,8 +62,22 @@ SECRET = {"api": "openmettle-api-database", "worker": "openmettle-worker-databas
 DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "openmettle_owner"}
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
 MIGRATION_DEADLINE_SECONDS = 120
-OPTIONAL_KINDS = "networkpolicies,ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
-RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets"
+OPTIONAL_KINDS = "ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
+RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies"
+INVENTORY_KINDS = "deployments,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies"
+# NetworkPolicy fixtures. The app namespace denies all traffic by default, as the owner's application
+# namespaces do; the release must work under it. PEER is a second PostgreSQL server in the database
+# namespace that is not a configured database peer; it is also the one configured API ingress peer.
+NAMESPACE_DENY = "default-deny"
+PEER = "netpol-peer"
+POSTGRES_LABELS = {"app.kubernetes.io/name": "postgres"}
+PEER_LABELS = {"app.kubernetes.io/name": PEER}
+DNS_SELECTOR = "k8s-app=kube-dns"  # CoreDNS in kube-system (kubeadm, so kind)
+DNS_METRICS_PORT = 9153  # CoreDNS `prometheus :9153` in kubeadm's Corefile; not a DNS port
+PROBE_SECONDS = 5
+TIMEOUT_EXIT = 124  # coreutils timeout(1)
+REJECTED = re.compile(r"Connection refused|No route to host|Network is unreachable")
+HTTP_OK = re.compile(r"HTTP/1\.[01] 200 ")
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
 # Stderr kept in a failure message, as core's Runner keeps; redacted before it is truncated.
 STDERR_TAIL = 2000
@@ -212,7 +227,16 @@ def smoke_values(digests: dict, worker_replicas: int) -> dict:
         "migration": {"activeDeadlineSeconds": MIGRATION_DEADLINE_SECONDS,
                       "settings": {"connectTimeoutMs": 5000, "lockTimeoutMs": 15000,
                                    "statementTimeoutMs": 60000}},
+        # networkPolicy.enabled and the DNS peer keep the chart defaults.
+        "networkPolicy": {"api": {"ingressFrom": [database_namespace_peer(PEER_LABELS)]},
+                          "database": {"to": [database_namespace_peer(POSTGRES_LABELS)]}},
     }
+
+
+def database_namespace_peer(labels: dict) -> dict:
+    """A NetworkPolicyPeer for pods with `labels` in the database namespace."""
+    return {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": DB_NAMESPACE}},
+            "podSelector": {"matchLabels": dict(labels)}}
 
 
 def database_url(role: str, password: str) -> str:
@@ -230,7 +254,7 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
     sql = "".join(f"CREATE ROLE {DB_ROLE[role]} LOGIN PASSWORD '{passwords[role]}';\n"
                   for role in ROLES)
     sql += "CREATE DATABASE openmettle OWNER openmettle_owner;\n"
-    selector = {"app.kubernetes.io/name": "postgres"}
+    selector = POSTGRES_LABELS
     items = [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": APP_NAMESPACE, "labels": {
             **labels, "pod-security.kubernetes.io/enforce": "restricted",
@@ -268,6 +292,30 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
          "metadata": {"name": "postgres", "namespace": DB_NAMESPACE, "labels": labels},
          "spec": {"selector": selector,
                   "ports": [{"name": "postgres", "port": 5432, "targetPort": "postgres"}]}},
+        # Selects every pod in the app namespace, including the chart's: nothing in or out unless a
+        # policy allows it. The chart's own deny-all is therefore not observable separately here.
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": NAMESPACE_DENY, "namespace": APP_NAMESPACE, "labels": labels},
+         "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}},
+        # A PostgreSQL server that is not a configured database peer, holding no data. It reuses the
+        # fixture's admin password Secret, so no new credential is created.
+        {"apiVersion": "apps/v1", "kind": "Deployment",
+         "metadata": {"name": PEER, "namespace": DB_NAMESPACE, "labels": labels},
+         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                  "selector": {"matchLabels": PEER_LABELS},
+                  "template": {"metadata": {"labels": PEER_LABELS}, "spec": {
+                      "automountServiceAccountToken": False, "enableServiceLinks": False,
+                      "containers": [{
+                          "name": "postgres", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
+                          "env": [{"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {
+                              "name": "postgres-fixture", "key": "admin-password"}}}],
+                          "ports": [{"name": "postgres", "containerPort": 5432}],
+                          "readinessProbe": {"exec": {"command": ["pg_isready", "-h", "127.0.0.1"]},
+                                             "periodSeconds": 2, "failureThreshold": 2},
+                          "volumeMounts": [{"name": "data", "mountPath": "/var/lib/postgresql"}],
+                      }],
+                      "volumes": [{"name": "data", "emptyDir": {}}],
+                  }}}},
     ]
     # Created by the test, not the chart: the chart only references existing Secrets.
     items += [{"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
@@ -314,10 +362,123 @@ def object_names(items: list) -> list:
     return sorted(f"{item['kind']}/{item['metadata']['name']}" for item in items)
 
 
+def release_network_policies() -> list:
+    """The release's non-hook NetworkPolicies. The migrate policy is a hook deleted on success."""
+    return sorted(f"NetworkPolicy/{FULLNAME}-{name}" for name in ("deny-all", "api", "worker"))
+
+
 def expected_release_objects() -> list:
     return sorted([f"Deployment/{FULLNAME}-api", f"Deployment/{FULLNAME}-worker",
                    f"Service/{FULLNAME}-api",
-                   f"ServiceAccount/{FULLNAME}-api", f"ServiceAccount/{FULLNAME}-worker"])
+                   f"ServiceAccount/{FULLNAME}-api", f"ServiceAccount/{FULLNAME}-worker",
+                   *release_network_policies()])
+
+
+def tcp_command(host: str, port: int) -> list:
+    """Open one TCP connection from inside a container with bash's /dev/tcp, bounded by timeout(1).
+
+    Host and port are positional arguments ($0, $1), never part of the script text.
+    """
+    return ["timeout", str(PROBE_SECONDS), "bash", "-c", 'exec 3<>"/dev/tcp/$0/$1"', host, str(port)]
+
+
+def http_command(host: str, port: int, path: str) -> list:
+    """GET `path` over one TCP connection and print the status line."""
+    script = ('exec 3<>"/dev/tcp/$0/$1" && printf "GET %s HTTP/1.1\\r\\nHost: %s\\r\\nConnection: close\\r\\n\\r\\n" '
+              '"$2" "$0" >&3 && head -n 1 <&3')
+    return ["timeout", str(PROBE_SECONDS), "bash", "-c", script, host, str(port), path]
+
+
+def probe_plan(dns_ip: str, peer_ip: str) -> list:
+    """Connections to try, each from inside a running pod (kubectl exec), with the expected result.
+
+    Every denial has a control: the same target reached from a pod that no NetworkPolicy selects.
+    A denial whose control fails is not evidence, because nothing may have been listening.
+    """
+    database = f"postgres.{DB_NAMESPACE}.svc.cluster.local"
+    api = f"{FULLNAME}-api.{APP_NAMESPACE}.svc.cluster.local"
+    readyz = http_command(api, 8080, "/readyz")
+
+    def probe(name, namespace, workload, container, command, expect, control=None):
+        return {"name": name, "namespace": namespace, "workload": workload, "container": container,
+                "command": command, "expect": expect, "control": control, "http": command == readyz}
+    decoy_control = "control: database namespace reaches the decoy PostgreSQL on 5432"
+    metrics_control = "control: database namespace reaches CoreDNS on 9153"
+    ingress_allowed = "api ingress from the configured peer: GET /readyz 200"
+    plan = [
+        probe(decoy_control, DB_NAMESPACE, "postgres", "postgres", tcp_command(peer_ip, 5432), "connect"),
+        probe(metrics_control, DB_NAMESPACE, PEER, "postgres", tcp_command(dns_ip, DNS_METRICS_PORT), "connect"),
+        probe(ingress_allowed, DB_NAMESPACE, PEER, "postgres", readyz, "connect"),
+    ]
+    for component in WORKLOADS:
+        workload = f"{FULLNAME}-{component}"
+        plan += [
+            probe(f"{component} egress to the database peer by DNS name", APP_NAMESPACE, workload, component,
+                  tcp_command(database, 5432), "connect"),
+            probe(f"{component} egress to PostgreSQL on a non-peer pod", APP_NAMESPACE, workload, component,
+                  tcp_command(peer_ip, 5432), "deny", decoy_control),
+            probe(f"{component} egress to the DNS peer on a non-DNS port", APP_NAMESPACE, workload, component,
+                  tcp_command(dns_ip, DNS_METRICS_PORT), "deny", metrics_control),
+        ]
+    plan.append(probe("api ingress from an unconfigured peer", DB_NAMESPACE, "postgres", "postgres",
+                      readyz, "deny", ingress_allowed))
+    return plan
+
+
+def probe_outcome(returncode: int, stdout: str, stderr: str, http: bool) -> str:
+    """connected, timeout or rejected (both denials), unexpected-response or inconclusive.
+
+    A dropped connection times out; a rejecting policy engine reports refused or unreachable. Any
+    other failure, such as kubectl failing to exec, is inconclusive and never counts as a denial.
+    """
+    if returncode == 0:
+        return "connected" if not http or HTTP_OK.match(stdout) else "unexpected-response"
+    if returncode == TIMEOUT_EXIT:
+        return "timeout"
+    if REJECTED.search(stderr):
+        return "rejected"
+    return "inconclusive"
+
+
+def evaluate_probes(results: list) -> None:
+    """Raise unless every allowed path and control connected and every other connection was denied."""
+    if not results:
+        raise SmokeFailure("no NetworkPolicy probes ran")
+    by_name = {r["name"]: r for r in results}
+    leaks = [r["name"] for r in results if r["expect"] == "deny" and r["outcome"] == "connected"]
+    if leaks:
+        raise SmokeFailure(
+            "NetworkPolicy is not enforced in this cluster: " + "; ".join(leaks) + " connected. kind's "
+            "kindnet runs kube-network-policies fail-open, so a missing or failed policy controller allows "
+            "everything. Do not count this run as NetworkPolicy evidence; a pinned policy engine for the "
+            "smoke cluster needs owner sign-off (tests/kind/README.md).")
+    problems = []
+    for r in results:
+        if r["expect"] == "connect":
+            if r["outcome"] != "connected":
+                problems.append(f"allowed path failed: {r['name']} ({r['outcome']})")
+        elif r["expect"] == "deny":
+            control = by_name.get(r["control"])
+            if control is None or control["expect"] != "connect":
+                problems.append(f"{r['name']} has no control probe")
+            elif control["outcome"] != "connected":
+                problems.append(f"{r['name']}: its control did not connect, so the denial is not evidence")
+            if r["outcome"] not in ("timeout", "rejected"):
+                problems.append(f"{r['name']} was inconclusive ({r['outcome']})")
+        else:
+            problems.append(f"{r['name']} has unexpected expectation ({r['expect']})")
+    if problems:
+        raise SmokeFailure("; ".join(problems))
+
+
+def running_pod_ip(items: list, description: str) -> str:
+    """The IP of the first Running, not terminating pod by name."""
+    running = sorted((p for p in items if p.get("status", {}).get("phase") == "Running"
+                      and p["status"].get("podIP") and not p["metadata"].get("deletionTimestamp")),
+                     key=lambda p: p["metadata"]["name"])
+    if not running:
+        raise SmokeFailure(f"no Running {description} pod with an IP")
+    return running[0]["status"]["podIP"]
 
 
 def unexpected_resources(pods: list) -> list:
@@ -582,8 +743,9 @@ class Smoke:
         manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id)
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(manifests))
-        self.kube("--namespace", DB_NAMESPACE, "rollout", "status", "deployment/postgres",
-                  "--timeout=300s", timeout=330)
+        for deployment in ("postgres", PEER):
+            self.kube("--namespace", DB_NAMESPACE, "rollout", "status", f"deployment/{deployment}",
+                      "--timeout=300s", timeout=330)
 
     def migrations(self) -> list:
         """Applied migration history, read as the fixture superuser."""
@@ -643,6 +805,32 @@ class Smoke:
                                                   f"{FULLNAME}-{c}")["metadata"]["generation"]
                                 for c in WORKLOADS}}
 
+    def network_policy(self):
+        """Prove that the cluster enforces the release's NetworkPolicies, from inside running pods.
+
+        Readiness is still read through `kubectl port-forward`, which the kubelet serves inside the
+        pod's network namespace, so no policy applies to it; the probes below are the policy evidence.
+        """
+        policies = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "networkpolicies")["items"])
+        self.expect(policies == sorted([f"NetworkPolicy/{NAMESPACE_DENY}", *release_network_policies()]),
+                    f"app namespace NetworkPolicy objects: {policies}")
+        dns_ip = running_pod_ip(self.kube_json("--namespace", "kube-system", "get", "pods", "--selector",
+                                               DNS_SELECTOR)["items"], "CoreDNS")
+        peer_ip = running_pod_ip(self.kube_json("--namespace", DB_NAMESPACE, "get", "pods", "--selector",
+                                                f"app.kubernetes.io/name={PEER}")["items"], PEER)
+        results = []
+        for probe in probe_plan(dns_ip, peer_ip):
+            result = self.kube("--namespace", probe["namespace"], "exec", f"deployment/{probe['workload']}",
+                               "--container", probe["container"], "--", *probe["command"],
+                               check=False, timeout=PROBE_SECONDS + 60)
+            outcome = probe_outcome(result.returncode, result.stdout, result.stderr, probe["http"])
+            _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']})")
+            results.append({key: probe[key] for key in ("name", "expect", "control")} | {"outcome": outcome})
+        evaluate_probes(results)
+        self.passed("NetworkPolicy enforced: DNS and database egress only, API ingress from the configured peer",
+                    namespace_policies=policies,
+                    probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]} for r in results])
+
     def completions(self) -> list:
         return job_completions(self.events("involvedObject.kind=Job"), f"{FULLNAME}-migrate")
 
@@ -675,8 +863,7 @@ class Smoke:
         # Helm deletes the succeeded hook Job; its pods are garbage-collected in the background.
         self.wait_for("migrate hook pods to be removed",
                       lambda: not self.pods("migrate", include_terminating=True), timeout=120)
-        inventory = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get",
-                                                "deployments,services,serviceaccounts,jobs,configmaps,secrets",
+        inventory = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", INVENTORY_KINDS,
                                                 "--selector", f"app.kubernetes.io/instance={RELEASE}")["items"])
         self.expect(inventory == expected_release_objects(), f"release objects: {inventory}")
         # Every non-hook object Helm manages, read back live (hooks are not in the manifest).
@@ -711,6 +898,10 @@ class Smoke:
                     "a non-compliant pod was not rejected by Pod Security admission")
         self.passed("app namespace enforces Pod Security restricted",
                     enforce="restricted", noncompliant_pod_rejected=True)
+
+        # 9: the install above ran under the namespace's default deny, so the migrate hook had only
+        # its own hook policy for egress. Now prove the policies are enforced at all.
+        self.network_policy()
 
         # 4: worker to 2 through chart values while the API stays at 1. Helm 4 applies server-side
         # by default, so a kubectl scale would conflict with Helm's ownership of replicas.
@@ -765,7 +956,10 @@ class Smoke:
                      ["--namespace", APP_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"],
                      ["--namespace", APP_NAMESPACE, "logs", "--selector", f"app.kubernetes.io/instance={RELEASE}",
                       "--all-containers", "--prefix", "--tail=100"],
-                     ["--namespace", DB_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"]):
+                     ["--namespace", DB_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"],
+                     ["--namespace", APP_NAMESPACE, "get", "networkpolicies", "--output=wide"],
+                     # kindnet enforces NetworkPolicy; its log shows whether the policy controller started.
+                     ["--namespace", "kube-system", "logs", "--selector", "app=kindnet", "--tail=50"]):
             try:
                 result = self.kube(*args, check=False, timeout=60)
             except (subprocess.TimeoutExpired, OSError):
