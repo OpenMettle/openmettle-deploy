@@ -2,7 +2,7 @@
 
 Generic Kubernetes/Helm packaging for the [accepted architecture](https://github.com/OpenMettle/openmettle-core/blob/main/ARCHITECTURE-v1.md). V1-32 owns the core Helm implementation and V1-20 owns the qualified optional GPU profile.
 
-**Status:** `charts/openmettle-core` has its render contract (V1-32 I1): API and worker Deployments, the API Service, per-component ServiceAccounts, a migration hook Job, a strict values schema and render-time tests. It has not been installed on any cluster. Cluster smoke testing, NetworkPolicy, storage and ingress follow in later increments; see the [chart README](charts/openmettle-core/README.md#pending).
+**Status:** `charts/openmettle-core` has its render contract (V1-32 I1): API and worker Deployments, the API Service, per-component ServiceAccounts, a migration hook Job, a strict values schema and render-time tests. A kind install smoke test (I2, [`tests/kind`](tests/kind/README.md)) passed on [a pull-request run](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) of the merge of `b8f2d79` into `main`; it has not yet run on `main`. NetworkPolicy, storage and ingress follow in later increments; see the [chart README](charts/openmettle-core/README.md#pending).
 
 ## Package boundaries
 
@@ -16,9 +16,10 @@ Generic Kubernetes/Helm packaging for the [accepted architecture](https://github
 python3 scripts/check_repository.py
 bash tests/chart/render.sh                      # helm lint, render matrix, kubeconform
 python3 -m unittest discover -s tests/chart -v  # chart policy tests; needs PyYAML
+python3 -m unittest discover -s tests/kind -v   # kind smoke harness logic; no cluster
 ```
 
-CI checks repository hygiene and runs the chart `render` job: SHA-256-verified Helm and kubeconform (`tests/chart/install-tools.sh`, linux/amd64), the commands above, and a byte comparison of the core contract fixture with the pinned core commit. Locally, the scripts use `helm` and `kubeconform` from `PATH` (or `HELM` and `KUBECONFORM`). kubeconform downloads schemas from the pinned source at run time. No successful cluster deployment, backup or restore is implied. Keep local values in ignored `config/*.local.yaml` or an external private configuration repository.
+CI checks repository hygiene and runs the chart `render` job: SHA-256-verified Helm and kubeconform (`tests/chart/install-tools.sh`, linux/amd64), the commands above, and a byte comparison of the core contract fixture with the pinned core commit. The `kind-smoke` workflow installs the chart on an ephemeral kind cluster. It runs on pull requests and pushes to `main` that touch the chart or harness, and on manual dispatch; see [`tests/kind`](tests/kind/README.md). Locally, the scripts use `helm` and `kubeconform` from `PATH` (or `HELM` and `KUBECONFORM`). kubeconform downloads schemas from the pinned source at run time. Beyond the ephemeral kind smoke, no cluster deployment, backup or restore is implied. Keep local values in ignored `config/*.local.yaml` or an external private configuration repository.
 
 ## Operations
 

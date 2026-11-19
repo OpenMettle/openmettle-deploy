@@ -28,7 +28,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      # openmettle-core commit whose runtime/process-contract.json is copied under tests/fixtures.
+      # openmettle-core commit whose runtime/process-contract.json is copied under tests/fixtures
+      # and whose kind harness guards tests/kind imports. Must equal tests/kind/smoke.py (unit-tested).
       CORE_COMMIT: 5cd8a9dcdd31989eb09adb425115e3d187a5d0e7
     steps:
       - name: Check out source
@@ -58,3 +59,11 @@ jobs:
             --output "$RUNNER_TEMP/process-contract.json" \
             "https://raw.githubusercontent.com/OpenMettle/openmettle-core/$CORE_COMMIT/runtime/process-contract.json"
           cmp "$RUNNER_TEMP/process-contract.json" "$fixture"
+      - name: Kind smoke harness tests (no cluster), with core guards from the pinned commit
+        # The cluster run itself is kind-smoke.yml (path-filtered pull requests and main, and dispatch).
+        run: |
+          mkdir -p "$RUNNER_TEMP/core/tests/kubernetes"
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
+            --output "$RUNNER_TEMP/core/tests/kubernetes/qualify.py" \
+            "https://raw.githubusercontent.com/OpenMettle/openmettle-core/$CORE_COMMIT/tests/kubernetes/qualify.py"
+          OPENMETTLE_CORE_DIR="$RUNNER_TEMP/core" python3 -m unittest discover -s tests/kind -v
