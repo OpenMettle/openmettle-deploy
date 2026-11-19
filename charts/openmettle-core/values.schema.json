@@ -3,7 +3,7 @@
   "title": "openmettle-core chart values",
   "type": "object",
   "additionalProperties": false,
-  "required": ["images", "database", "api", "worker", "migration"],
+  "required": ["images", "database", "api", "worker", "migration", "networkPolicy"],
   "properties": {
     "images": {
       "type": "object",
@@ -110,6 +110,39 @@
         "nodeSelector": {"$ref": "#/$defs/stringMap"},
         "tolerations": {"$ref": "#/$defs/tolerations"},
         "affinity": {"$ref": "#/$defs/affinity"}
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "api", "dns", "database"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ingressFrom"],
+          "properties": {
+            "ingressFrom": {"$ref": "#/$defs/networkPolicyPeers"}
+          }
+        },
+        "dns": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["to"],
+          "properties": {
+            "to": {"$ref": "#/$defs/networkPolicyPeers"}
+          }
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["to", "port"],
+          "properties": {
+            "to": {"$ref": "#/$defs/networkPolicyPeers"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        }
       }
     }
   },
@@ -236,6 +269,57 @@
         "maxSurge": {"type": "integer", "minimum": 0},
         "maxUnavailable": {"type": "integer", "minimum": 0}
       }
+    },
+    "networkPolicyPeers": {
+      "description": "Rendering fails if dns.to or database.to is empty while networkPolicy.enabled is true.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/networkPolicyPeer"}
+    },
+    "networkPolicyPeer": {
+      "description": "A Kubernetes NetworkPolicyPeer: podSelector and/or namespaceSelector, or ipBlock alone.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "podSelector": {"$ref": "#/$defs/labelSelector"},
+        "namespaceSelector": {"$ref": "#/$defs/labelSelector"},
+        "ipBlock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cidr"],
+          "properties": {
+            "cidr": {"$ref": "#/$defs/cidr"},
+            "except": {"type": "array", "items": {"$ref": "#/$defs/cidr"}}
+          }
+        }
+      },
+      "if": {"required": ["ipBlock"]},
+      "then": {"maxProperties": 1}
+    },
+    "labelSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "matchLabels": {"$ref": "#/$defs/stringMap"},
+        "matchExpressions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "operator"],
+            "properties": {
+              "key": {"type": "string", "minLength": 1},
+              "operator": {"enum": ["In", "NotIn", "Exists", "DoesNotExist"]},
+              "values": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "cidr": {
+      "description": "IPv4 or IPv6 CIDR; Kubernetes validates the address itself.",
+      "type": "string",
+      "pattern": "^([0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}|[0-9a-fA-F:.]*:[0-9a-fA-F:.]*/[0-9]{1,3})$"
     }
   }
 }

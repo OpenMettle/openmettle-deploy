@@ -187,6 +187,9 @@ class CoreCheckoutStateTest(unittest.TestCase):
 # --- Orchestration against a recording fake cluster ----------------------------------------------
 
 IMAGE_ID = {role: "sha256:" + "f" * 63 + str(i) for i, role in enumerate(smoke.ROLES, start=1)}
+DNS_IP, PEER_IP = "10.244.0.2", "10.244.0.9"
+DATABASE_HOST = f"postgres.{smoke.DB_NAMESPACE}.svc.cluster.local"
+API_HOST = f"{smoke.FULLNAME}-api.{smoke.APP_NAMESPACE}.svc.cluster.local"
 MUTATING = (("helm", "install"), ("helm", "upgrade"), ("helm", "uninstall"), ("kubectl", "apply"))
 
 
@@ -333,6 +336,35 @@ class FakeCluster:
                                                                                     f"{index}",
                                                   "imageID": f"import-2026-11-19@{DIGEST[component]}"}]}}
 
+    def probe(self, args):
+        """`kubectl exec deployment/<workload> ... -- timeout N bash -c <script> <host> <port> [path]`.
+
+        Models the chart's policies under the namespace deny-all: release pods reach only the
+        database; only the decoy peer reaches the API; pods in the database namespace are unrestricted.
+        """
+        workload = args[1].split("/", 1)[1]
+        command = args[args.index("--") + 1:]
+        host, port, http = command[5], int(command[6]), len(command) > 7
+        if workload.startswith(smoke.FULLNAME):
+            allowed = (host, port) == (DATABASE_HOST, 5432)
+        elif host == API_HOST:
+            allowed = workload == smoke.PEER
+        else:
+            allowed = True
+        if not allowed:
+            return smoke.TIMEOUT_EXIT, "", ""
+        return 0, "HTTP/1.1 200 OK\r\n" if http else "", ""
+
+    @staticmethod
+    def running_pod(name, ip):
+        return {"metadata": {"name": name}, "status": {"phase": "Running", "podIP": ip}}
+
+    def network_policies(self):
+        names = [f"NetworkPolicy/{smoke.NAMESPACE_DENY}"]
+        if self.installed:
+            names += smoke.release_network_policies()
+        return self.items(names)
+
     def pods(self, component=None):
         if not self.installed:
             return []
@@ -372,6 +404,9 @@ class FakeCluster:
             self.unknown.append(args)
             return 1, "", "unmodelled kubectl command"
         namespace, args = args[1], args[2:]
+        selector = args[args.index("--selector") + 1] if "--selector" in args else ""
+        if args[:1] == ["exec"] and "timeout" in args:
+            return self.probe(args)
         if namespace == smoke.DB_NAMESPACE:
             if args[:2] == ["rollout", "status"]:
                 return 0, "rolled out", ""
@@ -379,7 +414,12 @@ class FakeCluster:
                 return 0, "20261101000000|t|aa|2026-11-19 10:01:00\n20261102000000|t|bb|2026-11-19 10:01:00\n", ""
             if args[:2] == ["get", "events"]:
                 return ok("No events")
-        selector = args[args.index("--selector") + 1] if "--selector" in args else ""
+            if args[:2] == ["get", "pods"] and selector == f"app.kubernetes.io/name={smoke.PEER}":
+                return listing([self.running_pod(f"{smoke.PEER}-0", PEER_IP)])
+        if namespace == "kube-system" and args[:2] == ["get", "pods"] and selector == smoke.DNS_SELECTOR:
+            return listing([self.running_pod("coredns-1", DNS_IP), self.running_pod("coredns-0", DNS_IP)])
+        if args[:2] == ["get", "networkpolicies"]:
+            return listing(self.network_policies())
         if args[:2] == ["get", "deployment"]:
             component = args[2].rsplit("-", 1)[1]
             return ok({"metadata": {"name": args[2], "generation": self.generation[component],
@@ -402,16 +442,18 @@ class FakeCluster:
                 return listing([{"reason": "Pulled", "message": f'Container image '
                                  f'"{smoke.digest_reference(r, DIGEST[r])}" already present on machine'}
                                 for r in smoke.ROLES])
-        if args[:1] == ["get"] and args[1] in ("deployments,services,serviceaccounts,jobs,configmaps,secrets",
-                                               smoke.RELEASE_KINDS):
+        if args[:1] == ["get"] and args[1] in (smoke.INVENTORY_KINDS, smoke.RELEASE_KINDS):
             return listing(self.items(smoke.expected_release_objects()) if self.installed else [])
         if args[:3] == ["get", "--filename", "-"]:
             return listing(self.items(smoke.expected_release_objects()))
         if args[:2] == ["get", smoke.OPTIONAL_KINDS]:
             return listing([])
-        if args[:2] in (["get", "secrets"], ["get", "endpointslices"]):
+        if args[:2] in (["get", "secrets"], ["get", "secrets,networkpolicies"], ["get", "endpointslices"]):
             if selector == smoke.RUN_LABEL:
-                return listing(self.items(f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES))
+                owned = [f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES]
+                if args[1] == "secrets,networkpolicies":
+                    owned.append(f"NetworkPolicy/{smoke.NAMESPACE_DENY}")
+                return listing(self.items(owned))
             return listing([])
         if args[:1] == ["logs"]:
             return ok("log line\n")
@@ -519,7 +561,14 @@ class OrchestrationTest(unittest.TestCase):
         status, report, _ = self.run_main()
         self.assertEqual(self.fake.unknown, [])
         self.assertEqual((status, report["result"]), (0, "passed"), report.get("error"))
-        self.assertEqual(len(report["checks"]), 8)
+        self.assertEqual(len(report["checks"]), 9)
+        netpol_check = next(c for c in report["checks"] if "NetworkPolicy enforced" in c["check"])
+        self.assertEqual(netpol_check["namespace_policies"],
+                         sorted([f"NetworkPolicy/{smoke.NAMESPACE_DENY}", *smoke.release_network_policies()]))
+        self.assertEqual(len(netpol_check["probes"]), len(smoke.probe_plan(DNS_IP, PEER_IP)))
+        self.assertIn("networkpolicies", smoke.RELEASE_KINDS.split(","))
+        self.assertIn("networkpolicies", smoke.INVENTORY_KINDS.split(","))
+        self.assertNotIn("networkpolicies", smoke.OPTIONAL_KINDS.split(","))
         self.assertNotIn("error", report)
         self.assert_cleaned_up()
         self.assertEqual([c[1:3] for c in self.fake.commands("helm") if c[1] in ("install", "upgrade", "uninstall")],
@@ -716,9 +765,9 @@ class OrchestrationTest(unittest.TestCase):
             "two completions on install": (doctor_json(["involvedObject.kind=Job"], lambda data: data["items"].append(
                 {**data["items"][0], "involvedObject": {**data["items"][0]["involvedObject"], "uid": "extra"}})),
                 "expected one completed migrate Job after install"),
-            "failed migration": (doctor_output(["exec", "deployment/postgres"], stdout="1|f|aa|t\n"),
+            "failed migration": (doctor_output(["exec", "deployment/postgres", "psql"], stdout="1|f|aa|t\n"),
                                  "failed entry"),
-            "no migration history": (doctor_output(["exec", "deployment/postgres"], stdout=""),
+            "no migration history": (doctor_output(["exec", "deployment/postgres", "psql"], stdout=""),
                                      "migration history is empty"),
             "migrate after Deployments": (doctor_json([f"deployment {api} --output=json"], migrate_completed_late),
                                           "completed after the Deployments"),
@@ -727,7 +776,7 @@ class OrchestrationTest(unittest.TestCase):
                 "did not report every digest reference"),
             "migrate pods linger": (doctor_json(["app.kubernetes.io/component=migrate"], lambda data: data.__setitem__(
                 "items", [fake_ref().pod("api", 9)])), "migrate hook pods to be removed"),
-            "extra release object": (doctor_json(["deployments,services,serviceaccounts,jobs,configmaps,secrets"],
+            "extra release object": (doctor_json([smoke.INVENTORY_KINDS],
                                                  lambda data: data["items"].append(
                                                      {"kind": "ConfigMap", "metadata": {"name": "x"}})),
                                      "release objects:"),
@@ -747,6 +796,47 @@ class OrchestrationTest(unittest.TestCase):
                 when=lambda: fake_ref().revision == 1 and fake_ref().installed), "does not enforce restricted"),
             "probe admitted": (doctor_output(["--dry-run=server"], returncode=0, stdout="pod/psa-probe created"),
                                "was not rejected"),
+            "missing namespace default-deny": (doctor_json(
+                ["get networkpolicies --output=json"],
+                lambda data: data.__setitem__("items", [i for i in data["items"]
+                                                        if i["metadata"]["name"] != smoke.NAMESPACE_DENY])),
+                "app namespace NetworkPolicy objects:"),
+            "no running CoreDNS pod": (doctor_json(
+                ["--namespace kube-system", smoke.DNS_SELECTOR],
+                lambda data: data.__setitem__("items", [])),
+                "no Running CoreDNS pod with an IP"),
+            "no running netpol-peer pod": (doctor_json(
+                [f"app.kubernetes.io/name={smoke.PEER}"],
+                lambda data: data.__setitem__("items", [])),
+                f"no Running {smoke.PEER} pod with an IP"),
+            "unenforced egress policy": (doctor_output(
+                ["exec", f"deployment/{api}", PEER_IP], returncode=0, stdout=""),
+                "NetworkPolicy is not enforced in this cluster"),
+            "unenforced API ingress": (doctor_output(
+                ["exec", "deployment/postgres", API_HOST], returncode=0, stdout="HTTP/1.1 200 OK\r\n"),
+                "NetworkPolicy is not enforced in this cluster"),
+            "blocked allowed egress": (doctor_output(
+                ["exec", f"deployment/{api}", DATABASE_HOST], returncode=smoke.TIMEOUT_EXIT),
+                "allowed path failed: api egress to the database peer by DNS name"),
+            "control probe failed": (doctor_output(
+                ["exec", "deployment/postgres", PEER_IP], returncode=smoke.TIMEOUT_EXIT),
+                "its control did not connect, so the denial is not evidence"),
+            "inconclusive denied probe": (doctor_output(
+                ["exec", f"deployment/{worker}", PEER_IP], returncode=1, stderr="error: unable to upgrade connection"),
+                "was inconclusive (inconclusive)"),
+            "extra release networkpolicy": (doctor_json(
+                [smoke.INVENTORY_KINDS],
+                lambda data: data["items"].append({"kind": "NetworkPolicy", "metadata": {"name": "extra"}})),
+                "release objects:"),
+            "networkpolicy residue after uninstall": (doctor_json(
+                [smoke.RELEASE_KINDS],
+                lambda data: data["items"].append({"kind": "NetworkPolicy", "metadata": {"name": "leftover"}})),
+                "release objects to be removed"),
+            "default-deny removed by uninstall": (doctor_json(
+                ["get secrets,networkpolicies", smoke.RUN_LABEL],
+                lambda data: data.__setitem__("items", [i for i in data["items"]
+                                                        if i["metadata"]["name"] != smoke.NAMESPACE_DENY])),
+                "test-owned objects after uninstall:"),
             "scale ready replicas": (doctor_json([f"deployment {worker} --output=json"], lambda data: data["status"].__setitem__(
                 "readyReplicas", 1), when=revision(2)), "scale ready replicas"),
             "API pod replaced": (doctor_json(["app.kubernetes.io/component=api"], pod_status(
@@ -762,20 +852,22 @@ class OrchestrationTest(unittest.TestCase):
             "release listed after uninstall": (doctor_json(["list --output json"], lambda data: data.append(
                 {"name": smoke.RELEASE, "status": "uninstalling", "revision": "3"}),
                 when=lambda: not fake_ref().installed), "Helm still lists a release"),
-            "test-owned Secret removed": (doctor_json([f"--selector {smoke.RUN_LABEL} "], lambda data: data["items"].pop()),
-                                          "test-owned Secrets after uninstall"),
+            "test-owned Secret removed": (doctor_json(
+                [f"--selector {smoke.RUN_LABEL} "],
+                lambda data: data.__setitem__("items", [i for i in data["items"] if i["metadata"]["name"] != smoke.SECRET["api"]])),
+                "test-owned objects after uninstall:"),
         }
         # History changes only after the install was observed: compare against the first reading.
         readings = []
 
         def history_changes(args, result):
-            if "deployment/postgres" in args and "exec" in args:
+            if "deployment/postgres" in args and "exec" in args and "psql" in args:
                 readings.append(1)
                 if len(readings) > 1:
                     return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
 
         def history_changes_on_repeat(args, result):
-            if "deployment/postgres" in args and "exec" in args and fake_ref().revision == 3:
+            if "deployment/postgres" in args and "exec" in args and "psql" in args and fake_ref().revision == 3:
                 return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
         cases["upgrade changed history"] = (history_changes, "migration history changed on a same-digest upgrade")
         cases["repeated upgrade changed history"] = (history_changes_on_repeat,
@@ -865,6 +957,10 @@ class ValuesTest(unittest.TestCase):
             self.assertEqual(values["database"][role], {"existingSecret": smoke.SECRET[role]})
         self.assertEqual(values["worker"], {"replicas": 2})
         self.assertNotIn("api", values)
+        self.assertEqual(values["networkPolicy"], {
+            "api": {"ingressFrom": [smoke.database_namespace_peer(smoke.PEER_LABELS)]},
+            "database": {"to": [smoke.database_namespace_peer(smoke.POSTGRES_LABELS)]},
+        })
 
     def test_values_require_every_valid_digest_and_bounded_replicas(self):
         for digests in ({k: v for k, v in DIGEST.items() if k != "migrate"}, {**DIGEST, "api": "latest"}):
@@ -948,6 +1044,24 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(container["image"], "postgres@sha256:" + "e" * 64)
         self.assertNotIn(PASSWORDS["admin"], json.dumps(container))
 
+    def test_app_namespace_has_default_deny_network_policy(self):
+        policy = self.find("NetworkPolicy", smoke.NAMESPACE_DENY)
+        self.assertEqual(policy["metadata"]["namespace"], smoke.APP_NAMESPACE)
+        self.assertNotIn("app.kubernetes.io/instance", policy["metadata"]["labels"])
+        self.assertEqual(policy["spec"], {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]})
+
+    def test_decoy_peer_uses_postgres_image_and_distinct_labels(self):
+        peer = self.find("Deployment", smoke.PEER)
+        self.assertEqual(peer["metadata"]["namespace"], smoke.DB_NAMESPACE)
+        self.assertEqual(peer["spec"]["selector"]["matchLabels"], smoke.PEER_LABELS)
+        self.assertNotEqual(smoke.PEER_LABELS, smoke.POSTGRES_LABELS)
+        pod_spec = peer["spec"]["template"]["spec"]
+        self.assertFalse(pod_spec["automountServiceAccountToken"])
+        self.assertFalse(pod_spec["enableServiceLinks"])
+        container = pod_spec["containers"][0]
+        self.assertEqual(container["image"], "postgres@sha256:" + "e" * 64)
+        self.assertNotIn(PASSWORDS["admin"], json.dumps(container))
+
 
 class EvaluationTest(unittest.TestCase):
     def test_job_completions_one_per_uid_oldest_first(self):
@@ -993,6 +1107,96 @@ class EvaluationTest(unittest.TestCase):
     def test_object_names(self):
         items = [{"kind": "Service", "metadata": {"name": "b"}}, {"kind": "Deployment", "metadata": {"name": "a"}}]
         self.assertEqual(smoke.object_names(items), ["Deployment/a", "Service/b"])
+
+
+class NetworkPolicyProbeTest(unittest.TestCase):
+    def test_probe_plan_covers_allowed_and_denied_paths_with_controls(self):
+        plan = smoke.probe_plan(DNS_IP, PEER_IP)
+        by_name = {p["name"]: p for p in plan}
+        self.assertEqual(len(by_name), len(plan))
+        connect_probes = [p for p in plan if p["expect"] == "connect"]
+        deny_probes = [p for p in plan if p["expect"] == "deny"]
+        self.assertGreaterEqual(len(connect_probes), 5)
+        self.assertGreaterEqual(len(deny_probes), 5)
+        for p in deny_probes:
+            control = by_name.get(p["control"])
+            self.assertIsNotNone(control, p["name"])
+            self.assertEqual(control["expect"], "connect", p["name"])
+        for p in plan:
+            # Host and port are positional args, never interpolated into the bash script string.
+            script = p["command"][4]
+            self.assertNotIn(DNS_IP, script)
+            self.assertNotIn(PEER_IP, script)
+            self.assertNotIn(DATABASE_HOST, script)
+            self.assertNotIn(API_HOST, script)
+
+    def test_probe_outcome_classifies_tcp_and_http_results(self):
+        self.assertEqual(smoke.probe_outcome(0, "", "", http=False), "connected")
+        self.assertEqual(smoke.probe_outcome(smoke.TIMEOUT_EXIT, "", "", http=False), "timeout")
+        for err in ("Connection refused", "No route to host", "Network is unreachable"):
+            with self.subTest(err=err):
+                self.assertEqual(smoke.probe_outcome(1, "", f"bash: connect: {err}\n", http=False), "rejected")
+        # kubectl Go errors use lowercase "connection refused" and must stay inconclusive.
+        for err in ("", "error: unable to upgrade connection", "dial tcp 127.0.0.1:6443: connect: connection refused"):
+            with self.subTest(inconclusive=err):
+                self.assertEqual(smoke.probe_outcome(1, "", err, http=False), "inconclusive")
+        self.assertEqual(smoke.probe_outcome(0, "HTTP/1.1 200 OK\r\n", "", http=True), "connected")
+        self.assertEqual(smoke.probe_outcome(0, "HTTP/1.0 200 OK\r\n", "", http=True), "connected")
+        self.assertEqual(smoke.probe_outcome(0, "HTTP/1.1 503 Service Unavailable\r\n", "", http=True),
+                         "unexpected-response")
+        self.assertEqual(smoke.probe_outcome(0, "", "", http=True), "unexpected-response")
+
+    def test_evaluate_probes_accepts_timeouts_and_rejections(self):
+        results = [
+            {"name": "ctrl", "expect": "connect", "control": None, "outcome": "connected"},
+            {"name": "drop", "expect": "deny", "control": "ctrl", "outcome": "timeout"},
+            {"name": "reject", "expect": "deny", "control": "ctrl", "outcome": "rejected"},
+        ]
+        smoke.evaluate_probes(results)
+
+    def test_evaluate_probes_failures(self):
+        with self.assertRaisesRegex(smoke.SmokeFailure, "no NetworkPolicy probes ran"):
+            smoke.evaluate_probes([])
+        with self.assertRaisesRegex(smoke.SmokeFailure, "NetworkPolicy is not enforced.*leak"):
+            smoke.evaluate_probes([
+                {"name": "ctrl", "expect": "connect", "control": None, "outcome": "connected"},
+                {"name": "leak", "expect": "deny", "control": "ctrl", "outcome": "connected"},
+            ])
+        with self.assertRaisesRegex(smoke.SmokeFailure, "allowed path failed: db \(timeout\)"):
+            smoke.evaluate_probes([
+                {"name": "db", "expect": "connect", "control": None, "outcome": "timeout"},
+            ])
+        with self.assertRaisesRegex(smoke.SmokeFailure, "its control did not connect, so the denial is not evidence"):
+            smoke.evaluate_probes([
+                {"name": "ctrl", "expect": "connect", "control": None, "outcome": "timeout"},
+                {"name": "deny", "expect": "deny", "control": "ctrl", "outcome": "timeout"},
+            ])
+        with self.assertRaisesRegex(smoke.SmokeFailure, "has no control probe"):
+            smoke.evaluate_probes([
+                {"name": "deny", "expect": "deny", "control": "missing", "outcome": "timeout"},
+            ])
+        with self.assertRaisesRegex(smoke.SmokeFailure, "was inconclusive \(inconclusive\)"):
+            smoke.evaluate_probes([
+                {"name": "ctrl", "expect": "connect", "control": None, "outcome": "connected"},
+                {"name": "deny", "expect": "deny", "control": "ctrl", "outcome": "inconclusive"},
+            ])
+        with self.assertRaisesRegex(smoke.SmokeFailure, "unexpected expectation"):
+            smoke.evaluate_probes([
+                {"name": "weird", "expect": "ignore", "control": None, "outcome": "timeout"},
+            ])
+
+    def test_running_pod_ip_selects_first_running_non_terminating_pod(self):
+        pods = [
+            {"metadata": {"name": "a-pending"}, "status": {"phase": "Pending", "podIP": "10.0.0.1"}},
+            {"metadata": {"name": "b-term", "deletionTimestamp": "2026-11-19T10:00:00Z"},
+             "status": {"phase": "Running", "podIP": "10.0.0.2"}},
+            {"metadata": {"name": "c-no-ip"}, "status": {"phase": "Running"}},
+            {"metadata": {"name": "z-running"}, "status": {"phase": "Running", "podIP": "10.0.0.9"}},
+            {"metadata": {"name": "d-running"}, "status": {"phase": "Running", "podIP": "10.0.0.4"}},
+        ]
+        self.assertEqual(smoke.running_pod_ip(pods, "CoreDNS"), "10.0.0.4")
+        with self.assertRaisesRegex(smoke.SmokeFailure, "no Running CoreDNS pod with an IP"):
+            smoke.running_pod_ip(pods[:3], "CoreDNS")
 
 
 class SummaryTest(unittest.TestCase):

@@ -112,3 +112,27 @@ migration:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+networkPolicy:
+  # A deny-all NetworkPolicy for every pod of this release, plus the allows below. Policies take
+  # effect only if the cluster's network plugin enforces NetworkPolicy (see README).
+  enabled: true
+  api:
+    # Peers (Kubernetes NetworkPolicyPeer) that may connect to the API on TCP 8080, for example an
+    # ingress controller. Empty: no pod may connect. Kubelet probes come from the node, not a peer.
+    ingressFrom: []
+  dns:
+    # Peers that every component may query on UDP and TCP 53. The default matches the CoreDNS pods
+    # of kubeadm (kind) and K3s. Rendering fails if this is empty while enabled.
+    to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+  database:
+    # Required when enabled: the PostgreSQL peers that api, worker and migrate may reach on `port`.
+    # Rendering fails if this is empty while enabled, because an empty list would allow any destination.
+    to: []
+    port: 5432

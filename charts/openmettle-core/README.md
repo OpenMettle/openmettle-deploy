@@ -1,6 +1,6 @@
 # openmettle-core chart
 
-CPU-only packaging for the OpenMettle core API, worker and schema migration. Increment I1 of V1-32 is the **render contract**: templates, the values schema, security defaults and render-time tests. I2 adds a **kind install smoke test** ([`tests/kind`](../../tests/kind/README.md)). It has passed on a pull-request run; see [Kind smoke test](#kind-smoke-test-i2). Neither a render nor a smoke run is application acceptance or qualification.
+CPU-only packaging for the OpenMettle core API, worker and schema migration. Increment I1 of V1-32 is the **render contract**: templates, the values schema, security defaults and render-time tests. I2 adds a **kind install smoke test** ([`tests/kind`](../../tests/kind/README.md)). I3 adds **NetworkPolicies** (chart-scoped deny-all plus per-component allows) and live enforcement probes in the kind smoke test; the hosted kind run for I3 is pending pull-request CI execution. Neither a render nor a smoke run is application acceptance or qualification.
 
 ## What it renders
 
@@ -12,6 +12,9 @@ CPU-only packaging for the OpenMettle core API, worker and schema migration. Inc
 | ServiceAccount | `<fullname>-api`, `<fullname>-worker` | One per component; no token mounted |
 | ServiceAccount | `<fullname>-migrate` | Hook, weight `-10` |
 | Job | `<fullname>-migrate` | Hook, weight `0`; see [Schema migration](#schema-migration) |
+| NetworkPolicy | `<fullname>-deny-all` | Release-wide Ingress/Egress deny-all (`networkPolicy.enabled`, default `true`) |
+| NetworkPolicy | `<fullname>-api`, `<fullname>-worker` | DNS and database egress; API ingress on TCP 8080 from `networkPolicy.api.ingressFrom` only |
+| NetworkPolicy | `<fullname>-migrate` | Hook, weight `-10`; DNS and database egress for the migrate pod |
 
 `<fullname>` is the release name if it already contains `openmettle-core`, otherwise `<release>-openmettle-core`, truncated to 52 characters. The chart creates no Namespace, Secret, RBAC object, CRD, device request or `resource.k8s.io` object. All resources are namespaced; set the namespace with `--namespace`.
 
@@ -23,6 +26,7 @@ The chart refuses to render until you supply:
 
 - `images.{api,worker,migrate}.repository` and `.digest`. Images render as `[registry/]repository@sha256:<digest>`. Tags are not accepted in either field. `registry` is optional. The migrate image is not needed when `migration.enabled` is false.
 - `database.{api,worker,migrate}.existingSecret`: names of existing Secrets. Each holds a full `postgres://` URL under `key` (default `url`). The migrate Secret is not needed when `migration.enabled` is false.
+- `networkPolicy.database.to`: at least one Kubernetes `NetworkPolicyPeer` for PostgreSQL while `networkPolicy.enabled` is true. An empty list is rejected at render time because Kubernetes treats an empty `to` list as allowing every destination.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -48,6 +52,11 @@ The chart refuses to render until you supply:
 | `migration.activeDeadlineSeconds` | `900` | Job deadline. Must exceed `connectTimeoutMs + lockTimeoutMs + statementTimeoutMs`; rendering fails otherwise. Pass a Helm `--timeout` of at least this value; see [Schema migration](#schema-migration) |
 | `migration.resources`, `migration.serviceAccount` | `{}`, created | As above |
 | `migration.{podAnnotations,nodeSelector,tolerations,affinity}` | empty | Scheduling for the hook pod, for example on tainted nodes |
+| `networkPolicy.enabled` | `true` | Render the release's deny-all and per-component NetworkPolicies; see [NetworkPolicy](#networkpolicy) |
+| `networkPolicy.api.ingressFrom` | `[]` | `NetworkPolicyPeer` list allowed to connect to the API on TCP 8080. Empty denies all pod ingress |
+| `networkPolicy.dns.to` | `kube-system` / `k8s-app: kube-dns` | `NetworkPolicyPeer` list for UDP and TCP 53 egress. Must be non-empty while enabled |
+| `networkPolicy.database.to` | `[]` | Required while enabled: `NetworkPolicyPeer` list for PostgreSQL egress on `networkPolicy.database.port` |
+| `networkPolicy.database.port` | `5432` | TCP port for database egress, 1–65535 |
 
 `<component>` is `api` or `worker`; `<ROLE>` is `API` or `WORKER`.
 
@@ -71,26 +80,38 @@ These are fixed and are not values:
 - Container: `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`, `privileged: false`. No volumes are mounted.
 - `automountServiceAccountToken: false` on every ServiceAccount and every pod, plus `enableServiceLinks: false`. The processes never call the Kubernetes API, so the chart creates no RBAC.
 - Credentials come only from existing Secrets. The owner credential reaches only the migration Job. The chart never uses `lookup`.
-- `/healthz` and `/readyz` are unauthenticated. The Service is ClusterIP only, and the chart has no Ingress yet.
+- `/healthz` and `/readyz` are unauthenticated. The Service is ClusterIP only, `networkPolicy.api.ingressFrom` defaults to empty, and the chart has no Ingress yet.
+
+## NetworkPolicy
+
+`networkPolicy.enabled` defaults to `true`. When enabled, the chart renders a chart-scoped deny-all plus per-component allow policies:
+
+- **`<fullname>-deny-all`** selects every pod of this release (`app.kubernetes.io/name` and `app.kubernetes.io/instance`) with `policyTypes: [Ingress, Egress]` and no rules.
+- **`<fullname>-api`**, **`<fullname>-worker`** and **`<fullname>-migrate`** each select only their own component and declare `policyTypes: [Ingress, Egress]`:
+  - **Egress** is restricted to `networkPolicy.dns.to` on UDP and TCP 53 and `networkPolicy.database.to` on TCP `networkPolicy.database.port` (default `5432`). Rendering fails if `dns.to` or `database.to` is empty while `networkPolicy.enabled` is true, because Kubernetes treats an empty `to` list as matching every destination.
+  - The default `networkPolicy.dns.to` selects pods labelled `k8s-app: kube-dns` in the `kube-system` namespace, matching kubeadm (including kind) and K3s CoreDNS. Override it where cluster DNS uses different labels, namespace or IP blocks.
+  - **Ingress** is allowed only on the API pod's container port (TCP `8080`) from `networkPolicy.api.ingressFrom`. It defaults to `[]` (no ingress rule rendered, so all pod-to-pod ingress is denied). Kubelet liveness/readiness probes and `kubectl port-forward` originate from the node or inside the pod's network namespace rather than from another pod peer, so they are unaffected. Worker and migrate pods never render an ingress rule.
+- **Migrate hook policy.** `<fullname>-migrate` carries `helm.sh/hook: pre-install,pre-upgrade`, `helm.sh/hook-weight: "-10"` and `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`, matching the migrate ServiceAccount. Hooks run before ordinary release resources, so on first install in a namespace that denies by default—and on upgrades while `<fullname>-deny-all` is in place—the hook policy gives the migrate Job DNS and database egress and is deleted once the hook succeeds. When `migration.enabled` is false, no migrate NetworkPolicy is rendered.
+- **Cluster CNI requirement.** `NetworkPolicy` resources have no effect unless the target cluster's network plugin enforces them. K3s's embedded network policy controller (kube-router) enforces `NetworkPolicy` by default unless disabled (`--disable-network-policy`). Verify enforcement on the target cluster as part of qualification; setting `networkPolicy.enabled: false` disables all policy objects and waives the `networkPolicy.database.to` requirement.
 
 ## Schema migration
 
 Core runs migrations once per release, before new API and worker pods start (core ADR 0003). The chart does this with a Helm hook Job:
 
-- `helm.sh/hook: pre-install,pre-upgrade`. Helm creates or updates the Deployments only after the Job succeeds. Hooks run before ordinary resources, so the migrate ServiceAccount is a hook too, at a lower weight.
-- `before-hook-creation,hook-succeeded` delete policy on both hooks. A successful run leaves nothing behind. When the Job fails, Helm 4.3 still deletes the hooks that completed before it and carry `hook-succeeded` (`pkg/action/hooks.go`). The migrate ServiceAccount is therefore removed, and only the failed Job and its pods stay for diagnosis. The next install or upgrade recreates the ServiceAccount and replaces the Job.
+- `helm.sh/hook: pre-install,pre-upgrade`. Helm creates or updates the Deployments only after the Job succeeds. Hooks run before ordinary resources, so the migrate ServiceAccount and (when `networkPolicy.enabled` is true) the migrate egress NetworkPolicy are hooks too, at a lower weight (`-10`).
+- `before-hook-creation,hook-succeeded` delete policy on all migration hooks. A successful run leaves nothing behind. When the Job fails, Helm 4.3 still deletes the hooks that completed before it and carry `hook-succeeded` (`pkg/action/hooks.go`). The migrate ServiceAccount and migrate NetworkPolicy are therefore removed, and only the failed Job and its pods stay for diagnosis. The next install or upgrade recreates them and replaces the Job.
 - `restartPolicy: Never`, `backoffLimit: 2`, `activeDeadlineSeconds` from values. A `podFailurePolicy` fails the Job immediately on exit 78 (invalid configuration). Exit 1, for example a lock timeout, may retry.
 - `activeDeadlineSeconds` must exceed `connectTimeoutMs + lockTimeoutMs + statementTimeoutMs`, or rendering fails. One attempt connects, waits for locks and then runs statements, so a smaller deadline would end a long statement before its configured timeout. This is a lower bound only: migrations with several long statements, and retries, need more.
 - `migration.{nodeSelector,tolerations,affinity,podAnnotations}` schedule the hook pod independently of api and worker.
 - **No rollback hook.** Migrations are forward-only, and `helm rollback` runs no migration. Only the migrator refuses a database at a newer schema version. The API and worker do not check the schema version; core ADR 0003 lists a schema-compatibility readiness gate as not yet covered. A rollback to the previous release therefore relies on ADR 0003's rule that each migration stays compatible with the previous release's API and worker. Nothing guarantees compatibility further back. Recovery from a bad release is a corrective forward release or a restore (V1-30/V1-31).
 
-**Helm timeout.** Helm waits for each hook only for `--timeout`, which defaults to 300 s, while the Job deadline defaults to 900 s. Give `helm install` and `helm upgrade` a `--timeout` of at least `migration.activeDeadlineSeconds` (for the defaults, `--timeout 15m`). If Helm's timeout expires first, Helm marks the release failed and deletes the migrate ServiceAccount as described above, while the Job keeps running. The running pod may still finish, but the Job cannot create a retry pod without its ServiceAccount. Re-running the install or upgrade deletes and replaces the Job, which stops any pod still running. This is recoverable: each migration runs in one transaction, so an interrupted run leaves no partial migration, and the next run continues from the last committed version.
+**Helm timeout.** Helm waits for each hook only for `--timeout`, which defaults to 300 s, while the Job deadline defaults to 900 s. Give `helm install` and `helm upgrade` a `--timeout` of at least `migration.activeDeadlineSeconds` (for the defaults, `--timeout 15m`). If Helm's timeout expires first, Helm marks the release failed and deletes the migrate ServiceAccount and (when `networkPolicy.enabled` is true) the migrate NetworkPolicy as described above, while the Job keeps running. Without its ServiceAccount the Job cannot create a retry pod, and under default-deny the running pod loses its chart egress allowance for any new DNS lookup or database connection (and depending on CNI conntrack behavior, in-flight traffic may be disrupted). Re-running the install or upgrade deletes and replaces the Job, which stops any pod still running. This is recoverable: each migration runs in one transaction, so an interrupted run leaves no partial migration, and the next run continues from the last committed version.
 
 **Sidecar injection.** If a service mesh or another admission webhook injects a long-running sidecar into the hook pod, the pod does not finish when the migrate container exits. The Job then never completes and Helm waits until its timeout. Exclude the hook pod from injection, for example with `migration.podAnnotations` if your mesh supports an opt-out annotation. This has not been tested with any mesh.
 
 `helm template` and `--dry-run` do not run hooks. `--no-hooks` skips the migration, and the new pods then start against the old schema.
 
-**Out of band:** set `migration.enabled: false` to render no Job, no migrate ServiceAccount and no owner-Secret reference. You must then run the migrate image once per release, with `OPENMETTLE_MIGRATE_DATABASE_URL` set to the owner URL, and let it complete successfully before upgrading API and worker. Database roles and the database itself are provisioned outside the chart (core ADR 0003 and README).
+**Out of band:** set `migration.enabled: false` to render no Job, no migrate ServiceAccount, no migrate NetworkPolicy and no owner-Secret reference. You must then run the migrate image once per release, with `OPENMETTLE_MIGRATE_DATABASE_URL` set to the owner URL, and let it complete successfully before upgrading API and worker. Database roles and the database itself are provisioned outside the chart (core ADR 0003 and README).
 
 ## Validation
 
@@ -101,28 +122,28 @@ python3 -m unittest discover -s tests/chart -v  # policy, negative-case and cont
 
 Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim; `render.sh` fails on any other Helm version. The chart sets no `kubeVersion` floor.
 
-### Kind smoke test (I2)
+### Kind smoke test (I2/I3)
 
 [`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `5cd8a9d`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
 
 | Item | Smoke-tested |
 | --- | --- |
 | api, worker and migrate images install by digest | Yes (digest read back from the node's containerd) |
-| Migration hook completes before the Deployments roll out | Yes |
+| Migration hook completes before the Deployments roll out | Yes (under namespace default-deny) |
 | API and worker Ready; `/readyz` 200 | Yes |
 | Worker scales to 2 while the API stays at 1 | Yes, through `worker.replicas` |
 | No optional package present | Yes |
 | Same-digest `helm upgrade` reruns migrate as a no-op and stays Ready | Yes |
-| `helm uninstall` leaves no release objects | Yes |
+| `helm uninstall` leaves no release objects | Yes (including release NetworkPolicies) |
 | App namespace enforces Pod Security `restricted` | Yes |
-| NetworkPolicy, storage, ingress, registry pulls, multi-node | No (I3, I4 or the owner's qualification) |
+| NetworkPolicy enforced under namespace default-deny | Yes (implemented in I3; hosted kind run pending CI) |
+| Storage, ingress, registry pulls, multi-node | No (I4 or the owner's qualification) |
 
-The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch the chart or the harness, and on manual dispatch. These items passed on [pull-request run 44505148955](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) (5 min 15 s), which tested the merge of `b8f2d79` into `main`; the workflow has not yet run on `main`. Later harness changes are verified by the pull request's next run (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch the chart or the harness, and on manual dispatch. The I2 checks passed on [pull-request run 44505148955](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) (5 min 15 s), which tested the merge of `b8f2d79` into `main`; the workflow has not yet run on `main`, and the I3 NetworkPolicy checks have not yet run on a hosted kind cluster until pushed to CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
-- **I2:** a kind smoke run on `main` after merge, and owner acceptance. A pull-request run passed, including hook ordering under Helm 4.3 `--wait=watcher` (see [Kind smoke test](#kind-smoke-test-i2)).
-- **I3:** NetworkPolicies (chart-scoped deny-all, per-component allows).
+- **I2/I3:** hosted `kind-smoke` verification of I3 NetworkPolicy enforcement (including whether kind v0.33 kindnet enforces policies live) on pull-request CI and `main`, and owner acceptance.
 - **I4:** artifact PVC, database CA mount, Ingress and TLS, PodDisruptionBudget, a synthetic example profile and overlay documentation. All will be off by default.
 - **I5 / V1-04:** OIDC and auth settings, login key mounts, a `--check-auth-config` hook and identity-provider egress. No auth values are accepted yet.
 - **V1-20** (managed inference, accelerated tools) and **V1-06** (external providers or gateway): separate charts and releases, never subcharts of core.

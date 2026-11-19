@@ -1,4 +1,4 @@
-# Synthetic overlay on minimal.yaml that sets every I1 key to a non-default value.
+# Synthetic overlay on minimal.yaml that sets every key to a non-default value.
 # Non-installable: reserved example names and all-zero digests.
 images:
   pullPolicy: Never
@@ -68,3 +68,31 @@ migration:
         nodeSelectorTerms:
           - matchExpressions:
               - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+# Documentation-only addresses (RFC 5737, RFC 3849) and example.test labels.
+networkPolicy:
+  enabled: true
+  api:
+    ingressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: example-ingress
+        podSelector:
+          matchExpressions:
+            - {key: app.kubernetes.io/name, operator: In, values: [example-ingress-controller]}
+      - ipBlock:
+          cidr: 192.0.2.0/24
+          except: [192.0.2.128/25]
+  dns:
+    to:
+      - ipBlock:
+          cidr: 192.0.2.10/32
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: example-dns
+  database:
+    to:
+      - ipBlock:
+          cidr: 198.51.100.0/24
+      - ipBlock:
+          cidr: 2001:db8::/64
+    port: 5433

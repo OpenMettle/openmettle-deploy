@@ -1,4 +1,4 @@
-"""Policy tests over `helm template` output for charts/openmettle-core (V1-32 I1, render contract).
+"""Policy tests over `helm template` output for charts/openmettle-core (V1-32 I1 render contract, I3 network policy).
 
 These tests render the chart; they do not install it. Each test docstring names a template or
 schema change that would make it fail. Requires helm (or HELM) and PyYAML (test-only).
@@ -24,16 +24,20 @@ MATRIX = {
     "minimal": (),
     "all-keys": ("all-keys.yaml",),
     "migration-disabled": ("migration-disabled.yaml",),
+    "network-policy-disabled": ("network-policy-disabled.yaml",),
 }
 PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_"}
 PORT = {"api": 8080, "worker": 8081}
-ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job"}
+ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job", "NetworkPolicy"}
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
 IMAGE = re.compile(r"^(?:[a-z0-9.-]+(?::[0-9]+)?/)?[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
 HOOK = "helm.sh/hook"
 HOOK_DELETE = "helm.sh/hook-delete-policy"
 SCHEMA_ERROR = "values don't meet the specifications of the schema"
 DIGEST = "sha256:" + "0" * 64
+DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
+DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                      "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
 # from core src/lib.rs and src/migrate.rs at 5cd8a9d; this test does not read core.
 DEFAULT_ENV = {
@@ -71,6 +75,39 @@ def pods(docs):
 
 def containers(pod):
     return pod.get("initContainers", []) + pod["containers"]
+
+
+def pod_labels(docs):
+    """(component, pod template labels) for every workload that creates pods."""
+    return [(component(d), d["spec"]["template"]["metadata"]["labels"]) for d in docs if d["kind"] in ("Deployment", "Job")]
+
+
+def selects(selector, labels):
+    """Kubernetes label-selector semantics (matchLabels and matchExpressions)."""
+    if not all(labels.get(key) == value for key, value in selector.get("matchLabels", {}).items()):
+        return False
+    for expression in selector.get("matchExpressions", []):
+        key, operator, values = expression["key"], expression["operator"], expression.get("values", [])
+        matched = {"In": key in labels and labels[key] in values, "NotIn": labels.get(key) not in values,
+                   "Exists": key in labels, "DoesNotExist": key not in labels}[operator]
+        if not matched:
+            return False
+    return True
+
+
+def effective_policy(docs, labels):
+    """What every NetworkPolicy selecting a pod with `labels` adds up to (policies are additive).
+
+    Returns (isolated policy types, ingress rules, egress rules).
+    """
+    types, ingress, egress = set(), [], []
+    for policy in (d for d in docs if d["kind"] == "NetworkPolicy"):
+        spec = policy["spec"]
+        if selects(spec["podSelector"], labels):
+            types.update(spec.get("policyTypes", []))
+            ingress += spec.get("ingress", [])
+            egress += spec.get("egress", [])
+    return types, ingress, egress
 
 
 def find(docs, kind, name_suffix):
@@ -209,13 +246,15 @@ class ReleasePolicyTest(Rendered):
                     self.assertNotIn("namespace", doc["metadata"])
 
     def test_expected_resources(self):
-        """Fails if a component's Deployment, Service, ServiceAccount or Job is dropped or duplicated."""
+        """Fails if a component's Deployment, Service, ServiceAccount, Job or NetworkPolicy is dropped or duplicated."""
         names = sorted((d["kind"], d["metadata"]["name"]) for d in self.renders["minimal"])
         full = f"{RELEASE}-openmettle-core"
         self.assertEqual(names, sorted([
             ("Deployment", f"{full}-api"), ("Deployment", f"{full}-worker"), ("Service", f"{full}-api"),
             ("ServiceAccount", f"{full}-api"), ("ServiceAccount", f"{full}-worker"),
             ("ServiceAccount", f"{full}-migrate"), ("Job", f"{full}-migrate"),
+            ("NetworkPolicy", f"{full}-deny-all"), ("NetworkPolicy", f"{full}-api"),
+            ("NetworkPolicy", f"{full}-worker"), ("NetworkPolicy", f"{full}-migrate"),
         ]))
 
     def test_separate_service_accounts(self):
@@ -391,10 +430,144 @@ class MigrationHookTest(Rendered):
                               spec["podFailurePolicy"]["rules"])
 
     def test_migration_disabled(self):
-        """Fails if disabling migration still renders the Job, its ServiceAccount or requires its inputs."""
+        """Fails if disabling migration still renders the Job, its ServiceAccount, its NetworkPolicy or requires its inputs."""
         docs = self.renders["migration-disabled"]
         self.assertFalse([d for d in docs if component(d) == "migrate"])
-        self.assertEqual({d["kind"] for d in docs}, {"Deployment", "Service", "ServiceAccount"})
+        self.assertEqual({d["kind"] for d in docs}, {"Deployment", "Service", "ServiceAccount", "NetworkPolicy"})
+
+
+class NetworkPolicyTest(Rendered):
+    """Design §5: a chart-scoped deny-all plus DNS and database egress, and API ingress from configured peers."""
+
+    ENABLED = ("minimal", "all-keys", "migration-disabled")
+
+    def policies(self, name):
+        return [d for d in self.renders[name] if d["kind"] == "NetworkPolicy"]
+
+    def test_deny_all_selects_every_release_pod(self):
+        """Fails if the deny-all is dropped, loses a policy type, gains a rule or stops selecting a release pod."""
+        release = {"app.kubernetes.io/name": "openmettle-core", "app.kubernetes.io/instance": RELEASE}
+        for name in self.ENABLED:
+            with self.subTest(values=name):
+                docs = self.renders[name]
+                deny = find(docs, "NetworkPolicy", "-deny-all")
+                self.assertEqual(deny["spec"], {"podSelector": {"matchLabels": release},
+                                                "policyTypes": ["Ingress", "Egress"]})
+                self.assertNotIn(HOOK, deny["metadata"].get("annotations", {}))
+                for role, labels in pod_labels(docs):
+                    self.assertTrue(selects(deny["spec"]["podSelector"], labels), role)
+                # A future component of this release is denied too; another release's pods are not selected.
+                selector = deny["spec"]["podSelector"]
+                self.assertTrue(selects(selector, {**release, "app.kubernetes.io/component": "new"}))
+                self.assertFalse(selects(selector, {**release, "app.kubernetes.io/instance": "other"}))
+
+    def test_every_pod_is_isolated_both_ways(self):
+        """Fails if any rendered pod is not selected by a policy covering both Ingress and Egress."""
+        for name in self.ENABLED:
+            for role, labels in pod_labels(self.renders[name]):
+                with self.subTest(values=name, component=role):
+                    types, _, _ = effective_policy(self.renders[name], labels)
+                    self.assertEqual(types, {"Ingress", "Egress"})
+
+    def test_egress_is_dns_and_database_only(self):
+        """Fails if a component gains an egress rule, loses DNS or database egress, or a rule widens its peers or ports."""
+        expected = {
+            "minimal": (DEFAULT_DNS_PEERS, [{
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-database"}},
+                "podSelector": {"matchLabels": {"app.kubernetes.io/name": "postgres"}}}], 5432),
+            "all-keys": ([{"ipBlock": {"cidr": "192.0.2.10/32"}},
+                          {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-dns"}}}],
+                         [{"ipBlock": {"cidr": "198.51.100.0/24"}}, {"ipBlock": {"cidr": "2001:db8::/64"}}], 5433),
+        }
+        for name, (dns, database, port) in expected.items():
+            roles = []
+            for role, labels in pod_labels(self.renders[name]):
+                roles.append(role)
+                with self.subTest(values=name, component=role):
+                    _, _, egress = effective_policy(self.renders[name], labels)
+                    self.assertEqual(egress, [{"to": dns, "ports": DNS_PORTS},
+                                              {"to": database, "ports": [{"protocol": "TCP", "port": port}]}])
+            self.assertEqual(sorted(roles), ["api", "migrate", "worker"])
+
+    def test_ingress_only_to_api_from_configured_peers(self):
+        """Fails if a worker or migrate pod accepts ingress, or API ingress is open, widened or on another port."""
+        peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-ingress"}},
+                  "podSelector": {"matchExpressions": [{"key": "app.kubernetes.io/name", "operator": "In",
+                                                        "values": ["example-ingress-controller"]}]}},
+                 {"ipBlock": {"cidr": "192.0.2.0/24", "except": ["192.0.2.128/25"]}}]
+        for name in self.ENABLED:
+            for role, labels in pod_labels(self.renders[name]):
+                with self.subTest(values=name, component=role):
+                    _, ingress, _ = effective_policy(self.renders[name], labels)
+                    if name == "all-keys" and role == "api":
+                        self.assertEqual(ingress, [{"from": peers, "ports": [{"protocol": "TCP", "port": 8080}]}])
+                    else:
+                        self.assertEqual(ingress, [], "ingressFrom defaults to empty: no peer may connect")
+
+    def test_api_ingress_port_is_the_api_container_port(self):
+        """Fails if the ingress port drifts from the API's container port (the Service targets that port)."""
+        docs = self.renders["all-keys"]
+        container = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]["containers"][0]
+        rule = find(docs, "NetworkPolicy", "-api")["spec"]["ingress"][0]
+        self.assertEqual([p["port"] for p in rule["ports"]], [p["containerPort"] for p in container["ports"]])
+
+    def test_no_rule_matches_every_peer_or_port(self):
+        """Fails if any rendered rule has a missing or empty peer or port list, or an empty peer (each means "all")."""
+        for name in self.ENABLED:
+            for policy in self.policies(name):
+                with self.subTest(values=name, policy=policy["metadata"]["name"]):
+                    rules = [(rule, "from") for rule in policy["spec"].get("ingress", [])]
+                    rules += [(rule, "to") for rule in policy["spec"].get("egress", [])]
+                    for rule, key in rules:
+                        self.assertTrue(rule.get(key))
+                        self.assertTrue(rule.get("ports"))
+                        self.assertTrue(all(rule[key]))
+
+    def test_migrate_policy_is_a_hook_before_the_job(self):
+        """Fails if the migrate egress policy is dropped, stops being a hook or does not run before the Job."""
+        for name in ("minimal", "all-keys"):
+            with self.subTest(values=name):
+                docs = self.renders[name]
+                policy = find(docs, "NetworkPolicy", "-migrate")
+                job = find(docs, "Job", "-migrate")
+                annotations = policy["metadata"]["annotations"]
+                self.assertEqual(annotations[HOOK], job["metadata"]["annotations"][HOOK])
+                self.assertEqual(annotations[HOOK_DELETE], "before-hook-creation,hook-succeeded")
+                self.assertLess(int(annotations["helm.sh/hook-weight"]),
+                                int(job["metadata"]["annotations"]["helm.sh/hook-weight"]))
+                self.assertTrue(selects(policy["spec"]["podSelector"], job["spec"]["template"]["metadata"]["labels"]))
+                # Only the migrate policy is a hook; the others are ordinary release objects.
+                hooks = [p["metadata"]["name"] for p in self.policies(name) if HOOK in p["metadata"].get("annotations", {})]
+                self.assertEqual(hooks, [policy["metadata"]["name"]])
+
+    def test_component_policies_select_only_their_component(self):
+        """Fails if an api, worker or migrate policy selector also matches another component's pods."""
+        for name in self.ENABLED:
+            docs = self.renders[name]
+            for policy in self.policies(name):
+                role = component(policy)
+                if role == "network-policy":
+                    continue
+                with self.subTest(values=name, policy=role):
+                    matched = sorted(r for r, labels in pod_labels(docs) if selects(policy["spec"]["podSelector"], labels))
+                    self.assertEqual(matched, [role])
+
+    def test_disabled_renders_no_policy(self):
+        """Fails if networkPolicy.enabled=false still renders a NetworkPolicy or still requires database peers."""
+        docs = self.renders["network-policy-disabled"]
+        self.assertEqual({d["kind"] for d in docs}, {"Deployment", "Service", "ServiceAccount", "Job"})
+
+    def test_chart_defaults(self):
+        """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database or API peers."""
+        defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))["networkPolicy"]
+        self.assertEqual(defaults, {"enabled": True, "api": {"ingressFrom": []}, "dns": {"to": DEFAULT_DNS_PEERS},
+                                    "database": {"to": [], "port": 5432}})
+
+    def test_names_fit_in_63_characters(self):
+        """Fails if an object name can exceed 63 characters at the longest fullname (Helm caps release names at 53)."""
+        names = [d["metadata"]["name"] for d in render(release="r" * 53)]
+        self.assertIn("r" * 52 + "-deny-all", names)
+        self.assertLessEqual(max(map(len, names)), 63, names)
 
 
 class NegativeCaseTest(unittest.TestCase):
@@ -457,6 +630,33 @@ class NegativeCaseTest(unittest.TestCase):
          ["migration.activeDeadlineSeconds (320 s) must exceed connectTimeoutMs + lockTimeoutMs + statementTimeoutMs (320000 ms)"]),
         ("deadline below a raised statement timeout", ["migration.settings.statementTimeoutMs=900000"], [],
          ["migration.activeDeadlineSeconds (900 s) must exceed", "(920000 ms)"]),
+        ("no database peers", [], ["--set-json", "networkPolicy.database.to=[]"],
+         ["networkPolicy.database.to must list at least one PostgreSQL peer"]),
+        ("no database peers without schema", [], ["--set-json", "networkPolicy.database.to=[]", "--skip-schema-validation"],
+         ["networkPolicy.database.to must list at least one PostgreSQL peer"]),
+        ("no DNS peers", [], ["--set-json", "networkPolicy.dns.to=[]"],
+         ["networkPolicy.dns.to must list at least one DNS peer"]),
+        ("no DNS peers without schema", [], ["--set-json", "networkPolicy.dns.to=[]", "--skip-schema-validation"],
+         ["networkPolicy.dns.to must list at least one DNS peer"]),
+        ("empty peer", [], ["--set-json", "networkPolicy.database.to=[{}]"], [SCHEMA, "/networkPolicy/database/to/0"]),
+        ("empty database peer without schema", [],
+         ["--set-json", "networkPolicy.database.to=[{}]", "--skip-schema-validation"],
+         ["networkPolicy.database.to[0] must be a non-empty NetworkPolicyPeer object"]),
+        ("empty API ingress peer without schema", [],
+         ["--set-json", "networkPolicy.api.ingressFrom=[{}]", "--skip-schema-validation"],
+         ["networkPolicy.api.ingressFrom[0] must be a non-empty NetworkPolicyPeer object"]),
+        ("ipBlock combined with a selector", [],
+         ["--set-json", 'networkPolicy.api.ingressFrom=[{"ipBlock":{"cidr":"192.0.2.0/24"},"podSelector":{}}]'],
+         [SCHEMA, "/networkPolicy/api/ingressFrom/0"]),
+        ("unknown peer key", [], ["--set-json", 'networkPolicy.dns.to=[{"serviceSelector":{}}]'],
+         [SCHEMA, "additional properties 'serviceSelector' not allowed"]),
+        ("malformed CIDR", [], ["--set-json", 'networkPolicy.database.to=[{"ipBlock":{"cidr":"198.51.100.0"}}]'],
+         [SCHEMA, "/networkPolicy/database/to/0/ipBlock/cidr"]),
+        ("unknown selector operator", [], ["--set-json",
+         'networkPolicy.database.to=[{"podSelector":{"matchExpressions":[{"key":"a","operator":"Matches"}]}}]'],
+         [SCHEMA, "/networkPolicy/database/to/0/podSelector/matchExpressions/0/operator"]),
+        ("unknown networkPolicy key", ["networkPolicy.api.ingressPorts=8081"], [],
+         [SCHEMA, "additional properties 'ingressPorts' not allowed"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -478,6 +678,9 @@ class NegativeCaseTest(unittest.TestCase):
             with self.subTest(values=set_values):
                 result = helm_template(set_values=set_values)
                 self.assertEqual(result.returncode, 0, result.stderr)
+        # Database peers are not required while the policies are disabled.
+        result = helm_template(extra=["--set", "networkPolicy.enabled=false", "--set-json", "networkPolicy.database.to=[]"])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_chart_defaults_refuse_to_render(self):
         """Fails if values.yaml ever ships an image digest or Secret name."""
@@ -502,6 +705,7 @@ class BoundsTest(unittest.TestCase):
             ("strategy.maxUnavailable", 0, None, []),
         )],
         ("api.service.port", 1, 65535, []),
+        ("networkPolicy.database.port", 1, 65535, []),
         ("migration.settings.connectTimeoutMs", 1, 60000, MIGRATION_ROOM),
         ("migration.settings.lockTimeoutMs", 1, 600000, MIGRATION_ROOM),
         ("migration.settings.statementTimeoutMs", 1, 3600000, MIGRATION_ROOM),
@@ -543,9 +747,11 @@ class YamlScalarTest(unittest.TestCase):
             self.assertEqual(doc["metadata"]["labels"]["app.kubernetes.io/instance"], "123")
 
     def test_names_and_keys_are_strings(self):
-        """Fails if a ServiceAccount, pull Secret, Secret name or Secret key is emitted unquoted."""
+        """Fails if a ServiceAccount, pull Secret, Secret name, Secret key or policy peer label is emitted unquoted."""
         accounts = sorted(d["metadata"]["name"] for d in self.docs if d["kind"] == "ServiceAccount")
         self.assertEqual(accounts, ["555", "null"])
+        peer = find(self.docs, "NetworkPolicy", "-worker")["spec"]["egress"][1]["to"][0]
+        self.assertEqual(peer["podSelector"]["matchLabels"], {"example.test/enabled": "true", "example.test/id": "123"})
         expected = {
             "api": ("555", "456", "123"),
             "worker": ("true", "openmettle-worker-database", "false"),

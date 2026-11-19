@@ -20,3 +20,12 @@ database:
     existingSecret: openmettle-worker-database
   migrate:
     existingSecret: openmettle-owner-database
+networkPolicy:
+  database:
+    to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: example-database
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: postgres

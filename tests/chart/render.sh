@@ -24,6 +24,7 @@ matrix=(
   "openmettle"
   "openmettle all-keys.yaml"
   "openmettle migration-disabled.yaml"
+  "openmettle network-policy-disabled.yaml"
   "123 yaml-ambiguous.yaml"
 )
 

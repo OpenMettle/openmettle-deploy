@@ -13,10 +13,15 @@ Names are truncated to 52 characters so that "<fullname>-migrate" stays within 6
 {{- end -}}
 {{- end -}}
 
+{{/* Labels on every pod of this release, whatever its component. Argument: the root context. */}}
+{{- define "openmettle-core.releaseSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "openmettle-core.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+{{- end -}}
+
 {{/* Arguments: dict "root" $ "component" "api|worker|migrate" */}}
 {{- define "openmettle-core.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "openmettle-core.name" .root }}
-app.kubernetes.io/instance: {{ .root.Release.Name | quote }}
+{{ include "openmettle-core.releaseSelectorLabels" .root }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
@@ -130,6 +135,25 @@ deadline, not the configured timeout, ends long migrations. This is a lower boun
 {{- $deadline := int64 .Values.migration.activeDeadlineSeconds -}}
 {{- if le (mul $deadline 1000) $attempt -}}
 {{- fail (printf "migration.activeDeadlineSeconds (%d s) must exceed connectTimeoutMs + lockTimeoutMs + statementTimeoutMs (%d ms)" $deadline (int64 $attempt)) -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+An egress rule with an empty `to` list matches every destination, so the DNS and database peer
+lists must not be empty while the NetworkPolicies are rendered.
+*/ -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- if not .Values.networkPolicy.database.to -}}
+{{- fail "networkPolicy.database.to must list at least one PostgreSQL peer when networkPolicy.enabled is true (an empty list would allow egress to every destination on the database port)" -}}
+{{- end -}}
+{{- if not .Values.networkPolicy.dns.to -}}
+{{- fail "networkPolicy.dns.to must list at least one DNS peer when networkPolicy.enabled is true (an empty list would allow egress to every destination on port 53)" -}}
+{{- end -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) -}}
+{{- range $i, $peer := $entry.peers -}}
+{{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
+{{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- /*

@@ -1,0 +1,5 @@
+# Synthetic overlay on minimal.yaml: no NetworkPolicies, so the database peers are not required.
+networkPolicy:
+  enabled: false
+  database:
+    to: []
