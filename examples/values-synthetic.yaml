@@ -1,16 +1,16 @@
 # SYNTHETIC EXAMPLE. NOT INSTALLABLE. Do not copy real values into this file.
 #
-# A complete private overlay for charts/openmettle-core, showing every I4 option: database CA,
-# artifact volume, Ingress with TLS for a Traefik controller, the matching NetworkPolicy peer and an
-# API PodDisruptionBudget. Copy it to a private location outside this repository (for example an
-# ignored config/<site>.local.yaml or a private configuration repository), replace each placeholder
-# and render it with:
+# A complete private overlay for charts/openmettle-core, showing every I4 and I5 option: database CA,
+# artifact volume, Ingress with TLS for a Traefik controller, the matching NetworkPolicy peers, an
+# API PodDisruptionBudget, and optional browser sign-in / OIDC mounts and egress (API only). Copy it
+# to a private location outside this repository (for example an ignored config/<site>.local.yaml or
+# a private configuration repository), replace each placeholder and render it with:
 #
 #   helm template openmettle charts/openmettle-core --namespace openmettle -f <private>.yaml
 #
 # Placeholders: the reserved .example top-level domain (RFC 2606), all-zero image digests that name
-# no image, and Secret, ConfigMap and claim names that exist nowhere. The chart creates none of the
-# referenced Secrets or ConfigMaps. OIDC and login settings are not accepted yet (V1-32 I5).
+# no image, documentation IP blocks (RFC 5737), and Secret, ConfigMap and claim names that exist
+# nowhere. The chart creates none of the referenced Secrets or ConfigMaps.
 
 images:
   api:
@@ -84,8 +84,30 @@ networkPolicy:
         podSelector:
           matchLabels:
             app.kubernetes.io/name: traefik
+    oidc:
+      # Documentation range (RFC 5737) standing in for the OIDC provider address (API egress only;
+      # port 443 default, or e.g. 8443 for self-hosted Keycloak).
+      to:
+        - ipBlock:
+            cidr: 192.0.2.20/32
+      port: 443
   database:
     # Documentation range (RFC 5737) standing in for the PostgreSQL address.
     to:
       - ipBlock:
           cidr: 192.0.2.10/32
+
+auth:
+  # Optional browser sign-in / OIDC configuration (off by default in the chart, mounted into api only).
+  # Validate the version-2 document inside the API image with `openmettle-api --check-auth-config`
+  # and complete the Ingress TLS and access-log redaction gates before exposing sign-in externally.
+  enabled: true
+  configMapName: example-openmettle-auth-config
+  configKey: auth.json
+  loginKeysSecretName: example-openmettle-auth-login-keys
+  # Optional CA bundle for a private/cluster-CA OIDC provider (reference /etc/openmettle/auth-ca/ca.crt
+  # in providers[].trust.bundle_path).
+  providerCaBundle:
+    enabled: true
+    configMapName: example-openmettle-oidc-ca
+    key: ca.crt

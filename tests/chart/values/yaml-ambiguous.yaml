@@ -21,9 +21,25 @@ migration:
   serviceAccount:
     name: "null"
 networkPolicy:
+  api:
+    oidc:
+      to:
+        - podSelector:
+            matchLabels:
+              example.test/oidc: "true"
+              example.test/id: "456"
   database:
     to:
       - podSelector:
           matchLabels:
             example.test/enabled: "true"
             example.test/id: "123"
+auth:
+  enabled: true
+  configMapName: "789"
+  configKey: "false"
+  loginKeysSecretName: "null"
+  providerCaBundle:
+    enabled: true
+    configMapName: "123"
+    key: "true"

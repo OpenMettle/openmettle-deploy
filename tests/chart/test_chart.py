@@ -1,5 +1,5 @@
 """Policy tests over `helm template` output for charts/openmettle-core (V1-32 I1 render contract, I3 network
-policy, I4 storage, database CA, Ingress and PodDisruptionBudget).
+policy, I4 storage, database CA, Ingress and PodDisruptionBudget, I5 browser sign-in / OIDC).
 
 These tests render the chart; they do not install it. Each test docstring names a template or
 schema change that would make it fail. Requires helm (or HELM) and PyYAML (test-only).
@@ -29,6 +29,8 @@ MATRIX = {
     "network-policy-disabled": ("network-policy-disabled.yaml",),
     "storage-existing-claim": ("storage-existing-claim.yaml",),
     "ingress-network-policy-disabled": ("ingress-network-policy-disabled.yaml",),
+    "auth-enabled": ("auth-enabled.yaml",),
+    "auth-network-policy-disabled": ("auth-network-policy-disabled.yaml",),
 }
 PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_"}
 PORT = {"api": 8080, "worker": 8081}
@@ -147,11 +149,14 @@ class PodPolicyTest(Rendered):
             self.assertEqual(context.get("runAsUser"), 65532)
             self.assertEqual(context.get("runAsGroup"), 65532)
             self.assertEqual(context.get("seccompProfile"), {"type": "RuntimeDefault"})
-            if any(v["name"] == "artifacts" for v in pod.get("volumes", [])):
+            vol_names = {v["name"] for v in pod.get("volumes", [])}
+            if "artifacts" in vol_names or "auth-login-keys" in vol_names:
                 self.assertEqual(context.get("fsGroup"), 65532)
+            else:
+                self.assertNotIn("fsGroup", context, "fsGroup is only for pods mounting artifacts or auth login keys")
+            if "artifacts" in vol_names:
                 self.assertEqual(context.get("fsGroupChangePolicy"), "OnRootMismatch")
             else:
-                self.assertNotIn("fsGroup", context, "fsGroup is only for pods that mount the artifact volume")
                 self.assertNotIn("fsGroupChangePolicy", context)
 
     def test_container_security_context(self):
@@ -176,17 +181,33 @@ class PodPolicyTest(Rendered):
                     self.assertNotIn("hostPort", port)
 
     def test_only_known_volumes(self):
-        """Fails if a pod gains a volume other than the artifact claim or the database CA ConfigMap, or a mount without one."""
-        for _, _, pod in self.each_pod():
-            volumes = {v["name"]: v for v in pod.get("volumes", [])}
-            self.assertLessEqual(set(volumes), {"artifacts", "db-ca"})
-            if "artifacts" in volumes:
-                self.assertEqual(set(volumes["artifacts"]), {"name", "persistentVolumeClaim"})
-            if "db-ca" in volumes:
-                self.assertEqual(set(volumes["db-ca"]), {"name", "configMap"})
+        """Fails if a pod gains an unknown volume, auth volumes appear outside api, or a mount lacks a matching volume."""
+        for _, role, pod in self.each_pod():
+            vols = {v["name"]: v for v in pod.get("volumes", [])}
+            self.assertLessEqual(set(vols), {"artifacts", "db-ca"} | AUTH_VOLUMES)
+            if role != "api":
+                self.assertFalse(AUTH_VOLUMES & set(vols), f"{role} must never mount auth volumes")
+            if "artifacts" in vols:
+                self.assertEqual(set(vols["artifacts"]), {"name", "persistentVolumeClaim"})
+            for cm_vol in ("db-ca", "auth-config", "auth-provider-ca"):
+                if cm_vol in vols:
+                    self.assertEqual(set(vols[cm_vol]), {"name", "configMap"})
+            if "auth-login-keys" in vols:
+                self.assertEqual(set(vols["auth-login-keys"]), {"name", "secret"})
             for container in containers(pod):
-                mounts = container.get("volumeMounts", [])
-                self.assertEqual(sorted(m["name"] for m in mounts), sorted(volumes))
+                vol_mounts = container.get("volumeMounts", [])
+                self.assertEqual(sorted(m["name"] for m in vol_mounts), sorted(vols))
+
+    def test_volume_mount_paths_are_non_overlapping(self):
+        """Fails if any volumeMount is nested inside another mountPath (read-only ConfigMap mounts fail nested mkdir with EROFS)."""
+        for _, _, pod in self.each_pod():
+            for container in containers(pod):
+                paths = [m["mountPath"].rstrip("/") for m in container.get("volumeMounts", [])]
+                self.assertEqual(len(paths), len(set(paths)), paths)
+                for i, left in enumerate(paths):
+                    for j, right in enumerate(paths):
+                        if i != j:
+                            self.assertFalse(right.startswith(left + "/"), f"{right} nested inside {left}")
 
     def test_no_token_and_no_service_links(self):
         """Fails if a pod omits automountServiceAccountToken: false or enableServiceLinks: false."""
@@ -462,7 +483,7 @@ class MigrationHookTest(Rendered):
 class NetworkPolicyTest(Rendered):
     """Design §5: a chart-scoped deny-all plus DNS and database egress, and API ingress from configured peers."""
 
-    ENABLED = ("minimal", "all-keys", "migration-disabled")
+    ENABLED = ("minimal", "all-keys", "migration-disabled", "auth-enabled")
 
     def policies(self, name):
         return [d for d in self.renders[name] if d["kind"] == "NetworkPolicy"]
@@ -493,23 +514,36 @@ class NetworkPolicyTest(Rendered):
                     self.assertEqual(types, {"Ingress", "Egress"})
 
     def test_egress_is_dns_and_database_only(self):
-        """Fails if a component gains an egress rule, loses DNS or database egress, or a rule widens its peers or ports."""
+        """Fails if a component gains an unexpected egress rule, loses DNS/database egress, or OIDC egress leaks beyond api."""
+        default_db = [{
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-database"}},
+            "podSelector": {"matchLabels": {"app.kubernetes.io/name": "postgres"}},
+        }]
+        all_keys_oidc = [
+            {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-identity"}},
+             "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-oidc"}}},
+            {"ipBlock": {"cidr": "198.51.100.50/32"}},
+        ]
         expected = {
-            "minimal": (DEFAULT_DNS_PEERS, [{
-                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-database"}},
-                "podSelector": {"matchLabels": {"app.kubernetes.io/name": "postgres"}}}], 5432),
+            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None),
+            "auth-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, ([{"ipBlock": {"cidr": "192.0.2.20/32"}}], 443)),
             "all-keys": ([{"ipBlock": {"cidr": "192.0.2.10/32"}},
                           {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-dns"}}}],
-                         [{"ipBlock": {"cidr": "198.51.100.0/24"}}, {"ipBlock": {"cidr": "2001:db8::/64"}}], 5433),
+                         [{"ipBlock": {"cidr": "198.51.100.0/24"}}, {"ipBlock": {"cidr": "2001:db8::/64"}}],
+                         5433, (all_keys_oidc, 8443)),
         }
-        for name, (dns, database, port) in expected.items():
+        for name, (dns, database, port, api_oidc) in expected.items():
             roles = []
             for role, labels in pod_labels(self.renders[name]):
                 roles.append(role)
                 with self.subTest(values=name, component=role):
                     _, _, egress = effective_policy(self.renders[name], labels)
-                    self.assertEqual(egress, [{"to": dns, "ports": DNS_PORTS},
-                                              {"to": database, "ports": [{"protocol": "TCP", "port": port}]}])
+                    rules = [{"to": dns, "ports": DNS_PORTS},
+                             {"to": database, "ports": [{"protocol": "TCP", "port": port}]}]
+                    if role == "api" and api_oidc is not None:
+                        oidc_peers, oidc_port = api_oidc
+                        rules.append({"to": oidc_peers, "ports": [{"protocol": "TCP", "port": oidc_port}]})
+                    self.assertEqual(egress, rules)
             self.assertEqual(sorted(roles), ["api", "migrate", "worker"])
 
     def test_ingress_only_to_api_from_configured_peers(self):
@@ -583,8 +617,8 @@ class NetworkPolicyTest(Rendered):
     def test_chart_defaults(self):
         """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database or API peers."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))["networkPolicy"]
-        self.assertEqual(defaults, {"enabled": True, "api": {"ingressFrom": []}, "dns": {"to": DEFAULT_DNS_PEERS},
-                                    "database": {"to": [], "port": 5432}})
+        self.assertEqual(defaults, {"enabled": True, "api": {"ingressFrom": [], "oidc": {"to": [], "port": 443}},
+                                    "dns": {"to": DEFAULT_DNS_PEERS}, "database": {"to": [], "port": 5432}})
 
     def test_names_fit_in_63_characters(self):
         """Fails if an object name can exceed 63 characters at the longest fullname (Helm caps release names at 53)."""
@@ -596,6 +630,11 @@ class NetworkPolicyTest(Rendered):
 
 ARTIFACTS_PATH = "/var/lib/openmettle/artifacts"
 DB_CA_DIRECTORY = "/etc/openmettle/db-ca"
+AUTH_CONFIG_DIR = "/etc/openmettle/auth"
+AUTH_CONFIG_PATH = "/etc/openmettle/auth/auth.json"
+AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
+AUTH_CA_DIR = "/etc/openmettle/auth-ca"
+AUTH_VOLUMES = {"auth-config", "auth-login-keys", "auth-provider-ca"}
 I4_KINDS = {"PersistentVolumeClaim", "Ingress", "PodDisruptionBudget"}
 
 
@@ -608,10 +647,10 @@ def volumes(pod):
 
 
 class OptionalDefaultsTest(Rendered):
-    """I4 features are off by default and add nothing to a default render."""
+    """I4 and I5 features are off by default and add nothing to a default render."""
 
     def test_chart_defaults(self):
-        """Fails if values.yaml enables or pre-fills the artifact volume, database CA, Ingress or API PDB."""
+        """Fails if values.yaml enables or pre-fills the artifact volume, database CA, Ingress, API PDB or auth."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
         self.assertEqual(defaults["database"]["caBundle"], {"enabled": False, "configMapName": "", "key": "ca.crt"})
         self.assertEqual(defaults["api"]["podDisruptionBudget"],
@@ -620,6 +659,10 @@ class OptionalDefaultsTest(Rendered):
             "enabled": False, "existingClaim": "", "size": "", "accessModes": ["ReadWriteOnce"],
             "storageClassName": None, "annotations": {}}})
         self.assertEqual(defaults["ingress"], {"enabled": False, "className": "", "annotations": {}, "hosts": [], "tls": []})
+        self.assertEqual(defaults["auth"], {
+            "enabled": False, "configMapName": "", "configKey": "auth.json", "loginKeysSecretName": "",
+            "providerCaBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
+        })
 
     def test_defaults_render_no_optional_resource_volume_or_env(self):
         """Fails if a default render gains a PVC, Ingress, PDB, volume, mount, fsGroup or environment variable."""
@@ -786,6 +829,88 @@ class PodDisruptionBudgetTest(Rendered):
                 self.assertEqual(type(pdb["spec"][field]), type(expected))
 
 
+class AuthTest(Rendered):
+    """auth mounts browser sign-in / OIDC files and env into api only, never worker or migrate (core ADR 0025)."""
+
+    def test_api_mounts_config_login_keys_optional_ca_and_env(self):
+        """Fails if api lacks OPENMETTLE_API_AUTH_CONFIG, read-only directory mounts, 0440 Secret mode or fsGroup 65532."""
+        cases = {
+            "auth-enabled": ("example-auth-config", "auth.json", "example-auth-login-keys", None),
+            "auth-network-policy-disabled": ("example-auth-config", "auth.json", "example-auth-login-keys", None),
+            "all-keys": ("example-auth-config", "browser-auth.json", "example-auth-login-keys",
+                         ("example-oidc-ca", "idp-ca.pem")),
+        }
+        for name, (cm, cm_key, secret, ca) in cases.items():
+            with self.subTest(values=name):
+                api = find(self.renders[name], "Deployment", "-api")["spec"]["template"]["spec"]
+                container = api["containers"][0]
+                env = env_map(container)
+                self.assertEqual(env["OPENMETTLE_API_AUTH_CONFIG"],
+                                 {"name": "OPENMETTLE_API_AUTH_CONFIG", "value": AUTH_CONFIG_PATH})
+                self.assertEqual(api["securityContext"]["fsGroup"], 65532)
+                self.assertEqual(volumes(api)["auth-config"], {"name": "auth-config", "configMap": {
+                    "name": cm, "items": [{"key": cm_key, "path": "auth.json"}]}})
+                self.assertEqual(mounts(api)["auth-config"],
+                                 {"name": "auth-config", "mountPath": AUTH_CONFIG_DIR, "readOnly": True})
+                self.assertEqual(volumes(api)["auth-login-keys"], {"name": "auth-login-keys", "secret": {
+                    "secretName": secret, "defaultMode": 0o440}})
+                self.assertEqual(mounts(api)["auth-login-keys"],
+                                 {"name": "auth-login-keys", "mountPath": AUTH_KEYS_DIR, "readOnly": True})
+                if ca is None:
+                    self.assertNotIn("auth-provider-ca", volumes(api))
+                    self.assertNotIn("auth-provider-ca", mounts(api))
+                else:
+                    ca_cm, ca_key = ca
+                    self.assertEqual(volumes(api)["auth-provider-ca"], {"name": "auth-provider-ca", "configMap": {
+                        "name": ca_cm, "items": [{"key": ca_key, "path": "ca.crt"}]}})
+                    self.assertEqual(mounts(api)["auth-provider-ca"],
+                                     {"name": "auth-provider-ca", "mountPath": AUTH_CA_DIR, "readOnly": True})
+                for mount in container["volumeMounts"]:
+                    self.assertNotIn("subPath", mount)
+
+    def test_worker_and_migrate_never_receive_auth_env_volumes_or_secrets(self):
+        """Fails if worker or migrate mounts auth config/keys/CA, sets AUTH_CONFIG or references auth object names."""
+        for name in ("auth-enabled", "auth-network-policy-disabled", "all-keys"):
+            docs = self.renders[name]
+            with self.subTest(values=name):
+                for role, pod in pods(docs):
+                    if role == "api":
+                        continue
+                    env_names = {e["name"] for e in pod["containers"][0]["env"]}
+                    self.assertFalse([e for e in env_names if "AUTH" in e], f"{role}: {env_names}")
+                    self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
+                    self.assertFalse(AUTH_VOLUMES & set(mounts(pod)), role)
+                    if name != "all-keys":
+                        self.assertNotIn("volumes", pod, role)
+                        self.assertNotIn("volumeMounts", pod["containers"][0], role)
+                        self.assertNotIn("fsGroup", pod["securityContext"], role)
+                non_api_yaml = yaml.safe_dump_all(
+                    d for d in docs if not (d["kind"] in ("Deployment", "NetworkPolicy") and component(d) == "api")
+                )
+                for ref in ("example-auth-config", "example-auth-login-keys", "example-oidc-ca", "AUTH_CONFIG"):
+                    self.assertNotIn(ref, non_api_yaml)
+
+    def test_provider_ca_uses_default_key_ca_crt(self):
+        """Fails if auth.providerCaBundle omits the default key ca.crt when enabled."""
+        docs = render(("auth-enabled.yaml",), [
+            "auth.providerCaBundle.enabled=true",
+            "auth.providerCaBundle.configMapName=example-oidc-ca",
+        ])
+        api = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(api)["auth-provider-ca"], {"name": "auth-provider-ca", "configMap": {
+            "name": "example-oidc-ca", "items": [{"key": "ca.crt", "path": "ca.crt"}]}})
+        self.assertEqual(mounts(api)["auth-provider-ca"],
+                         {"name": "auth-provider-ca", "mountPath": AUTH_CA_DIR, "readOnly": True})
+        for role, pod in pods(docs):
+            if role != "api":
+                self.assertNotIn("auth-provider-ca", volumes(pod), role)
+
+    def test_auth_without_network_policy_renders_no_policies(self):
+        """Fails if enabling auth while networkPolicy.enabled=false still renders a NetworkPolicy."""
+        docs = self.renders["auth-network-policy-disabled"]
+        self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
+
+
 class ExampleOverlayTest(unittest.TestCase):
     """examples/values-synthetic.yaml renders standalone and stays synthetic."""
 
@@ -798,12 +923,23 @@ class ExampleOverlayTest(unittest.TestCase):
         cls.docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
         cls.values = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
 
-    def test_shows_every_i4_feature(self):
-        """Fails if the example stops demonstrating the PVC, Ingress, PDB, database CA or ingress-controller peer."""
+    def test_shows_every_i4_and_i5_feature(self):
+        """Fails if the example stops demonstrating I4 (PVC, Ingress, PDB, db CA, ingress peer) or I5 (API-only auth & OIDC egress)."""
         self.assertLessEqual(I4_KINDS, {d["kind"] for d in self.docs})
         for role, pod in pods(self.docs):
             self.assertIn("db-ca", volumes(pod), role)
-        self.assertTrue(find(self.docs, "NetworkPolicy", "-api")["spec"]["ingress"])
+            if role == "api":
+                self.assertEqual(env_map(pod["containers"][0])["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
+                self.assertLessEqual(AUTH_VOLUMES, set(volumes(pod)))
+            else:
+                self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
+                self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env_map(pod["containers"][0]))
+        api_np = find(self.docs, "NetworkPolicy", "-api")["spec"]
+        self.assertTrue(api_np["ingress"])
+        self.assertEqual(len(api_np["egress"]), 3)
+        self.assertEqual(api_np["egress"][2]["ports"], [{"protocol": "TCP", "port": 443}])
+        for role in ("worker", "migrate"):
+            self.assertEqual(len(find(self.docs, "NetworkPolicy", f"-{role}")["spec"]["egress"]), 2)
 
     def test_values_are_synthetic(self):
         """Fails if the example names a non-reserved domain, a real digest or a non-documentation address."""
@@ -813,7 +949,7 @@ class ExampleOverlayTest(unittest.TestCase):
             self.assertTrue(host == "example" or host.endswith(".example"), host)
         for role in ("api", "worker", "migrate"):
             self.assertEqual(self.values["images"][role]["digest"], DIGEST)
-        for peer in self.values["networkPolicy"]["database"]["to"]:
+        for peer in self.values["networkPolicy"]["database"]["to"] + self.values["networkPolicy"]["api"]["oidc"]["to"]:
             self.assertTrue(peer["ipBlock"]["cidr"].startswith("192.0.2."))
         self.assertNotIn("oidc", self.values)
 
@@ -1014,6 +1150,75 @@ class NegativeCaseTest(unittest.TestCase):
         ("unknown PDB key", ["api.podDisruptionBudget.selector=x"], [], [SCHEMA, "additional properties 'selector' not allowed"]),
         ("worker has no PDB", ["worker.podDisruptionBudget.enabled=true"], [],
          [SCHEMA, "additional properties 'podDisruptionBudget' not allowed"]),
+        # Browser sign-in / OIDC (I5).
+        ("auth without ConfigMap or login keys", ["auth.enabled=true"], [],
+         [SCHEMA, "/auth/configMapName", "/auth/loginKeysSecretName"]),
+        ("auth without ConfigMap without schema", ["auth.enabled=true"], ["--skip-schema-validation"],
+         ["auth.configMapName is required when auth.enabled is true"]),
+        ("auth without login keys", ["auth.enabled=true", "auth.configMapName=auth-cm"], [],
+         [SCHEMA, "/auth/loginKeysSecretName"]),
+        ("auth without login keys without schema", ["auth.enabled=true", "auth.configMapName=auth-cm"],
+         ["--skip-schema-validation"], ["auth.loginKeysSecretName is required when auth.enabled is true"]),
+        ("auth configKey with path", ["auth.configKey=../auth.json"], [], [SCHEMA, "/auth/configKey"]),
+        ("auth configKey dot-dot", ["auth.configKey=.."], [], [SCHEMA, "/auth/configKey"]),
+        ("auth configKey dot without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys", "auth.configKey=."],
+         ["--skip-schema-validation"], ["auth.configKey must be a ConfigMap key"]),
+        ("auth configKey slash without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys", "auth.configKey=a/b"],
+         ["--skip-schema-validation"], ["auth.configKey must be a ConfigMap key"]),
+        ("auth bad ConfigMap name", ["auth.configMapName=Auth_Config"], [], [SCHEMA, "/auth/configMapName"]),
+        ("auth bad login keys Secret name", ["auth.loginKeysSecretName=Auth_Keys"], [],
+         [SCHEMA, "/auth/loginKeysSecretName"]),
+        ("auth provider CA enabled while auth disabled",
+         ["auth.providerCaBundle.enabled=true", "auth.providerCaBundle.configMapName=oidc-ca"], [],
+         [SCHEMA, "/auth/providerCaBundle/enabled"]),
+        ("auth provider CA enabled while auth disabled without schema",
+         ["auth.providerCaBundle.enabled=true", "auth.providerCaBundle.configMapName=oidc-ca"],
+         ["--skip-schema-validation"], ["auth.providerCaBundle.enabled cannot be true when auth.enabled is false"]),
+        ("auth provider CA without ConfigMap",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys",
+          "auth.providerCaBundle.enabled=true"], [], [SCHEMA, "/auth/providerCaBundle/configMapName"]),
+        ("auth provider CA without ConfigMap without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys",
+          "auth.providerCaBundle.enabled=true"], ["--skip-schema-validation"],
+         ["auth.providerCaBundle.configMapName is required when auth.providerCaBundle.enabled is true"]),
+        ("auth provider CA key with path", ["auth.providerCaBundle.key=../ca.crt"], [],
+         [SCHEMA, "/auth/providerCaBundle/key"]),
+        ("auth provider CA key dot-dot", ["auth.providerCaBundle.key=.."], [],
+         [SCHEMA, "/auth/providerCaBundle/key"]),
+        ("auth provider CA key dot-dot without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys",
+          "auth.providerCaBundle.enabled=true", "auth.providerCaBundle.configMapName=oidc-ca",
+          "auth.providerCaBundle.key=.."], ["--skip-schema-validation"],
+         ["auth.providerCaBundle.key must be a ConfigMap key"]),
+        ("auth provider CA bad ConfigMap name", ["auth.providerCaBundle.configMapName=OIDC_CA"], [],
+         [SCHEMA, "/auth/providerCaBundle/configMapName"]),
+        ("auth enabled without OIDC egress peers",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"], [],
+         ["networkPolicy.api.oidc.to must list at least one OIDC provider peer"]),
+        ("auth enabled without OIDC egress peers without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"],
+         ["--skip-schema-validation"], ["networkPolicy.api.oidc.to must list at least one OIDC provider peer"]),
+        ("OIDC egress peers while auth disabled", [],
+         ["--set-json", 'networkPolicy.api.oidc.to=[{"ipBlock":{"cidr":"192.0.2.20/32"}}]'],
+         ["networkPolicy.api.oidc.to must be empty when auth.enabled is false"]),
+        ("OIDC egress peers while auth and networkPolicy disabled", ["networkPolicy.enabled=false"],
+         ["--set-json", 'networkPolicy.api.oidc.to=[{"ipBlock":{"cidr":"192.0.2.20/32"}}]'],
+         ["networkPolicy.api.oidc.to must be empty when auth.enabled is false"]),
+        ("empty OIDC peer", ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"],
+         ["--set-json", "networkPolicy.api.oidc.to=[{}]"], [SCHEMA, "/networkPolicy/api/oidc/to/0"]),
+        ("empty OIDC peer without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"],
+         ["--set-json", "networkPolicy.api.oidc.to=[{}]", "--skip-schema-validation"],
+         ["networkPolicy.api.oidc.to[0] must be a non-empty NetworkPolicyPeer object"]),
+        ("unknown auth key", ["auth.mountPath=/tmp"], [], [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        ("unknown auth providerCaBundle key", ["auth.providerCaBundle.mountPath=/tmp"], [],
+         [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        ("unknown OIDC policy key", ["networkPolicy.api.oidc.protocol=UDP"], [],
+         [SCHEMA, "additional properties 'protocol' not allowed"]),
+        ("worker has no auth", ["worker.auth.enabled=true"], [],
+         [SCHEMA, "additional properties 'auth' not allowed"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -1050,7 +1255,9 @@ class NegativeCaseTest(unittest.TestCase):
                            ["storage.artifacts.enabled=true", "storage.artifacts.size=1.5Gi"],
                            ["storage.artifacts.enabled=true", "storage.artifacts.size=500M"],
                            ["database.caBundle.configMapName=ca"],
-                           ["ingress.className=traefik"]):
+                           ["ingress.className=traefik"],
+                           ["auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys",
+                            "auth.providerCaBundle.configMapName=oidc-ca"]):
             with self.subTest(values=set_values):
                 result = helm_template(set_values=set_values)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1079,6 +1286,7 @@ class BoundsTest(unittest.TestCase):
         )],
         ("api.service.port", 1, 65535, []),
         ("networkPolicy.database.port", 1, 65535, []),
+        ("networkPolicy.api.oidc.port", 1, 65535, []),
         ("migration.settings.connectTimeoutMs", 1, 60000, MIGRATION_ROOM),
         ("migration.settings.lockTimeoutMs", 1, 600000, MIGRATION_ROOM),
         ("migration.settings.statementTimeoutMs", 1, 3600000, MIGRATION_ROOM),
@@ -1138,6 +1346,15 @@ class YamlScalarTest(unittest.TestCase):
                 ref = env_map(pod["containers"][0])[PREFIX[role] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]
                 self.assertEqual(ref, {"name": secret, "key": key})
                 self.assertIsInstance(pod["containers"][0]["imagePullPolicy"], str)
+        api_pod = find(self.docs, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(api_pod)["auth-config"]["configMap"], {
+            "name": "789", "items": [{"key": "false", "path": "auth.json"}]})
+        self.assertEqual(volumes(api_pod)["auth-login-keys"]["secret"], {
+            "secretName": "null", "defaultMode": 0o440})
+        self.assertEqual(volumes(api_pod)["auth-provider-ca"]["configMap"], {
+            "name": "123", "items": [{"key": "true", "path": "ca.crt"}]})
+        oidc_peer = find(self.docs, "NetworkPolicy", "-api")["spec"]["egress"][2]["to"][0]
+        self.assertEqual(oidc_peer["podSelector"]["matchLabels"], {"example.test/oidc": "true", "example.test/id": "456"})
 
 
 class ContractDriftTest(unittest.TestCase):

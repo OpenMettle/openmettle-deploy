@@ -1,8 +1,10 @@
 {{/*
 Per-component NetworkPolicy. Every component may reach DNS and the database only; the API may
-also accept connections on its container port from networkPolicy.api.ingressFrom.
+also accept connections on its container port from networkPolicy.api.ingressFrom and, when
+auth.enabled is true, reach OIDC provider peers in networkPolicy.api.oidc.
 Arguments: dict "root" $ "component" "api|worker|migrate" "ingressFrom" <peers> "port" <container
-port> "annotations" <map>. An empty ingressFrom renders no ingress rule, which denies all ingress.
+port> "oidc" <bool> "annotations" <map>. An empty ingressFrom renders no ingress rule, which denies
+all ingress.
 */}}
 {{- define "openmettle-core.networkPolicy" -}}
 {{- $root := .root -}}
@@ -46,4 +48,11 @@ spec:
       ports:
         - protocol: TCP
           port: {{ int64 $values.database.port }}
+    {{- if .oidc }}
+    - to:
+        {{- toYaml $values.api.oidc.to | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ int64 $values.api.oidc.port }}
+    {{- end }}
 {{- end -}}

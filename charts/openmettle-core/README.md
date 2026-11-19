@@ -1,6 +1,6 @@
 # openmettle-core chart
 
-CPU-only packaging for the OpenMettle core API, worker and schema migration. Increment I1 of V1-32 is the **render contract**: templates, the values schema, security defaults and render-time tests. I2 adds a **kind install smoke test** ([`tests/kind`](../../tests/kind/README.md)). I3 adds **NetworkPolicies** (chart-scoped deny-all plus per-component allows) and live enforcement probes in the kind smoke test; the hosted kind run for I3 is pending pull-request CI execution. I4 adds optional, off-by-default **artifact storage, a database CA mount, an Ingress with TLS and an API PodDisruptionBudget**, plus a [synthetic example overlay](../../examples/values-synthetic.yaml). The I4 options are render-tested and kubeconform-validated only; none has been installed on a cluster. Neither a render nor a smoke run is application acceptance or qualification.
+CPU-only packaging for the OpenMettle core API, worker and schema migration. Increment I1 of V1-32 is the **render contract**: templates, the values schema, security defaults and render-time tests. I2 adds a **kind install smoke test** ([`tests/kind`](../../tests/kind/README.md)). I3 adds **NetworkPolicies** (chart-scoped deny-all plus per-component allows) and live enforcement probes in the kind smoke test; the hosted kind run for I3 is pending pull-request CI execution. I4 adds optional, off-by-default **artifact storage, a database CA mount, an Ingress with TLS and an API PodDisruptionBudget**, plus a [synthetic example overlay](../../examples/values-synthetic.yaml). I5 adds optional, off-by-default **browser sign-in / OIDC mounts and API-only OIDC provider egress** (core ADR 0025). The I4 and I5 options are render-tested and kubeconform-validated only; none has been installed on a cluster. Neither a render nor a smoke run is application acceptance or qualification.
 
 ## What it renders
 
@@ -13,7 +13,7 @@ CPU-only packaging for the OpenMettle core API, worker and schema migration. Inc
 | ServiceAccount | `<fullname>-migrate` | Hook, weight `-10` |
 | Job | `<fullname>-migrate` | Hook, weight `0`; see [Schema migration](#schema-migration) |
 | NetworkPolicy | `<fullname>-deny-all` | Release-wide Ingress/Egress deny-all (`networkPolicy.enabled`, default `true`) |
-| NetworkPolicy | `<fullname>-api`, `<fullname>-worker` | DNS and database egress; API ingress on TCP 8080 from `networkPolicy.api.ingressFrom` only |
+| NetworkPolicy | `<fullname>-api`, `<fullname>-worker` | DNS and database egress; API-only ingress on TCP 8080 from `networkPolicy.api.ingressFrom` and, when `auth.enabled` is true, API-only OIDC egress from `networkPolicy.api.oidc` |
 | NetworkPolicy | `<fullname>-migrate` | Hook, weight `-10`; DNS and database egress for the migrate pod |
 | PersistentVolumeClaim | `<fullname>-artifacts` | Optional (`storage.artifacts` with `size`); kept on uninstall. See [Artifact storage](#artifact-storage) |
 | Ingress | `<fullname>-api` | Optional (`ingress.enabled`); HTTPS to the API Service. See [Ingress and TLS](#ingress-and-tls) |
@@ -57,6 +57,8 @@ The chart refuses to render until you supply:
 | `migration.{podAnnotations,nodeSelector,tolerations,affinity}` | empty | Scheduling for the hook pod, for example on tainted nodes |
 | `networkPolicy.enabled` | `true` | Render the release's deny-all and per-component NetworkPolicies; see [NetworkPolicy](#networkpolicy) |
 | `networkPolicy.api.ingressFrom` | `[]` | `NetworkPolicyPeer` list allowed to connect to the API on TCP 8080. Empty denies all pod ingress |
+| `networkPolicy.api.oidc.to` | `[]` | Required while `auth.enabled` and `networkPolicy.enabled` are both true (must be empty while `auth.enabled` is false): API-only OIDC provider egress peers |
+| `networkPolicy.api.oidc.port` | `443` | TCP port for API OIDC provider egress, 1–65535 (for example `8443` for self-hosted Keycloak) |
 | `networkPolicy.dns.to` | `kube-system` / `k8s-app: kube-dns` | `NetworkPolicyPeer` list for UDP and TCP 53 egress. Must be non-empty while enabled |
 | `networkPolicy.database.to` | `[]` | Required while enabled: `NetworkPolicyPeer` list for PostgreSQL egress on `networkPolicy.database.port` |
 | `networkPolicy.database.port` | `5432` | TCP port for database egress, 1–65535 |
@@ -74,10 +76,15 @@ The chart refuses to render until you supply:
 | `ingress.tls` | `[]` | Required while enabled: `{secretName, hosts}` entries naming existing TLS Secrets. Every host must be covered |
 | `api.podDisruptionBudget.enabled` | `false` | See [API PodDisruptionBudget](#api-poddisruptionbudget) |
 | `api.podDisruptionBudget.{minAvailable,maxUnavailable}` | `null` | Exactly one while enabled: an integer or `"<0–100>%"` |
+| `auth.enabled` | `false` | Enable browser sign-in / OIDC configuration for the API only; see [Browser sign-in / OIDC](#browser-sign-in--oidc) |
+| `auth.configMapName` | `""` | Required while enabled: existing ConfigMap holding a version-2 auth settings document |
+| `auth.configKey` | `auth.json` | ConfigMap key projected read-only at `/etc/openmettle/auth/auth.json` |
+| `auth.loginKeysSecretName` | `""` | Required while enabled: existing Secret holding raw 32-byte login key files, mounted read-only at `/etc/openmettle/auth-keys` |
+| `auth.providerCaBundle.{enabled,configMapName,key}` | `false`, `""`, `ca.crt` | Optional existing ConfigMap key mounted read-only at `/etc/openmettle/auth-ca/ca.crt` in the API pod only |
 
 `<component>` is `api` or `worker`; `<ROLE>` is `API` or `WORKER`.
 
-Every process gets an explicit environment: `BIND` (`0.0.0.0:8080` or `0.0.0.0:8081`; core otherwise binds loopback), `DATABASE_URL` from its own Secret through `secretKeyRef`, and the settings above. The chart never uses `envFrom`. Each variable carries its own component prefix, as core ADR 0002 requires. Set `sslmode` explicitly in every URL, because SQLx defaults to `prefer`, which permits plaintext fallback. Readiness `timeoutSeconds` is `ceil(dbTimeoutMs / 1000) + 1`, because `/readyz` waits up to the database timeout.
+Every process gets an explicit environment: `BIND` (`0.0.0.0:8080` or `0.0.0.0:8081`; core otherwise binds loopback), `DATABASE_URL` from its own Secret through `secretKeyRef`, the settings above, and—when `auth.enabled` is true on the API only—`OPENMETTLE_API_AUTH_CONFIG=/etc/openmettle/auth/auth.json`. The chart never uses `envFrom`. Each variable carries its own component prefix, as core ADR 0002 requires. Set `sslmode` explicitly in every URL, because SQLx defaults to `prefer`, which permits plaintext fallback. Readiness `timeoutSeconds` is `ceil(dbTimeoutMs / 1000) + 1`, because `/readyz` waits up to the database timeout.
 
 Keep site values in a private overlay outside this repository and pass it with `-f`; see [Private overlays](#private-overlays). The synthetic files under `tests/chart/values/` use reserved `example.test` names and all-zero digests; they render but cannot be installed.
 
@@ -93,8 +100,8 @@ Set it to the connections available to this release, after subtracting reserved 
 
 These are fixed and are not values:
 
-- Pod: `runAsNonRoot`, `runAsUser`/`runAsGroup` 65532 (the core image user), seccomp `RuntimeDefault`. `fsGroup: 65532` with `fsGroupChangePolicy: OnRootMismatch` is added only to api and worker pods that mount the artifact volume.
-- Container: `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`, `privileged: false`. By default no volumes are mounted. The only optional volumes are the artifact claim (read-write, api and worker) and the database CA ConfigMap (read-only, every component). The root filesystem stays read-only either way.
+- Pod: `runAsNonRoot`, `runAsUser`/`runAsGroup` 65532 (the core image user), seccomp `RuntimeDefault`. `fsGroup: 65532` is added to api and worker pods when mounting the artifact volume (with `fsGroupChangePolicy: OnRootMismatch`) and to the api pod when `auth.enabled` is true (so mode `0440` login key Secret files are readable by GID `65532` without world-read permission).
+- Container: `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`, `privileged: false`. By default no volumes are mounted. The only optional volumes are the artifact claim (read-write, api and worker), the database CA ConfigMap (read-only, every component), and browser sign-in config, login keys and optional provider CA (read-only, api only). The root filesystem stays read-only either way.
 - `automountServiceAccountToken: false` on every ServiceAccount and every pod, plus `enableServiceLinks: false`. The processes never call the Kubernetes API, so the chart creates no RBAC.
 - Credentials come only from existing Secrets. The owner credential reaches only the migration Job. The chart never uses `lookup`.
 - `/healthz` and `/readyz` are unauthenticated. The Service is ClusterIP only, `networkPolicy.api.ingressFrom` defaults to empty, and the Ingress is off by default.
@@ -105,7 +112,7 @@ These are fixed and are not values:
 
 - **`<fullname>-deny-all`** selects every pod of this release (`app.kubernetes.io/name` and `app.kubernetes.io/instance`) with `policyTypes: [Ingress, Egress]` and no rules.
 - **`<fullname>-api`**, **`<fullname>-worker`** and **`<fullname>-migrate`** each select only their own component and declare `policyTypes: [Ingress, Egress]`:
-  - **Egress** is restricted to `networkPolicy.dns.to` on UDP and TCP 53 and `networkPolicy.database.to` on TCP `networkPolicy.database.port` (default `5432`). Rendering fails if `dns.to` or `database.to` is empty while `networkPolicy.enabled` is true, because Kubernetes treats an empty `to` list as matching every destination.
+  - **Egress** is restricted to `networkPolicy.dns.to` on UDP and TCP 53 and `networkPolicy.database.to` on TCP `networkPolicy.database.port` (default `5432`), plus—on `<fullname>-api` only when `auth.enabled` is true—`networkPolicy.api.oidc.to` on TCP `networkPolicy.api.oidc.port` (default `443`). Rendering fails if `dns.to` or `database.to` is empty while `networkPolicy.enabled` is true, if `networkPolicy.api.oidc.to` is empty while both `auth.enabled` and `networkPolicy.enabled` are true, or if `networkPolicy.api.oidc.to` is non-empty while `auth.enabled` is false. Worker and migrate policies never render OIDC egress.
   - The default `networkPolicy.dns.to` selects pods labelled `k8s-app: kube-dns` in the `kube-system` namespace, matching kubeadm (including kind) and K3s CoreDNS. Override it where cluster DNS uses different labels, namespace or IP blocks.
   - **Ingress** is allowed only on the API pod's container port (TCP `8080`) from `networkPolicy.api.ingressFrom`. It defaults to `[]` (no ingress rule rendered, so all pod-to-pod ingress is denied). Kubelet liveness/readiness probes and `kubectl port-forward` originate from the node or inside the pod's network namespace rather than from another pod peer, so they are unaffected. Worker and migrate pods never render an ingress rule.
 - **Migrate hook policy.** `<fullname>-migrate` carries `helm.sh/hook: pre-install,pre-upgrade`, `helm.sh/hook-weight: "-10"` and `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`, matching the migrate ServiceAccount. Hooks run before ordinary release resources, so on first install in a namespace that denies by default—and on upgrades while `<fullname>-deny-all` is in place—the hook policy gives the migrate Job DNS and database egress and is deleted once the hook succeeds. When `migration.enabled` is false, no migrate NetworkPolicy is rendered.
@@ -115,7 +122,7 @@ These are fixed and are not values:
 
 The chart ships no site values. Compose an install from the chart defaults plus one or more private overlays kept outside this public repository: an ignored `config/<site>.local.yaml` here, or a private configuration repository. Helm merges `-f` files left to right, so later files win. Lists such as `ingress.hosts` or `networkPolicy.database.to` are replaced, not merged.
 
-[`examples/values-synthetic.yaml`](../../examples/values-synthetic.yaml) is a complete, clearly marked synthetic overlay that enables every I4 option. It uses the reserved `.example` domain, all-zero digests and placeholder Secret, ConfigMap and claim names. It renders, but cannot be installed. Copy it to a private location, replace every placeholder and review the render before any apply:
+[`examples/values-synthetic.yaml`](../../examples/values-synthetic.yaml) is a complete, clearly marked synthetic overlay that enables every I4 and I5 option. It uses the reserved `.example` domain, all-zero digests and placeholder Secret, ConfigMap and claim names. It renders, but cannot be installed. Copy it to a private location, replace every placeholder and review the render before any apply:
 
 ```sh
 helm template openmettle charts/openmettle-core --namespace openmettle -f config/site.local.yaml > /tmp/openmettle.yaml
@@ -123,7 +130,7 @@ helm template openmettle charts/openmettle-core --namespace openmettle -f config
 helm upgrade --install openmettle charts/openmettle-core --namespace openmettle -f config/site.local.yaml --timeout 15m
 ```
 
-The overlay references objects the chart never creates: the three database URL Secrets, the database CA ConfigMap, an existing artifact PVC (if used), the TLS Secret, the IngressClass and any Traefik Middleware. Create them in the release namespace first. OIDC and login settings are not accepted yet: they arrive in I5, after core V1-04 mounts its routes. The schema rejects an `oidc:` key.
+The overlay references objects the chart never creates: the three database URL Secrets, the database CA ConfigMap, an existing artifact PVC (if used), the TLS Secret, the IngressClass, any Traefik Middleware, and (when `auth.enabled` is true) the auth settings ConfigMap, login-keys Secret and optional provider CA ConfigMap. Create them in the release namespace first. Configure browser sign-in under `auth:` and `networkPolicy.api.oidc:`; the schema still rejects an unknown top-level `oidc:` key.
 
 ## Database CA
 
@@ -218,6 +225,38 @@ On K3s's bundled Traefik, pass them through a `HelmChartConfig` named `traefik` 
 
 `unhealthyPodEvictionPolicy: AlwaysAllow` lets a drain evict API pods that are not Ready, so an unhealthy API never blocks maintenance. The budget counts current replicas only. Pair it with `api.affinity` (for example a preferred anti-affinity on `kubernetes.io/hostname`) to spread replicas across nodes. The worker has no PDB.
 
+## Browser sign-in / OIDC
+
+`auth` exposes core ADR 0025's opt-in browser sign-in runtime mounting for `openmettle-api`. It is **off by default** (`auth.enabled: false`): when disabled, `OPENMETTLE_API_AUTH_CONFIG` is unset, no auth volumes or OIDC egress rules are rendered, and the API serves `/healthz` and `/readyz` only (`404` on every sign-in path).
+
+### Mount paths and permissions (API only)
+
+The chart never creates ConfigMaps or Secrets. Every file comes from a pre-existing object in the release namespace and is mounted read-only into the `api` container only, without `subPath` (preserving atomic kubelet directory projection):
+
+| Source value | Volume | In-pod path | Mode / notes |
+| --- | --- | --- | --- |
+| `auth.configMapName` + `auth.configKey` (default `auth.json`) | `auth-config` | `/etc/openmettle/auth/auth.json` (dir `/etc/openmettle/auth`) | Projected via `items` as `auth.json`; sets `OPENMETTLE_API_AUTH_CONFIG=/etc/openmettle/auth/auth.json` |
+| `auth.loginKeysSecretName` | `auth-login-keys` | `/etc/openmettle/auth-keys/<file>` (dir `/etc/openmettle/auth-keys`) | `defaultMode: 288` (`0440` octal) with API pod `fsGroup: 65532`: readable by UID/GID `65532`, never world-readable |
+| `auth.providerCaBundle.{configMapName,key}` (optional, default `ca.crt`) | `auth-provider-ca` | `/etc/openmettle/auth-ca/ca.crt` (dir `/etc/openmettle/auth-ca`) | Projected via `items` as `ca.crt`; reference in `providers[].trust` as `{"roots": "bundle", "bundle_path": "/etc/openmettle/auth-ca/ca.crt"}` |
+
+- **Non-overlapping sibling directories.** The three mounts sit side by side under `/etc/openmettle/` (`/etc/openmettle/auth`, `/etc/openmettle/auth-keys`, `/etc/openmettle/auth-ca`, alongside `/etc/openmettle/db-ca`). Kubernetes mounts ConfigMap volumes read-only, so nesting another volume inside `/etc/openmettle/auth` (such as `/etc/openmettle/auth/keys`) would fail container startup with `EROFS` when the runtime attempts to create the nested mountpoint. The `/etc/openmettle/auth-keys/<file>` path also matches core ADR 0015's document example.
+- **Why `worker` and `migrate` never mount auth or receive OIDC egress.** Core ADR 0025 restricts `OPENMETTLE_API_AUTH_CONFIG` to `openmettle-api`. Neither `openmettle-worker` nor `openmettle-migrate` serves sign-in routes, reads login keys or contacts an identity provider. Keeping the ConfigMap, login-keys Secret, provider CA and `networkPolicy.api.oidc` egress rule strictly on the API pod preserves least privilege so a worker or migration job never has access to login-key material or provider reachability.
+- **Strict guards.** When `auth.enabled` is true, `auth.configMapName` and `auth.loginKeysSecretName` are required, and while `networkPolicy.enabled` is true `networkPolicy.api.oidc.to` must list at least one OIDC provider peer (on TCP `networkPolicy.api.oidc.port`, default `443`, configurable `1`–`65535` for self-hosted providers such as Keycloak on `8443`). When `auth.enabled` is false, `auth.providerCaBundle.enabled: true` and non-empty `networkPolicy.api.oidc.to` are both rejected so unused CA mounts or egress rules are never silently left behind.
+
+### Offline validation, rollout and prerequisites
+
+- **Check the mounted files before rollout.** Run core's offline validator inside the exact API image (with the same mounts and environment) before rolling out (core ADRs 0015 and 0020):
+
+  ```sh
+  openmettle-api --check-auth-config /etc/openmettle/auth/auth.json
+  ```
+
+  Note that `--check-auth-config` accepts **both** version-1 and version-2 documents (because it validates files offline), whereas serving through `OPENMETTLE_API_AUTH_CONFIG` **requires a version-2 document** containing the `browser` profile and exits `78` on a version-1 document (core ADR 0025). The chart does not add a pre-upgrade `--check-auth-config` hook in I5; an invalid mounted document fails API startup with exit `78` before the listener binds.
+- **No live reload.** Core reads the auth document, login keys and CA bundle once at startup (core ADR 0025). After updating the ConfigMap, Secret or provider CA bundle, restart the API Deployment (`kubectl rollout restart deployment/<fullname>-api`). For login-key rotation, follow core ADR 0015's staged procedure: add the new 32-byte key to `decrypt_only` and roll out; promote it to `active` and roll out; remove the retired key after the maximum login lifetime plus rollout overlap.
+- **Database prerequisites.** Passing `--check-auth-config` validates local files only and makes no database or provider request. Before sign-in requests can succeed, provision the durable provider authority and active revision (core ADR 0012), configure the login admission limit (core ADR 0014; an unset limit refuses every initiation), and create home invitations where required (core ADR 0022).
+- **Mandatory exposure gates.** Enabling `auth.enabled: true` mounts sign-in routes on the API container port, but does not by itself satisfy core ADR 0025's exposure gates. Before routing external traffic to sign-in, complete the TLS, path-preservation, body-limit and verified Ingress/Traefik access-log redaction steps in [Ingress and TLS](#ingress-and-tls).
+- **Native sign-in is not mounted.** Core ADR 0025 mounts browser sign-in only; native sign-in (core ADR 0023) remains unmounted.
+
 ## Schema migration
 
 Core runs migrations once per release, before new API and worker pods start (core ADR 0003). The chart does this with a Helm hook Job:
@@ -262,6 +301,7 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 | App namespace enforces Pod Security `restricted` | Yes |
 | NetworkPolicy enforced under namespace default-deny | Yes (implemented in I3; hosted kind run pending CI) |
 | I4 artifact volume, database CA, Ingress, PDB | No. Off in the smoke run; render tests and kubeconform only |
+| I5 browser sign-in / OIDC mounts & API OIDC egress | No. Off in the smoke run; render tests and kubeconform only |
 | Registry pulls, TLS to PostgreSQL, ingress controller, multi-node | No (owner's qualification) |
 
 The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch the chart or the harness, and on manual dispatch. The I2 checks passed on [pull-request run 44505148955](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) (5 min 15 s), which tested the merge of `b8f2d79` into `main`; the workflow has not yet run on `main`, and the I3 NetworkPolicy checks have not yet run on a hosted kind cluster until pushed to CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
@@ -270,6 +310,6 @@ The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs o
 
 - **I2/I3:** hosted `kind-smoke` verification of I3 NetworkPolicy enforcement (including whether kind v0.33 kindnet enforces policies live) on pull-request CI and `main`, and owner acceptance.
 - **I4 (render contract delivered):** live verification of the artifact volume (StorageClass binding, `fsGroup`), the database CA against TLS-enabled PostgreSQL, the API PDB during a drain, and the Ingress behind Traefik, including the access-log [acceptance check](#ingress-and-tls). None has run on a cluster.
-- **I5 / V1-04:** OIDC and auth settings, login key mounts, a `--check-auth-config` hook and identity-provider egress. No auth values are accepted yet.
+- **I5 (render contract delivered):** live cluster qualification of `auth` mounts, Secret `0440`/`fsGroup: 65532` readability and `networkPolicy.api.oidc` egress against a real OIDC provider (such as Keycloak); optional pre-upgrade `--check-auth-config` hook if needed; and native sign-in runtime mounting (core ADR 0023).
 - **V1-20** (managed inference, accelerated tools) and **V1-06** (external providers or gateway): separate charts and releases, never subcharts of core.
 - Qualification on the owner's cluster is an owner action.

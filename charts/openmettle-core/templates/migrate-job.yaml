@@ -58,8 +58,8 @@ spec:
       serviceAccountName: {{ $serviceAccountName | quote }}
       automountServiceAccountToken: false
       enableServiceLinks: false
-      {{- $volumes := dict "root" . "artifacts" false }}
-      {{- include "openmettle-core.podSecurityContext" (dict "storage" false) | nindent 6 }}
+      {{- $volumes := dict "root" . "artifacts" false "auth" false }}
+      {{- include "openmettle-core.podSecurityContext" (dict "storage" false "auth" false) | nindent 6 }}
       {{- with .Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
