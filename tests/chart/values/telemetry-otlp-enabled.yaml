@@ -1,0 +1,13 @@
+# Synthetic overlay on minimal.yaml: OTLP trace export enabled alone (default logging null,
+# no artifacts volume, no database CA, no auth, no optional OTLP CA bundle, no privateRanges)
+# with default OTLP collector port (4318).
+telemetry:
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+networkPolicy:
+  telemetry:
+    otlp:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.30/32

@@ -1,0 +1,18 @@
+# Synthetic overlay on minimal.yaml: OTLP trace export and logging overrides enabled without
+# the chart's NetworkPolicies, so networkPolicy.telemetry.otlp.to is not required.
+networkPolicy:
+  enabled: false
+  database:
+    to: []
+telemetry:
+  logging:
+    format: text
+    level: warn
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+    privateRanges:
+      - 10.43.0.0/16
+    caBundle:
+      enabled: true
+      configMapName: example-otlp-ca

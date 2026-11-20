@@ -112,6 +112,18 @@ networkPolicy:
       - ipBlock:
           cidr: 2001:db8::/64
     port: 5433
+  telemetry:
+    otlp:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: example-observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: example-alloy
+        - ipBlock:
+            cidr: 198.51.100.60/32
+      port: 4319
 storage:
   artifacts:
     enabled: true
@@ -138,3 +150,18 @@ auth:
     enabled: true
     configMapName: example-oidc-ca
     key: idp-ca.pem
+# Reserved synthetic telemetry logging and OTLP trace export values (I6).
+telemetry:
+  logging:
+    format: text
+    level: debug
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.observability.example.test:4319/v1/traces
+    privateRanges:
+      - 10.43.0.0/16
+      - fd00:10::/64
+    caBundle:
+      enabled: true
+      configMapName: example-otlp-ca
+      key: collector-ca.pem

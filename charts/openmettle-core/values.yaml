@@ -158,6 +158,13 @@ networkPolicy:
     # Rendering fails if this is empty while enabled, because an empty list would allow any destination.
     to: []
     port: 5432
+  telemetry:
+    otlp:
+      # Required when telemetry.otlp.enabled and networkPolicy.enabled are true: OTLP collector
+      # peers that api and worker (never migrate) may reach on TCP `port` (default 4318).
+      # Must stay empty while telemetry.otlp.enabled is false so unused egress is never opened.
+      to: []
+      port: 4318
 
 storage:
   # Optional artifact volume, mounted read-write at /var/lib/openmettle/artifacts in api and worker
@@ -212,3 +219,31 @@ auth:
     enabled: false
     configMapName: ""
     key: ca.crt
+
+telemetry:
+  logging:
+    # Optional OPENMETTLE_<ROLE>_LOG_FORMAT ("json" or "text") and OPENMETTLE_<ROLE>_LOG_LEVEL
+    # ("error", "warn", "info", or "debug"; "trace" is intentionally refused by core ADR 0024).
+    # When null/unset, no LOG_* env vars are emitted and core uses its defaults (json / info).
+    format: null
+    level: null
+  otlp:
+    # Optional OTLP/HTTP protobuf trace export for api and worker only (core ADR 0026).
+    # Off by default: when false, no OTLP_* env vars, CA mounts or collector egress are rendered.
+    # openmettle-migrate is stderr-only and never receives OTLP settings, CA mounts or egress.
+    enabled: false
+    # Required when enabled: canonical HTTPS URL with a DNS host (no http://, no IP literal,
+    # no credentials, no query or fragment). Passed via OPENMETTLE_{API,WORKER}_OTLP_TRACES_ENDPOINT.
+    tracesEndpoint: ""
+    # Optional list of up to 32 unique canonical private CIDR strings (RFC 1918, CGNAT or ULA)
+    # joined with commas into OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES when non-empty.
+    # Must stay empty while telemetry.otlp.enabled is false.
+    privateRanges: []
+    # Optional CA bundle for verifying private/cluster-CA OTLP collectors (e.g. in-cluster Alloy).
+    # Existing ConfigMap key mounted read-only at sibling directory /etc/openmettle/otlp-ca/ca.crt
+    # in api and worker pods only (never migrate), setting OPENMETTLE_{API,WORKER}_OTLP_CA_FILE.
+    # The chart never creates ConfigMaps or Secrets. Must stay disabled when telemetry.otlp.enabled is false.
+    caBundle:
+      enabled: false
+      configMapName: ""
+      key: ca.crt

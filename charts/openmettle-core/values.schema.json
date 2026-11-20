@@ -3,7 +3,7 @@
   "title": "openmettle-core chart values",
   "type": "object",
   "additionalProperties": false,
-  "required": ["images", "database", "api", "worker", "migration", "networkPolicy", "storage", "ingress", "auth"],
+  "required": ["images", "database", "api", "worker", "migration", "networkPolicy", "storage", "ingress", "auth", "telemetry"],
   "properties": {
     "images": {
       "type": "object",
@@ -139,7 +139,7 @@
     "networkPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "api", "dns", "database"],
+      "required": ["enabled", "api", "dns", "database", "telemetry"],
       "properties": {
         "enabled": {"type": "boolean"},
         "api": {
@@ -175,6 +175,23 @@
           "properties": {
             "to": {"$ref": "#/$defs/networkPolicyPeers"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["otlp"],
+          "properties": {
+            "otlp": {
+              "description": "OTLP collector peers reachable from api and worker pods only (never migrate). Required while telemetry.otlp.enabled and networkPolicy.enabled are true; must be empty while telemetry.otlp.enabled is false.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "port"],
+              "properties": {
+                "to": {"$ref": "#/$defs/networkPolicyPeers"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            }
           }
         }
       }
@@ -293,9 +310,89 @@
           }
         }
       }
+    },
+    "telemetry": {
+      "description": "Optional structured logging overrides across all roles (core ADR 0024) and OTLP/HTTP protobuf trace export for api and worker only (core ADR 0026).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logging", "otlp"],
+      "properties": {
+        "logging": {
+          "description": "Optional OPENMETTLE_<ROLE>_LOG_FORMAT and OPENMETTLE_<ROLE>_LOG_LEVEL for api, worker and migrate. Null or unset emits no LOG_* env vars.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "format": {"enum": [null, "json", "text"]},
+            "level": {"enum": [null, "error", "warn", "info", "debug"]}
+          }
+        },
+        "otlp": {
+          "description": "Optional OTLP/HTTP protobuf trace export for api and worker only (never migrate). Off by default.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "tracesEndpoint", "privateRanges", "caBundle"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "tracesEndpoint": {"$ref": "#/$defs/optionalOtlpTracesEndpoint"},
+            "privateRanges": {
+              "description": "Up to 32 unique canonical private CIDRs (RFC 1918, CGNAT or ULA), joined with commas into OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES when non-empty. Must stay empty while telemetry.otlp.enabled is false.",
+              "type": "array",
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/cidr"}
+            },
+            "caBundle": {
+              "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/otlp-ca/ca.crt in api and worker pods only (never migrate).",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enabled", "configMapName", "key"],
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+                "key": {"$ref": "#/$defs/configMapKey"}
+              },
+              "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+              "then": {"properties": {"configMapName": {"minLength": 1}}}
+            }
+          },
+          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+          "then": {
+            "properties": {
+              "tracesEndpoint": {"minLength": 1}
+            }
+          },
+          "else": {
+            "properties": {
+              "tracesEndpoint": {"const": ""},
+              "privateRanges": {"maxItems": 0},
+              "caBundle": {
+                "properties": {
+                  "enabled": {"const": false}
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "$defs": {
+    "otlpTracesEndpoint": {
+      "description": "Canonical HTTPS URL with a lowercase DNS host (at least two labels), optional non-default port and path; no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments.",
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^https://([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(:[1-9][0-9]{0,4})?/[-A-Za-z0-9._~!$&'()*+,;=:/]*$",
+      "not": {
+        "anyOf": [
+          {"pattern": "^https://[0-9.]+(:|/)"},
+          {"pattern": "^https://[^/]+:443/"},
+          {"pattern": "/\\.\\.?(/|$)"}
+        ]
+      }
+    },
+    "optionalOtlpTracesEndpoint": {
+      "anyOf": [{"const": ""}, {"$ref": "#/$defs/otlpTracesEndpoint"}]
+    },
     "hostname": {
       "description": "Lowercase DNS name with at least two labels; no wildcard, port or IP address.",
       "type": "string",
