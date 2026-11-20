@@ -36,16 +36,7 @@
         "connectionBudget": {"type": ["integer", "null"], "minimum": 1},
         "caBundle": {
           "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/db-ca/ca.crt in api, worker and migrate pods.",
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["enabled", "configMapName", "key"],
-          "properties": {
-            "enabled": {"type": "boolean"},
-            "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
-            "key": {"$ref": "#/$defs/configMapKey"}
-          },
-          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
-          "then": {"properties": {"configMapName": {"minLength": 1}}}
+          "$ref": "#/$defs/caBundle"
         }
       }
     },
@@ -286,16 +277,7 @@
         "loginKeysSecretName": {"$ref": "#/$defs/optionalDnsSubdomain"},
         "providerCaBundle": {
           "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/auth-ca/ca.crt in the API pod only.",
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["enabled", "configMapName", "key"],
-          "properties": {
-            "enabled": {"type": "boolean"},
-            "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
-            "key": {"$ref": "#/$defs/configMapKey"}
-          },
-          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
-          "then": {"properties": {"configMapName": {"minLength": 1}}}
+          "$ref": "#/$defs/caBundle"
         }
       },
       "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
@@ -348,16 +330,7 @@
             },
             "caBundle": {
               "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/otlp-ca/ca.crt in api and worker pods only (never migrate).",
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["enabled", "configMapName", "key"],
-              "properties": {
-                "enabled": {"type": "boolean"},
-                "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
-                "key": {"$ref": "#/$defs/configMapKey"}
-              },
-              "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
-              "then": {"properties": {"configMapName": {"minLength": 1}}}
+              "$ref": "#/$defs/caBundle"
             }
           },
           "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
@@ -418,6 +391,18 @@
       "maxLength": 253,
       "pattern": "^[-._a-zA-Z0-9]+$",
       "not": {"enum": [".", ".."]}
+    },
+    "caBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "configMapName", "key"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "key": {"$ref": "#/$defs/configMapKey"}
+      },
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {"properties": {"configMapName": {"minLength": 1}}}
     },
     "optionalIntOrPercent": {
       "anyOf": [

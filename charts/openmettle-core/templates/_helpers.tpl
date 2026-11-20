@@ -133,12 +133,7 @@ volumes:
       claimName: {{ include "openmettle-core.artifactsClaimName" .root | quote }}
   {{- end }}
   {{- if $ca.enabled }}
-  - name: db-ca
-    configMap:
-      name: {{ required "database.caBundle.configMapName is required when database.caBundle.enabled is true" $ca.configMapName | quote }}
-      items:
-        - key: {{ $ca.key | quote }}
-          path: ca.crt
+  {{- include "openmettle-core.caBundleVolume" (dict "name" "db-ca" "path" "database.caBundle" "bundle" $ca) | nindent 2 }}
   {{- end }}
   {{- if $mountAuth }}
   - name: auth-config
@@ -154,22 +149,21 @@ volumes:
       defaultMode: 288
   {{- end }}
   {{- if $mountProviderCa }}
-  - name: auth-provider-ca
-    configMap:
-      name: {{ required "auth.providerCaBundle.configMapName is required when auth.providerCaBundle.enabled is true" $auth.providerCaBundle.configMapName | quote }}
-      items:
-        - key: {{ $auth.providerCaBundle.key | quote }}
-          path: ca.crt
+  {{- include "openmettle-core.caBundleVolume" (dict "name" "auth-provider-ca" "path" "auth.providerCaBundle" "bundle" $auth.providerCaBundle) | nindent 2 }}
   {{- end }}
   {{- if $mountOtlpCa }}
-  - name: otlp-ca
-    configMap:
-      name: {{ required "telemetry.otlp.caBundle.configMapName is required when telemetry.otlp.caBundle.enabled is true" $otlp.caBundle.configMapName | quote }}
-      items:
-        - key: {{ $otlp.caBundle.key | quote }}
-          path: ca.crt
+  {{- include "openmettle-core.caBundleVolume" (dict "name" "otlp-ca" "path" "telemetry.otlp.caBundle" "bundle" $otlp.caBundle) | nindent 2 }}
   {{- end }}
 {{- end }}
+{{- end -}}
+
+{{- define "openmettle-core.caBundleVolume" -}}
+- name: {{ .name }}
+  configMap:
+    name: {{ required (printf "%s.configMapName is required when %s.enabled is true" .path .path) .bundle.configMapName | quote }}
+    items:
+      - key: {{ .bundle.key | quote }}
+        path: ca.crt
 {{- end -}}
 
 {{- define "openmettle-core.volumeMounts" -}}
@@ -291,15 +285,7 @@ lists must not be empty while the NetworkPolicies are rendered.
 Database CA bundle. The key selects one ConfigMap entry; it is mounted under the fixed file name
 ca.crt, so the key never becomes a path. The checks repeat the schema for --skip-schema-validation.
 */ -}}
-{{- $ca := .Values.database.caBundle -}}
-{{- if $ca.enabled -}}
-{{- if not $ca.configMapName -}}
-{{- fail "database.caBundle.configMapName is required when database.caBundle.enabled is true (an existing ConfigMap holding the PEM CA bundle)" -}}
-{{- end -}}
-{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $ca.key))) (has (toString $ca.key) (list "." "..")) -}}
-{{- fail "database.caBundle.key must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
-{{- end -}}
-{{- end -}}
+{{- include "openmettle-core.validate.caBundle" (dict "path" "database.caBundle" "bundle" .Values.database.caBundle) -}}
 {{- /*
 Artifact volume: exactly one source. The chart-owned settings would be silently ignored for an
 existing claim, so they are rejected there.
@@ -431,20 +417,11 @@ provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030
 {{- if not $auth.configMapName -}}
 {{- fail "auth.configMapName is required when auth.enabled is true (an existing ConfigMap holding the version-2 auth settings document)" -}}
 {{- end -}}
-{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $auth.configKey))) (has (toString $auth.configKey) (list "." "..")) -}}
-{{- fail "auth.configKey must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
-{{- end -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" "auth.configKey" "key" $auth.configKey) -}}
 {{- if not $auth.loginKeysSecretName -}}
 {{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
 {{- end -}}
-{{- if $auth.providerCaBundle.enabled -}}
-{{- if not $auth.providerCaBundle.configMapName -}}
-{{- fail "auth.providerCaBundle.configMapName is required when auth.providerCaBundle.enabled is true (an existing ConfigMap holding the PEM CA bundle)" -}}
-{{- end -}}
-{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $auth.providerCaBundle.key))) (has (toString $auth.providerCaBundle.key) (list "." "..")) -}}
-{{- fail "auth.providerCaBundle.key must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
-{{- end -}}
-{{- end -}}
+{{- include "openmettle-core.validate.caBundle" (dict "path" "auth.providerCaBundle" "bundle" $auth.providerCaBundle) -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
 {{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
 {{- end -}}
@@ -466,10 +443,7 @@ same login role twice (core exits 78) or mount a role's credential where it does
 {{- fail (printf "database.issuance must not reuse database.%s (Secret %q, key %q); session issuance needs its own openmettle_issuance login (core ADR 0030)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
 {{- end -}}
 {{- end -}}
-{{- $issuanceConnections := .Values.api.settings.issuanceDbMaxConnections -}}
-{{- if or (not (or (kindIs "int" $issuanceConnections) (kindIs "int64" $issuanceConnections) (kindIs "float64" $issuanceConnections))) (ne (float64 (int64 $issuanceConnections)) (float64 $issuanceConnections)) (lt (int64 $issuanceConnections) 1) (gt (int64 $issuanceConnections) 64) -}}
-{{- fail (printf "api.settings.issuanceDbMaxConnections (%v) must be an integer between 1 and 64" $issuanceConnections) -}}
-{{- end -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "api.settings.issuanceDbMaxConnections" "value" .Values.api.settings.issuanceDbMaxConnections "min" 1 "max" 64 "includeValueOnTypeError" true) -}}
 {{- else -}}
 {{- if .Values.database.issuance.existingSecret -}}
 {{- fail "database.issuance.existingSecret must be empty when auth.enabled is false; the issuance URL is mounted only with sign-in (core ADR 0030)" -}}
@@ -498,13 +472,7 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- fail "telemetry.logging.level must be null, \"error\", \"warn\", \"info\" or \"debug\" (\"trace\" is refused by core ADR 0024)" -}}
 {{- end -}}
 {{- end -}}
-{{- $otlpPort := .Values.networkPolicy.telemetry.otlp.port -}}
-{{- if not (or (kindIs "int" $otlpPort) (kindIs "int64" $otlpPort) (kindIs "float64" $otlpPort)) -}}
-{{- fail "networkPolicy.telemetry.otlp.port must be an integer between 1 and 65535" -}}
-{{- end -}}
-{{- if or (ne (float64 (int64 $otlpPort)) (float64 $otlpPort)) (lt (int64 $otlpPort) 1) (gt (int64 $otlpPort) 65535) -}}
-{{- fail (printf "networkPolicy.telemetry.otlp.port (%v) must be an integer between 1 and 65535" $otlpPort) -}}
-{{- end -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "networkPolicy.telemetry.otlp.port" "value" .Values.networkPolicy.telemetry.otlp.port "min" 1 "max" 65535) -}}
 {{- $otlp := .Values.telemetry.otlp -}}
 {{- if not (kindIs "string" $otlp.tracesEndpoint) -}}
 {{- fail "telemetry.otlp.tracesEndpoint must be a string" -}}
@@ -541,14 +509,7 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- $_ := set $seenRanges $cidr true -}}
 {{- end -}}
 {{- end -}}
-{{- if $otlp.caBundle.enabled -}}
-{{- if not $otlp.caBundle.configMapName -}}
-{{- fail "telemetry.otlp.caBundle.configMapName is required when telemetry.otlp.caBundle.enabled is true (an existing ConfigMap holding the PEM CA bundle)" -}}
-{{- end -}}
-{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $otlp.caBundle.key))) (has (toString $otlp.caBundle.key) (list "." "..")) -}}
-{{- fail "telemetry.otlp.caBundle.key must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" -}}
-{{- end -}}
-{{- end -}}
+{{- include "openmettle-core.validate.caBundle" (dict "path" "telemetry.otlp.caBundle" "bundle" $otlp.caBundle) -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.telemetry.otlp.to) -}}
 {{- fail "networkPolicy.telemetry.otlp.to must list at least one OTLP collector peer when telemetry.otlp.enabled and networkPolicy.enabled are true (an empty list would block OTLP export or allow egress to every destination)" -}}
 {{- end -}}
@@ -568,6 +529,33 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- if .Values.networkPolicy.telemetry.otlp.to -}}
 {{- fail "networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false; remove OTLP egress peers or enable telemetry.otlp" -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "field" <path> "key" <value> */}}
+{{- define "openmettle-core.validate.configMapKey" -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString .key))) (has (toString .key) (list "." "..")) -}}
+{{- fail (printf "%s must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" .field) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "path" <prefix> "bundle" <map> */}}
+{{- define "openmettle-core.validate.caBundle" -}}
+{{- if .bundle.enabled -}}
+{{- if not .bundle.configMapName -}}
+{{- fail (printf "%s.configMapName is required when %s.enabled is true (an existing ConfigMap holding the PEM CA bundle)" .path .path) -}}
+{{- end -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" (printf "%s.key" .path) "key" .bundle.key) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "field" <path> "value" <val> "min" <int> "max" <int> ["includeValueOnTypeError" <bool>] */}}
+{{- define "openmettle-core.validate.intRange" -}}
+{{- if not (or (kindIs "int" .value) (kindIs "int64" .value) (kindIs "float64" .value)) -}}
+{{- fail (printf "%s%s must be an integer between %d and %d" .field (ternary (printf " (%v)" .value) "" (default false .includeValueOnTypeError)) (int64 .min) (int64 .max)) -}}
+{{- end -}}
+{{- if or (ne (float64 (int64 .value)) (float64 .value)) (lt (int64 .value) (int64 .min)) (gt (int64 .value) (int64 .max)) -}}
+{{- fail (printf "%s (%v) must be an integer between %d and %d" .field .value (int64 .min) (int64 .max)) -}}
 {{- end -}}
 {{- end -}}
 
