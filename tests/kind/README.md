@@ -2,7 +2,7 @@
 
 `smoke.py` installs `charts/openmettle-core` on a temporary [kind](https://kind.sigs.k8s.io/) cluster classified `dev`. The images are core's `api`, `worker` and `migrate` targets, built from a pinned core commit and referenced by digest. It is a test harness, not an installer. Nothing is pushed, published or applied to any other cluster.
 
-**Status:** all 10 checks (I2 install/upgrade/uninstall, I3 namespace default-deny and live NetworkPolicy enforcement, and I7 enabled-profile upgrade) passed on hosted `kind-smoke.yml` CI in PR #12 and PR #13 (~3 min 20 s on core `e5ff673`). Pinning `CORE_COMMIT` to `a93a277` exercises the same 10 checks against core migration 15. The cluster-free tests in `test_smoke.py` cover the harness's own logic, including its orchestration against a recording fake cluster; they are not evidence that the chart installs or that kindnet enforces NetworkPolicy.
+**Status:** all 10 checks (I2 install/upgrade/uninstall, I3 namespace default-deny and live NetworkPolicy enforcement, and I7 enabled-profile upgrade) passed on hosted `kind-smoke.yml` CI on core `e5ff673` in PR #12 and PR #13 (~3 min 20 s). Hosted `kind-smoke.yml` verification for the bumped `CORE_COMMIT` pin `a93a277` (core migration 15) is pending CI on PR #14. The cluster-free tests in `test_smoke.py` cover the harness's own logic, including its orchestration against a recording fake cluster; they are not evidence that the chart installs or that kindnet enforces NetworkPolicy.
 
 ## What a passing run shows
 

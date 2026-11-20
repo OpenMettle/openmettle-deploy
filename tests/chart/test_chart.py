@@ -1166,15 +1166,25 @@ class WorkstationProfileTest(unittest.TestCase):
         self.assertEqual(pvc["accessModes"], ["ReadWriteOnce"])
         for role, pod in pods(self.docs):
             env = env_map(pod["containers"][0])
-            self.assertIn("db-ca", volumes(pod), role)
+            vols = set(volumes(pod))
+            self.assertIn("db-ca", vols, role)
+            self.assertEqual(env[PREFIX[role] + "LOG_FORMAT"]["value"], "json")
+            self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"]["value"], "info")
             if role == "api":
-                self.assertLessEqual(AUTH_VOLUMES, set(volumes(pod)))
+                self.assertEqual(env["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
+                self.assertLessEqual(AUTH_VOLUMES, vols)
             else:
-                self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
+                self.assertFalse(AUTH_VOLUMES & vols, role)
+                self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
             if role in ("api", "worker"):
-                self.assertIn("otlp-ca", volumes(pod), role)
+                self.assertIn("artifacts", vols, role)
+                self.assertIn("otlp-ca", vols, role)
+                self.assertEqual(env[PREFIX[role] + "OTLP_TRACES_ENDPOINT"]["value"],
+                                 "https://alloy.workstation.example.test:4318/v1/traces")
             else:
-                self.assertNotIn("otlp-ca", volumes(pod))
+                self.assertNotIn("artifacts", vols)
+                self.assertNotIn("otlp-ca", vols)
+                self.assertFalse([k for k in env if "OTLP" in k])
         self.assertEqual(len(find(self.docs, "NetworkPolicy", "-api")["spec"]["egress"]), 4)
         self.assertEqual(len(find(self.docs, "NetworkPolicy", "-worker")["spec"]["egress"]), 3)
         self.assertEqual(len(find(self.docs, "NetworkPolicy", "-migrate")["spec"]["egress"]), 2)
