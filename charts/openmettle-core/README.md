@@ -78,7 +78,7 @@ The chart refuses to render until you supply:
 | `ingress.tls` | `[]` | Required while enabled: `{secretName, hosts}` entries naming existing TLS Secrets. Every host must be covered |
 | `api.podDisruptionBudget.enabled` | `false` | See [API PodDisruptionBudget](#api-poddisruptionbudget) |
 | `api.podDisruptionBudget.{minAvailable,maxUnavailable}` | `null` | Exactly one while enabled: an integer or `"<0–100>%"` |
-| `auth.enabled` | `false` | Enable browser sign-in / OIDC configuration for the API only; see [Browser sign-in / OIDC](#browser-sign-in--oidc) |
+| `auth.enabled` | `false` | Enable browser and optional native sign-in / OIDC plus authenticated `/v1/*` routes for the API only; see [Browser sign-in / OIDC](#browser-sign-in--oidc) |
 | `auth.configMapName` | `""` | Required while enabled: existing ConfigMap holding a version-2 auth settings document |
 | `auth.configKey` | `auth.json` | ConfigMap key projected read-only at `/etc/openmettle/auth/auth.json` |
 | `auth.loginKeysSecretName` | `""` | Required while enabled: existing Secret holding raw 32-byte login key files, mounted read-only at `/etc/openmettle/auth-keys` |
@@ -215,7 +215,7 @@ On K3s's bundled Traefik, pass them through a `HelmChartConfig` named `traefik` 
 
 **Body size, timeouts and TLS (Traefik).**
 
-- **Body limit.** Core refuses initiation bodies over 256 bytes and every other login body that is not empty (ADR 0018). The ingress limit is defence in depth and must allow the routes you expose. A Traefik `Middleware` in the release namespace, created by the operator:
+- **Body limit.** Core refuses browser initiation bodies over 256 bytes, native token/logout form bodies over their fixed bounds, and `/v1/*` JSON request bodies over 64 KiB (`65536` bytes; core ADRs 0018, 0027 and 0029). The ingress limit is defence in depth and must allow the routes you expose. A Traefik `Middleware` in the release namespace, created by the operator:
 
   ```yaml
   apiVersion: traefik.io/v1alpha1
@@ -244,7 +244,7 @@ On K3s's bundled Traefik, pass them through a `HelmChartConfig` named `traefik` 
 
 ## Browser sign-in / OIDC
 
-`auth` exposes core ADR 0025's opt-in browser sign-in runtime mounting for `openmettle-api`. It is **off by default** (`auth.enabled: false`): when disabled, `OPENMETTLE_API_AUTH_CONFIG` is unset, no auth volumes or OIDC egress rules are rendered, and the API serves `/healthz` and `/readyz` only (`404` on every sign-in path).
+`auth` exposes core ADRs 0025, 0027 and 0029's opt-in sign-in and authenticated `/v1/*` runtime mounting for `openmettle-api`. It is **off by default** (`auth.enabled: false`): when disabled, `OPENMETTLE_API_AUTH_CONFIG` is unset, no auth volumes or OIDC egress rules are rendered, and the API serves `/healthz` and `/readyz` only (`404` on every sign-in and `/v1/*` path).
 
 ### Mount paths and permissions (API only)
 
@@ -257,7 +257,7 @@ The chart never creates ConfigMaps or Secrets. Every file comes from a pre-exist
 | `auth.providerCaBundle.{configMapName,key}` (optional, default `ca.crt`) | `auth-provider-ca` | `/etc/openmettle/auth-ca/ca.crt` (dir `/etc/openmettle/auth-ca`) | Projected via `items` as `ca.crt`; reference in `providers[].trust` as `{"roots": "bundle", "bundle_path": "/etc/openmettle/auth-ca/ca.crt"}` |
 
 - **Non-overlapping sibling directories.** The three mounts sit side by side under `/etc/openmettle/` (`/etc/openmettle/auth`, `/etc/openmettle/auth-keys`, `/etc/openmettle/auth-ca`, alongside `/etc/openmettle/db-ca`). Kubernetes mounts ConfigMap volumes read-only, so nesting another volume inside `/etc/openmettle/auth` (such as `/etc/openmettle/auth/keys`) would fail container startup with `EROFS` when the runtime attempts to create the nested mountpoint. The `/etc/openmettle/auth-keys/<file>` path also matches core ADR 0015's document example.
-- **Why `worker` and `migrate` never mount auth or receive OIDC egress.** Core ADR 0025 restricts `OPENMETTLE_API_AUTH_CONFIG` to `openmettle-api`. Neither `openmettle-worker` nor `openmettle-migrate` serves sign-in routes, reads login keys or contacts an identity provider. Keeping the ConfigMap, login-keys Secret, provider CA and `networkPolicy.api.oidc` egress rule strictly on the API pod preserves least privilege so a worker or migration job never has access to login-key material or provider reachability.
+- **Why `worker` and `migrate` never mount auth or receive OIDC egress.** Core ADRs 0025, 0027 and 0029 restrict `OPENMETTLE_API_AUTH_CONFIG` to `openmettle-api`. Neither `openmettle-worker` nor `openmettle-migrate` serves sign-in or `/v1/*` routes, reads login keys or contacts an identity provider. Keeping the ConfigMap, login-keys Secret, provider CA and `networkPolicy.api.oidc` egress rule strictly on the API pod preserves least privilege so a worker or migration job never has access to login-key material or provider reachability.
 - **Strict guards.** When `auth.enabled` is true, `auth.configMapName` and `auth.loginKeysSecretName` are required, and while `networkPolicy.enabled` is true `networkPolicy.api.oidc.to` must list at least one OIDC provider peer (on TCP `networkPolicy.api.oidc.port`, default `443`, configurable `1`–`65535` for self-hosted providers such as Keycloak on `8443`). When `auth.enabled` is false, `auth.providerCaBundle.enabled: true` and non-empty `networkPolicy.api.oidc.to` are both rejected so unused CA mounts or egress rules are never silently left behind.
 
 ### Offline validation, rollout and prerequisites
@@ -272,11 +272,11 @@ The chart never creates ConfigMaps or Secrets. Every file comes from a pre-exist
 - **No live reload.** Core reads the auth document, login keys and CA bundle once at startup (core ADR 0025). After updating the ConfigMap, Secret or provider CA bundle, restart the API Deployment (`kubectl rollout restart deployment/<fullname>-api`). For login-key rotation, follow core ADR 0015's staged procedure: add the new 32-byte key to `decrypt_only` and roll out; promote it to `active` and roll out; remove the retired key after the maximum login lifetime plus rollout overlap.
 - **Database prerequisites.** Passing `--check-auth-config` validates local files only and makes no database or provider request. Before sign-in requests can succeed, provision the durable provider authority and active revision (core ADR 0012), configure the login admission limit (core ADR 0014; an unset limit refuses every initiation), and create home invitations where required (core ADR 0022).
 - **Mandatory exposure gates.** Enabling `auth.enabled: true` mounts sign-in routes on the API container port, but does not by itself satisfy core ADR 0025's exposure gates. Before routing external traffic to sign-in, complete the TLS, path-preservation, body-limit and verified Ingress/Traefik access-log redaction steps in [Ingress and TLS](#ingress-and-tls).
-- **Native sign-in is not mounted.** Core ADR 0025 mounts browser sign-in only; native sign-in (core ADR 0023) remains unmounted.
+- **Optional native sign-in and `/v1/*` application routes.** When `OPENMETTLE_API_AUTH_CONFIG` is set to a version-2 document (minimum `openmettle-core` commit `adef30a`), `openmettle-api` mounts browser sign-in (core ADR 0025), the 15 authenticated `/v1/*` application operations over browser cookies with `Origin` CSRF binding (core ADR 0027), and—when the optional `"native"` profile is present in the document—the five `/auth/native/{authorize,callback,token,session,logout}` routes plus native bearer-token authentication on `/v1/*` (core ADR 0029). Sign-in routes, provider/native callbacks and same-origin app links cannot use `/healthz`, `/readyz`, `/v1` or `/v1/*`.
 
 ## Telemetry / OTLP trace and metrics export
 
-`telemetry` exposes core ADR 0024's structured stderr logging settings across all three roles (minimum `openmettle-core` commit `13c5227`) and core ADRs 0026 and 0028's opt-in OTLP/HTTP protobuf trace and metrics export for `openmettle-api` and `openmettle-worker` (minimum `openmettle-core` commits `ac047ec` for traces and `67f4fc2` for metrics); all are satisfied by the chart's pinned core commit `b5ee68d`. Both leave default renders completely unchanged (`telemetry.logging.{format,level}: null` and `telemetry.otlp.enabled: false`).
+`telemetry` exposes core ADR 0024's structured stderr logging settings across all three roles (minimum `openmettle-core` commit `13c5227`) and core ADRs 0026 and 0028's opt-in OTLP/HTTP protobuf trace and metrics export for `openmettle-api` and `openmettle-worker` (minimum `openmettle-core` commits `ac047ec` for traces and `67f4fc2` for metrics); all are satisfied by the chart's pinned core commit `adef30a`. Both leave default renders completely unchanged (`telemetry.logging.{format,level}: null` and `telemetry.otlp.enabled: false`).
 
 ### Structured logging (`telemetry.logging`, all roles)
 
@@ -321,9 +321,9 @@ python3 -m unittest discover -s tests/chart -v  # policy, negative-case and cont
 
 Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim; `render.sh` fails on any other Helm version. The chart sets no `kubeVersion` floor.
 
-### Kind smoke test (I2/I3/I7)
+### Kind smoke test (I2/I3/I7/I10)
 
-[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `b5ee68d`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
+[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `adef30a`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
 
 | Item | Smoke-tested |
 | --- | --- |
@@ -331,24 +331,24 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 | Migration hook completes before the Deployments roll out | Yes (under namespace default-deny) |
 | API and worker Ready; `/readyz` 200 | Yes |
 | Worker scales to 2 while the API stays at 1 | Yes, through `worker.replicas` |
-| No optional package present (default install) | Yes |
+| No optional package present (default install; `/auth/*` and `/v1/*` answer `404`) | Yes |
 | Same-digest `helm upgrade` reruns migrate as a no-op and stays Ready | Yes |
-| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`) | Yes (checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount, and ADR 0024 JSON/debug stderr logs on `api` and `worker`) |
+| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`, `auth.enabled: true` with `browser` + `native` v2 profile) | Yes (checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount, API-only `auth` mounts + `0440`/`fsGroup: 65532` `openmettle-api --check-auth-config`, live `/auth/session` `403`, `/auth/native/session` `403` & `/v1/capabilities` `401` problem JSON body (`code: "unauthenticated"`), and ADR 0024 JSON/debug stderr logs on `api` and `worker`) |
 | `helm uninstall` leaves no non-kept release objects | Yes (release Deployments, Services, NetworkPolicies and PDB removed; chart-owned artifact PVC kept via `helm.sh/resource-policy: keep`) |
 | App namespace enforces Pod Security `restricted` | Yes |
 | NetworkPolicy enforced under namespace default-deny | Yes |
 | I4 database CA against TLS PostgreSQL, Ingress behind Traefik, multi-node/drain eviction | No (render tests and kubeconform only; owner's qualification) |
-| I5 browser sign-in / OIDC mounts & API OIDC egress | No. Off in the smoke run; render tests and kubeconform only |
+| I5/I10 live OIDC provider exchange (`networkPolicy.api.oidc` to an external/in-cluster IdP) | Mounts, `0440`/`fsGroup: 65532` key readability and `/auth/*` + `/v1/*` route mounting are smoke-tested in I10; live OIDC provider exchange is qualified in core `oidc-qualification.yml` and pending owner cluster qualification |
 | I6/I9 OTLP trace & metrics export (`api`/`worker` CA mount & collector egress) | No. Off in the chart smoke run (qualified in core `telemetry-qualification.yml`); chart render tests and kubeconform only |
 | Registry pulls, TLS to PostgreSQL, ingress controller, multi-node | No (owner's qualification) |
 
-The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch `CORE_COMMIT`, the chart or the harness, and on manual dispatch. All 10 checks—including I2 install/upgrade/uninstall, I3 NetworkPolicy enforcement and I7 enabled-profile upgrade—passed on hosted `kind-smoke` CI on core `e5ff673` (PR #12 and PR #13) and `a93a277` (`main`, ~3 min 20 s); hosted `kind-smoke` verification for the bumped pin `b5ee68d` (including core migration 16 and telemetry contract v1) runs on this pull request (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch `CORE_COMMIT`, the chart or the harness, and on manual dispatch. All 10 checks—including I2 install/upgrade/uninstall, I3 NetworkPolicy enforcement, I7 enabled-profile upgrade, I9 core `b5ee68d` (`main`, PR #15) and I10 core `adef30a` (adding default-off `404` checks plus enabled-profile `auth.enabled: true` mounts, `--check-auth-config` and `/auth/*` + `/v1/*` route checks; [pull-request run 44761077005](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44761077005))—passed on hosted `kind-smoke` CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
-- **I2/I3/I7/I8/I9:** hosted `kind-smoke` verification on core `b5ee68d` (including migration 16) and owner acceptance.
+- **I2/I3/I7/I8/I9/I10:** owner acceptance (hosted `kind-smoke` verification on core `adef30a`, including `auth` + `/v1/*` smoke checks, passed in [run 44761077005](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44761077005)).
 - **I4 (render contract delivered; API PDB and single-node RWO artifact PVC added to I7 kind smoke):** live verification of the database CA against TLS-enabled PostgreSQL, the API PDB during a real node drain, `ReadWriteMany` multi-node artifact storage, and the Ingress behind Traefik, including the access-log [acceptance check](#ingress-and-tls).
-- **I5 (render contract delivered):** live cluster qualification of `auth` mounts, Secret `0440`/`fsGroup: 65532` readability and `networkPolicy.api.oidc` egress against a real OIDC provider (such as Keycloak); optional pre-upgrade `--check-auth-config` hook if needed; and native sign-in runtime mounting (core ADR 0023).
+- **I5/I10 (render contract delivered; API-only `auth` mounts, Secret `0440`/`fsGroup: 65532` `--check-auth-config` readability and `/auth/*` + `/v1/*` route mounting added to I10 kind smoke):** live cluster qualification of `networkPolicy.api.oidc` egress and `auth.providerCaBundle` against a real OIDC provider (core's `oidc-qualification.yml` already qualifies browser and native sign-in against Keycloak 26.8.2; owner cluster qualification remains separate), plus an optional pre-upgrade `--check-auth-config` hook if needed.
 - **I6/I9 (render contract for `tracesEndpoint` + `metricsEndpoint` delivered; `telemetry.logging` `json`/`debug` added to I7 kind smoke):** chart-installed live cluster qualification of `telemetry.otlp` export, `/etc/openmettle/otlp-ca/ca.crt` trust verification and `networkPolicy.telemetry.otlp` egress against an OTLP/HTTP collector (core's own `telemetry-qualification.yml` already qualifies live Alloy + Prometheus ingestion on kind; owner cluster qualification remains separate).
 - **V1-20** (managed inference, accelerated tools) and **V1-06** (external providers or gateway): separate charts and releases, never subcharts of core.
 - Qualification on the owner's cluster is an owner action.

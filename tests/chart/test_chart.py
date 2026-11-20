@@ -50,7 +50,7 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at b5ee68d; this test does not read core.
+# from core src/lib.rs and src/migrate.rs at adef30a; this test does not read core.
 DEFAULT_ENV = {
     "api": {"BIND": "0.0.0.0:8080", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
     "worker": {"BIND": "0.0.0.0:8081", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
@@ -860,7 +860,7 @@ class PodDisruptionBudgetTest(Rendered):
 
 
 class AuthTest(Rendered):
-    """auth mounts browser sign-in / OIDC files and env into api only, never worker or migrate (core ADR 0025)."""
+    """auth mounts sign-in / OIDC and /v1/* route files and env into api only, never worker or migrate (core ADRs 0025, 0027 and 0029)."""
 
     def test_api_mounts_config_login_keys_optional_ca_and_env(self):
         """Fails if api lacks OPENMETTLE_API_AUTH_CONFIG, read-only directory mounts, 0440 Secret mode or fsGroup 65532."""

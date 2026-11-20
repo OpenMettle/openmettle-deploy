@@ -271,7 +271,7 @@
       }
     },
     "auth": {
-      "description": "Optional browser sign-in / OIDC configuration mounted into the API pod only (core ADR 0025). Never mounted into worker or migrate pods.",
+      "description": "Optional sign-in / OIDC and /v1/* application route configuration mounted into the API pod only (core ADRs 0025, 0027 and 0029). Never mounted into worker or migrate pods.",
       "type": "object",
       "additionalProperties": false,
       "required": ["enabled", "configMapName", "configKey", "loginKeysSecretName", "providerCaBundle"],

@@ -199,8 +199,9 @@ ingress:
   tls: []
 
 auth:
-  # Optional browser sign-in / OIDC configuration mounted into the API pod only (core ADR 0025).
-  # Off by default: when false, OPENMETTLE_API_AUTH_CONFIG is unset and no auth files are mounted.
+  # Optional sign-in / OIDC and /v1/* application route configuration mounted into the API pod only
+  # (core ADRs 0025, 0027 and 0029). Off by default: when false, OPENMETTLE_API_AUTH_CONFIG is unset,
+  # no auth files are mounted and the API answers 404 on every sign-in and /v1/* path.
   # The chart never creates ConfigMaps or Secrets, and never mounts auth config, login keys or the
   # provider CA into worker or migrate pods.
   enabled: false
