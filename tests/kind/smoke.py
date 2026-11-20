@@ -5,11 +5,13 @@ Test harness only; not an installer. It builds core's api, worker and migrate im
 pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
 migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
-(API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug structured logs, and
-API-only auth + /v1/* mounts and session issuance credential), uninstall (with chart-owned PVC
-preservation), absence of optional packages, issuance settings and unmounted 404 routes on
-default install, Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
-live cluster, Helm or database state. Core's process-contract assertions are not repeated
+(API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug structured logs,
+API-only auth + /v1/* mounts and session issuance credential, and a live /v1/artifacts upload,
+idempotent retry, revision and byte-range download round trip across both API replicas on the
+PVC), uninstall (with chart-owned PVC preservation), absence of optional packages, issuance
+settings and unmounted 404 routes on default install, migration 19 run-admission role grants,
+Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
+live cluster, Helm, HTTP or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
 
 Safety guards, tool and image pins are imported from core tests/kubernetes/qualify.py at
@@ -20,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -74,7 +78,28 @@ DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "o
 # Every PostgreSQL login the fixture provisions: one per image role, plus the API-only session
 # issuance login (core ADR 0030), which core migration 18 requires before it runs.
 DB_LOGINS = (*ROLES, "issuance")
-ISSUANCE_MIGRATION = 18  # core migrations/0018_session_issuance_role.sql
+# The newest core migration this pin must have applied: migrations/0019_run_admission_and_queue.sql
+# (V1-10, core ADR 0032), after 0018_session_issuance_role.sql (ADR 0030).
+REQUIRED_MIGRATION = 19
+RUN_DISPATCH_LOCK = "openmettle.run_dispatch_lock"
+# Migration 19 role boundaries, read live as the fixture superuser: each expression and its expected
+# value. The worker locks the singleton dispatch row through an inert column and records claims; the
+# API writes the admission decision with the run and never sees the dispatch lock.
+RUN_ADMISSION_CHECKS = (
+    (f"(SELECT count(*) = 1 AND bool_and(id AND NOT lock_guard) FROM {RUN_DISPATCH_LOCK})", True),
+    (f"has_table_privilege('openmettle_worker', '{RUN_DISPATCH_LOCK}', 'SELECT')", True),
+    (f"has_column_privilege('openmettle_worker', '{RUN_DISPATCH_LOCK}', 'lock_guard', 'UPDATE')", True),
+    (f"has_table_privilege('openmettle_worker', '{RUN_DISPATCH_LOCK}', 'UPDATE')", False),
+    ("has_column_privilege('openmettle_worker', 'openmettle.runs', 'claim_token', 'UPDATE')", True),
+    ("has_column_privilege('openmettle_worker', 'openmettle.runs', 'claimed_at', 'UPDATE')", True),
+    ("has_column_privilege('openmettle_worker', 'openmettle.runs', 'actor_approval_id', 'INSERT')", False),
+    ("has_column_privilege('openmettle_api', 'openmettle.runs', 'actor_approval_id', 'INSERT')", True),
+    ("has_column_privilege('openmettle_api', 'openmettle.runs', 'round_limit', 'INSERT')", True),
+    ("has_column_privilege('openmettle_api', 'openmettle.runs', 'queue_expires_at', 'INSERT')", True),
+    ("has_column_privilege('openmettle_api', 'openmettle.runs', 'claim_token', 'UPDATE')", False),
+    (f"has_any_column_privilege('openmettle_api', '{RUN_DISPATCH_LOCK}', 'SELECT')", False),
+    (f"has_any_column_privilege('openmettle_api', '{RUN_DISPATCH_LOCK}', 'UPDATE')", False),
+)
 ISSUANCE_URL_ENV = "OPENMETTLE_API_ISSUANCE_DATABASE_URL"
 ISSUANCE_POOL_ENV = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
 ISSUANCE_POOL = "2"  # chart default api.settings.issuanceDbMaxConnections
@@ -101,6 +126,30 @@ AUTH_CHECK_BINARY = "/usr/local/bin/openmettle-api"
 AUTH_CHECK_OK = "auth configuration valid (local files only)\n"
 MOUNTED_AUTH_HTTP = {"/auth/session": 403, "/auth/native/session": 403, "/v1/capabilities": 401}
 AUTH_ROUTE_PATHS = tuple(MOUNTED_AUTH_HTTP)
+AUTH_ORIGIN = "https://app.example.test"  # the synthetic browser origin; /v1 cookie requests send it
+# A synthetic browser session seeded in the fixture database as core's issuance stores it (core
+# sessions.rs and tests/schema/authz_runs.rs seeded_session), so /v1 runs without an OIDC provider.
+# The login provider is distinct from the auth document's: session validation reads only the database.
+SESSION_COOKIE = "__Host-openmettle-session"
+SESSION_DOMAIN = b"openmettle/session-secret/1\0"
+SESSION_EXPIRES_MS = 4102444800000  # 2100-01-01
+SESSION_ISSUER = "https://kind-smoke.example.test"
+SESSION_CLIENT = "kind-smoke"
+SESSION_IDS = {"provider": "00000000-0000-4000-8000-00000000a001", "user": "00000000-0000-4000-8000-00000000a002",
+               "identity": "00000000-0000-4000-8000-00000000a003", "approval": "00000000-0000-4000-8000-00000000a004"}
+# Uploads need configured storage limits (else 503 provisioning); max_bytes bounds each reservation.
+STORAGE_LIMIT_BYTES = 1 << 20
+ARTIFACT_MAX_BYTES = 1024
+ARTIFACT_FILENAME = "smoke.txt"
+ARTIFACT_MEDIA_TYPE = "text/plain"
+ARTIFACT_PAYLOADS = (b"openmettle-pvc-artifact-v1\n", b"openmettle-pvc-artifact-v2-0123456789")
+ARTIFACT_BOUNDARIES = ("openmettle-smoke-boundary-a", "openmettle-smoke-boundary-b")
+ARTIFACT_RANGE = (0, 9)
+UNSATISFIABLE_RANGE = "bytes=999999-"
+V1_API_VERSION = "1.0"  # every /v1 response's OpenMettle-API-Version (core ADR 0007)
+HTTP_TIMEOUT = 30
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+B64_ID = re.compile(r"[A-Za-z0-9_-]{43}")
 PROFILE_ROLLOUT_TIMEOUT = "180s"
 LOG_LEVELS = {"ERROR", "WARN", "INFO", "DEBUG"}
 # Matches core src/telemetry.rs FIELDS plus tracing-subscriber flattened JSON metadata.
@@ -342,7 +391,7 @@ def smoke_auth_document() -> dict:
         }],
         "browser": {
             "provider_id": provider_id,
-            "origin": "https://app.example.test",
+            "origin": AUTH_ORIGIN,
             "landing_path": "/home",
             "paths": {
                 "initiation": "/auth/login",
@@ -838,6 +887,169 @@ def evaluate_mounted_auth_http(responses: dict) -> dict:
     return {**MOUNTED_AUTH_HTTP, "v1_error_code": "unauthenticated"}
 
 
+def run_admission_sql() -> str:
+    return "SELECT " + ", ".join(expression for expression, _ in RUN_ADMISSION_CHECKS) + ";"
+
+
+def evaluate_run_admission(output: str) -> dict:
+    """Compare run_admission_sql()'s one psql -tA row with RUN_ADMISSION_CHECKS."""
+    observed = output.strip().split("|")
+    expected = ["t" if value else "f" for _, value in RUN_ADMISSION_CHECKS]
+    if len(observed) != len(expected):
+        raise SmokeFailure(f"migration 19 privilege query returned {output.strip()!r}")
+    wrong = [f"{expression} is {got!r}, expected {want!r}"
+             for (expression, _), got, want in zip(RUN_ADMISSION_CHECKS, observed, expected) if got != want]
+    if wrong:
+        raise SmokeFailure("migration 19 role boundary: " + "; ".join(wrong))
+    return {"dispatch_lock_singleton": True, "privileges_checked": len(RUN_ADMISSION_CHECKS) - 1}
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def session_credential(raw: bytes) -> tuple:
+    """(session id, cookie value, secret hash hex) from 64 random bytes, as core sessions.rs
+    create_with: the hash is SHA-256 over the domain and the length-framed id and secret."""
+    if len(raw) != 64:
+        raise ValueError("a session credential needs 64 random bytes")
+    session_id, secret = b64url(raw[:32]), raw[32:]
+    framed = SESSION_DOMAIN + b"".join(len(field).to_bytes(8, "big") + field
+                                       for field in (session_id.encode("ascii"), secret))
+    return session_id, f"{session_id}.{b64url(secret)}", hashlib.sha256(framed).hexdigest()
+
+
+def session_seed_sql(session_id: str, secret_hash: str, login_id: str) -> str:
+    """One personal-scope user with an active approval and a browser session stored as issuance
+    stores it, plus storage limits. Only the hash reaches the database, never the secret."""
+    if not (B64_ID.fullmatch(session_id) and B64_ID.fullmatch(login_id)
+            and re.fullmatch(r"[0-9a-f]{64}", secret_hash)):
+        raise SmokeFailure("malformed synthetic session values")
+    ids, expires = SESSION_IDS, SESSION_EXPIRES_MS
+    by = "'kind-smoke', 'synthetic smoke fixture'"
+    return f"""\
+INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason)
+    VALUES ('{ids['provider']}', '{SESSION_ISSUER}', '{SESSION_CLIENT}', {by});
+INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ('{ids['provider']}', 'r1');
+INSERT INTO openmettle.users (id) VALUES ('{ids['user']}');
+INSERT INTO openmettle.scopes (kind, personal_user_id) VALUES ('personal', '{ids['user']}');
+INSERT INTO openmettle.user_identities (id, user_id, issuer, subject)
+    VALUES ('{ids['identity']}', '{ids['user']}', '{SESSION_ISSUER}', 'kind-smoke-user');
+INSERT INTO openmettle.local_identity_approvals (id, provider_id, identity_id, active, expires_ms, changed_by, change_reason)
+    VALUES ('{ids['approval']}', '{ids['provider']}', '{ids['identity']}', true, {expires}, {by});
+INSERT INTO openmettle.login_nonce_reservations (key_id, nonce)
+    VALUES ('kind-smoke', substring(sha256(convert_to('{login_id}', 'UTF8')) FROM 1 FOR 12));
+INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
+        key_id, nonce, ciphertext, consumed, session_issued)
+    SELECT '{login_id}', decode('01', 'hex'), {expires}, sha256(convert_to('{login_id}:state', 'UTF8')),
+           sha256(convert_to('{login_id}:nonce', 'UTF8')), sha256(convert_to('{login_id}:caller', 'UTF8')),
+           key_id, nonce, NULL, true, true
+      FROM openmettle.login_nonce_reservations WHERE key_id = 'kind-smoke';
+INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
+        issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
+        user_generation, created_ms, expires_ms)
+    SELECT '{session_id}', decode('{secret_hash}', 'hex'), '{login_id}', '{ids['provider']}', '{ids['identity']}',
+           '{ids['approval']}', '{ids['user']}', '{SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {expires}
+      FROM openmettle.login_provider_revisions WHERE provider_id = '{ids['provider']}';
+UPDATE openmettle.storage_instance
+    SET instance_budget_bytes = {STORAGE_LIMIT_BYTES}, personal_limit_bytes = {STORAGE_LIMIT_BYTES};
+"""
+
+
+def multipart_form(boundary: str, payload: bytes, *, file_first: bool = False) -> bytes:
+    """An artifact upload body: an empty `metadata` object and one `file` part, in either order."""
+    metadata = b'Content-Disposition: form-data; name="metadata"\r\nContent-Type: application/json\r\n\r\n{}'
+    file = (f'Content-Disposition: form-data; name="file"; filename="{ARTIFACT_FILENAME}"\r\n'
+            f"Content-Type: {ARTIFACT_MEDIA_TYPE}\r\n\r\n").encode("ascii") + payload
+    delimiter = f"--{boundary}".encode("ascii")
+    parts = (file, metadata) if file_first else (metadata, file)
+    return b"".join(delimiter + b"\r\n" + part + b"\r\n" for part in parts) + delimiter + b"--\r\n"
+
+
+def v1_headers(cookie: str, *, key: str | None = None, boundary: str | None = None,
+               byte_range: str | None = None) -> dict:
+    """Browser cookie channel: the session cookie and the configured Origin (core ADRs 0007, 0019)."""
+    headers = {"Cookie": f"{SESSION_COOKIE}={cookie}", "Origin": AUTH_ORIGIN}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    if boundary is not None:
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    if byte_range is not None:
+        headers["Range"] = byte_range
+    return headers
+
+
+def http_exchange(port: int, method: str, path: str, headers: dict, body: bytes = b"") -> tuple:
+    """One HTTP/1.1 request to the loopback port-forward: (status, lowercase headers, body bytes)."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+def expect_v1(name: str, response: tuple, status: int) -> tuple:
+    """(headers, body) of a /v1 response with `status`; every one is versioned and uncacheable."""
+    got, headers, body = response
+    if got != status:
+        raise SmokeFailure(f"{name}: HTTP {got}, expected {status}: {body[:300]!r}")
+    if headers.get("openmettle-api-version") != V1_API_VERSION or headers.get("cache-control") != "no-store":
+        raise SmokeFailure(f"{name}: missing OpenMettle-API-Version {V1_API_VERSION} or Cache-Control no-store")
+    return headers, body
+
+
+def evaluate_artifact_revision(body: bytes, payload: bytes, revision: int) -> dict:
+    """An active revision `revision` of `payload` in the caller's personal scope."""
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        raise SmokeFailure("artifact revision body is not JSON") from exc
+    if not isinstance(document, dict):
+        raise SmokeFailure("artifact revision body is not a JSON object")
+    expected = {"revision": str(revision), "state": "active", "scope_kind": "personal", "project_id": None,
+                "media_type": ARTIFACT_MEDIA_TYPE, "display_name": ARTIFACT_FILENAME,
+                "size_bytes": str(len(payload)), "sha256": hashlib.sha256(payload).hexdigest()}
+    observed = {key: document.get(key) for key in expected}
+    if observed != expected:
+        raise SmokeFailure(f"artifact revision {revision}: {observed}, expected {expected}")
+    if not all(isinstance(document.get(key), str) and UUID.fullmatch(document[key])
+               for key in ("artifact_id", "revision_id", "scope_id")):
+        raise SmokeFailure(f"artifact revision {revision} lacks canonical artifact, revision or scope ids")
+    return document
+
+
+def evaluate_artifact_downloads(payload: bytes, full: tuple, partial: tuple, unsatisfiable: tuple) -> dict:
+    """The (headers, body) of a full download, a single byte range and an unsatisfiable range."""
+    total = len(payload)
+    headers, body = full
+    expected = {"content-type": ARTIFACT_MEDIA_TYPE, "content-length": str(total), "accept-ranges": "bytes",
+                "x-content-type-options": "nosniff", "content-range": None,
+                "content-disposition": f"attachment; filename*=UTF-8''{ARTIFACT_FILENAME}"}
+    observed = {key: headers.get(key) for key in expected}
+    if body != payload or observed != expected:
+        raise SmokeFailure(f"full download: {len(body)} bytes matching={body == payload}, headers {observed}")
+    first, last = ARTIFACT_RANGE
+    headers, body = partial
+    if body != payload[first:last + 1] or headers.get("content-range") != f"bytes {first}-{last}/{total}" \
+            or headers.get("content-length") != str(last - first + 1):
+        raise SmokeFailure(f"range download: {body!r} Content-Range {headers.get('content-range')!r} "
+                           f"Content-Length {headers.get('content-length')!r}")
+    headers, body = unsatisfiable
+    try:
+        problem = json.loads(body)
+    except ValueError as exc:
+        raise SmokeFailure("unsatisfiable range body is not JSON") from exc
+    if not str(headers.get("content-type", "")).startswith("application/problem+json") \
+            or not isinstance(problem, dict) or problem.get("status") != 416 \
+            or problem.get("code") != "range_not_satisfiable" \
+            or headers.get("content-range") != f"bytes */{total}":
+        raise SmokeFailure(f"unsatisfiable range: {problem!r} Content-Range {headers.get('content-range')!r}")
+    return {"full_bytes": total, "range": f"bytes={first}-{last}", "range_status": 206,
+            "unsatisfiable_status": 416}
+
+
 def parse_structured_logs(output: str, role: str) -> list:
     """Parse container stderr as ADR 0024 flattened JSON lines; fail immediately on any non-JSON line."""
     records = []
@@ -1141,12 +1353,16 @@ class Smoke:
             self.kube("--namespace", DB_NAMESPACE, "rollout", "status", f"deployment/{deployment}",
                       "--timeout=300s", timeout=330)
 
+    def psql(self, sql: str) -> str:
+        """Run `sql` from stdin in one transaction on the openmettle database as the fixture superuser."""
+        return self.kube("--namespace", DB_NAMESPACE, "exec", "--stdin", "deployment/postgres", "--",
+                         "psql", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-qtA",
+                         "-U", "fixture_admin", "-d", "openmettle", input=sql).stdout
+
     def migrations(self) -> list:
         """Applied migration history, read as the fixture superuser."""
-        out = self.kube("--namespace", DB_NAMESPACE, "exec", "deployment/postgres", "--",
-                        "psql", "-v", "ON_ERROR_STOP=1", "-qtA", "-U", "fixture_admin", "-d", "openmettle",
-                        "-c", "SELECT version, success, encode(checksum, 'hex'), installed_on "
-                              "FROM openmettle._sqlx_migrations ORDER BY version").stdout
+        out = self.psql("SELECT version, success, encode(checksum, 'hex'), installed_on "
+                        "FROM openmettle._sqlx_migrations ORDER BY version;")
         return [line.split("|") for line in out.splitlines() if line]
 
     def helm_deploy(self, command: str, worker_replicas: int, *, enabled_profile: bool = False):
@@ -1245,8 +1461,65 @@ class Smoke:
     def completions(self) -> list:
         return job_completions(self.events("involvedObject.kind=Job"), f"{FULLNAME}-migrate")
 
+    def seed_session(self) -> str:
+        """Seed a synthetic browser session; return its cookie value, which is redacted from then on."""
+        session_id, cookie, secret_hash = session_credential(secrets.token_bytes(64))
+        self.passwords["session"] = cookie
+        self.psql(session_seed_sql(session_id, secret_hash, b64url(secrets.token_bytes(32))))
+        return cookie
+
+    def artifact_round_trip(self, api_pods: list) -> dict:
+        """Core ADR 0031 /v1/artifacts on the live PVC. Writes alternate between the two API replicas
+        and every read goes to the replica that did not write that revision, so the bytes cross pods."""
+        cookie = self.seed_session()
+        forwards = []
+        try:
+            for name in api_pods:
+                forwards.append(PortForward(self.kubectl, self.env, f"pod/{name}", 8080))
+            first, second = (forward.port for forward in forwards)
+
+            def send(port, method, path, status, *, key=None, boundary=None, body=b"", byte_range=None):
+                headers = v1_headers(cookie, key=key, boundary=boundary, byte_range=byte_range)
+                return expect_v1(f"{method} {path.partition('?')[0]}",
+                                 http_exchange(port, method, path, headers, body), status)
+            v1, v2 = ARTIFACT_PAYLOADS
+            boundary_a, boundary_b = ARTIFACT_BOUNDARIES
+            query = f"?max_bytes={ARTIFACT_MAX_BYTES}"
+            _, body = send(first, "POST", f"/v1/artifacts{query}", 201, key="kind-smoke-create",
+                           boundary=boundary_a, body=multipart_form(boundary_a, v1))
+            created = evaluate_artifact_revision(body, v1, 1)
+            # The exact retry, with another boundary and the file part first, replays revision 1.
+            _, body = send(second, "POST", f"/v1/artifacts{query}", 201, key="kind-smoke-create",
+                           boundary=boundary_b, body=multipart_form(boundary_b, v1, file_first=True))
+            self.expect(evaluate_artifact_revision(body, v1, 1) == created,
+                        "idempotent artifact upload retry did not return the same artifact and revision")
+            revisions = f"/v1/artifacts/{created['artifact_id']}/revisions"
+            _, body = send(first, "POST", f"{revisions}{query}", 201, key="kind-smoke-revision",
+                           boundary=boundary_a, body=multipart_form(boundary_a, v2))
+            latest = evaluate_artifact_revision(body, v2, 2)
+            self.expect(latest["artifact_id"] == created["artifact_id"]
+                        and latest["revision_id"] != created["revision_id"],
+                        "revision 2 did not append a new revision to the same artifact")
+            path = f"{revisions}/{latest['revision_id']}"
+            _, body = send(second, "GET", path, 200)
+            self.expect(evaluate_artifact_revision(body, v2, 2) == latest,
+                        "revision 2 metadata differs from its upload response")
+            first_byte, last_byte = ARTIFACT_RANGE
+            downloads = evaluate_artifact_downloads(
+                v2,
+                send(second, "GET", f"{path}/content", 200),
+                send(second, "GET", f"{path}/content", 206, byte_range=f"bytes={first_byte}-{last_byte}"),
+                send(second, "GET", f"{path}/content", 416, byte_range=UNSATISFIABLE_RANGE))
+        finally:
+            for forward in forwards:
+                forward.close()
+        return {"session": "synthetic browser session (cookie channel)", "api_pods": len(forwards),
+                "revisions": 2, "idempotent_retry": "same revision from the other replica",
+                "downloads": downloads}
+
     def enabled_profile(self, history: list):
-        """Upgrade to an enabled profile and verify live PDB, PVC and ARTIFACTS_DIR store, auth + /v1/* mounts and JSON/debug logs."""
+        """Upgrade to an enabled profile and verify live PDB, PVC and ARTIFACTS_DIR store, auth + /v1/* mounts,
+        a /v1/artifacts round trip across both API replicas and JSON/debug logs."""
         self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True)
         for component in WORKLOADS:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
@@ -1285,6 +1558,7 @@ class Smoke:
                                    *artifact_dirs_command(), timeout=60)
                 evaluate_artifact_dirs(pod_name, listed.stdout)
         pvc["store_subdirectories"] = list(ARTIFACT_SUBDIRS)
+        artifacts = self.artifact_round_trip(profile["pods"]["api"])
         logs_summary = {}
         for role, require_debug in (("api", True), ("worker", False)):
             names = profile["pods"][role]
@@ -1299,10 +1573,12 @@ class Smoke:
                 timeout=30)
         auth_summary = {**auth_mounts, "checked_pods": len(profile["pods"]["api"]), "routes": auth_routes}
         self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and ARTIFACTS_DIR store, auth + /v1/* mounts, "
-                    "API-only issuance credential and JSON/debug logs",
+                    "API-only issuance credential, /v1/artifacts upload, retry, revision and byte ranges on the PVC, "
+                    "and JSON/debug logs",
                     ready_replicas=profile["ready_replicas"],
                     healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
-                    pdb=pdb, pvc=pvc, auth=auth_summary, issuance=issuance, logs=logs_summary)
+                    pdb=pdb, pvc=pvc, auth=auth_summary, issuance=issuance, artifacts=artifacts,
+                    logs=logs_summary)
 
     def scenario(self):
         # 1-3, 5, 8: install by digest; migrate hook; Ready; no optional package; PSA restricted.
@@ -1315,9 +1591,10 @@ class Smoke:
         history = self.migrations()
         self.expect(history and all(row[1] == "t" for row in history),
                     "migration history is empty or has a failed entry")
-        self.expect(int(history[-1][0]) >= ISSUANCE_MIGRATION,
-                    f"migration history ends at version {history[-1][0]}, before the session issuance "
-                    f"migration {ISSUANCE_MIGRATION}")
+        self.expect(int(history[-1][0]) >= REQUIRED_MIGRATION,
+                    f"migration history ends at version {history[-1][0]}, before the run admission "
+                    f"migration {REQUIRED_MIGRATION}")
+        run_admission = evaluate_run_admission(self.psql(run_admission_sql()))
         created = {c: parse_time(self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
                                                 f"{FULLNAME}-{c}")["metadata"]["creationTimestamp"])
                    for c in WORKLOADS}
@@ -1328,8 +1605,10 @@ class Smoke:
         present = images_reported_present(self.events("reason=Pulled"), references)
         self.expect(present == sorted(references),
                     f"kubelet did not report every digest reference as present: {present}")
-        self.passed("install by digest: migrate hook completed before Deployments; API and worker Ready",
+        self.passed("install by digest: migrate hook completed before Deployments; API and worker Ready; "
+                    "migration 19 role boundaries",
                     migrations_applied=len(history), latest_version=int(history[-1][0]),
+                    run_admission=run_admission,
                     ready_replicas=installed["ready_replicas"], readyz=installed["readyz"],
                     images_present=len(present))
 
