@@ -50,7 +50,7 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at adef30a; this test does not read core.
+# from core src/lib.rs and src/migrate.rs at 94d21f8; this test does not read core.
 DEFAULT_ENV = {
     "api": {"BIND": "0.0.0.0:8080", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
     "worker": {"BIND": "0.0.0.0:8081", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
@@ -768,6 +768,20 @@ class ArtifactStorageTest(Rendered):
                                   "storage.artifacts.storageClassName="])
         self.assertEqual(find(docs, "PersistentVolumeClaim", "-artifacts")["spec"]["storageClassName"], "")
 
+    def test_artifacts_dir_env_follows_the_mount(self):
+        """Fails if ARTIFACTS_DIR is missing or wrong where the volume mounts, set where it does not, or reaches migrate."""
+        enabled = {"all-keys", "storage-existing-claim"}
+        for name, docs in self.renders.items():
+            for role, pod in pods(docs):
+                with self.subTest(values=name, component=role):
+                    env = env_map(pod["containers"][0])
+                    self.assertEqual("artifacts" in volumes(pod), name in enabled and role != "migrate")
+                    if "artifacts" in volumes(pod):
+                        self.assertEqual(env[PREFIX[role] + "ARTIFACTS_DIR"],
+                                         {"name": PREFIX[role] + "ARTIFACTS_DIR", "value": ARTIFACTS_PATH})
+                    else:
+                        self.assertFalse([key for key in env if "ARTIFACTS" in key])
+
     def test_mounted_read_write_into_api_and_worker_only(self):
         """Fails if the migrate pod mounts artifacts, the mount is read-only or moves, or the claim name is wrong."""
         expected = {"all-keys": f"{RELEASE}-openmettle-core-artifacts", "storage-existing-claim": "example-artifacts"}
@@ -1135,9 +1149,10 @@ class ExampleOverlayTest(unittest.TestCase):
                 self.assertEqual(env[PREFIX[role] + "OTLP_CA_FILE"]["value"], OTLP_CA_PATH)
                 self.assertEqual(env[PREFIX[role] + "OTLP_PRIVATE_RANGES"]["value"], "10.43.0.0/16")
                 self.assertIn("otlp-ca", volumes(pod), role)
+                self.assertEqual(env[PREFIX[role] + "ARTIFACTS_DIR"]["value"], ARTIFACTS_PATH)
             else:
                 self.assertNotIn("otlp-ca", volumes(pod))
-                self.assertFalse([k for k in env if "OTLP" in k])
+                self.assertFalse([k for k in env if "OTLP" in k or "ARTIFACTS" in k])
         api_np = find(self.docs, "NetworkPolicy", "-api")["spec"]
         self.assertTrue(api_np["ingress"])
         self.assertEqual(len(api_np["egress"]), 4)
@@ -1201,10 +1216,11 @@ class WorkstationProfileTest(unittest.TestCase):
                                  "https://alloy.workstation.example.test:4318/v1/traces")
                 self.assertEqual(env[PREFIX[role] + "OTLP_METRICS_ENDPOINT"]["value"],
                                  "https://alloy.workstation.example.test:4318/v1/metrics")
+                self.assertEqual(env[PREFIX[role] + "ARTIFACTS_DIR"]["value"], ARTIFACTS_PATH)
             else:
                 self.assertNotIn("artifacts", vols)
                 self.assertNotIn("otlp-ca", vols)
-                self.assertFalse([k for k in env if "OTLP" in k])
+                self.assertFalse([k for k in env if "OTLP" in k or "ARTIFACTS" in k])
         self.assertEqual(len(find(self.docs, "NetworkPolicy", "-api")["spec"]["egress"]), 4)
         self.assertEqual(len(find(self.docs, "NetworkPolicy", "-worker")["spec"]["egress"]), 3)
         self.assertEqual(len(find(self.docs, "NetworkPolicy", "-migrate")["spec"]["egress"]), 2)

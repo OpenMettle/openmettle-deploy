@@ -95,6 +95,10 @@ spec:
               value: {{ join "," $otlp.privateRanges | quote }}
             {{- end }}
             {{- end }}
+            {{- if $root.Values.storage.artifacts.enabled }}
+            - name: {{ $prefix }}ARTIFACTS_DIR
+              value: {{ include "openmettle-core.artifactsMountPath" $root | quote }}
+            {{- end }}
             {{- if $auth }}
             - name: OPENMETTLE_API_AUTH_CONFIG
               value: {{ include "openmettle-core.authConfigPath" $root | quote }}
