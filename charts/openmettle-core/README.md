@@ -129,12 +129,19 @@ These are fixed and are not values:
 
 The chart ships no site values. Compose an install from the chart defaults plus one or more private overlays kept outside this public repository: an ignored `config/<site>.local.yaml` here, or a private configuration repository. Helm merges `-f` files left to right, so later files win. Lists such as `ingress.hosts` or `networkPolicy.database.to` are replaced, not merged.
 
-[`examples/values-synthetic.yaml`](../../examples/values-synthetic.yaml) is a complete, clearly marked synthetic overlay that enables every I4, I5 and I6 option. It uses the reserved `.example` domain, all-zero digests and placeholder Secret, ConfigMap and claim names. It renders, but cannot be installed. Copy it to a private location, replace every placeholder and review the render before any apply:
+Two clearly marked synthetic overlays live under `examples/` (both use reserved `.example`/`.example.test` domains, all-zero digests, RFC 5737 TEST-NET egress peers, an illustrative RFC 1918 `telemetry.otlp.privateRanges` CIDR and placeholder Secret, ConfigMap and claim names; both render and pass `kubeconform`, and neither can be installed as-is):
+
+- [`examples/values-synthetic.yaml`](../../examples/values-synthetic.yaml) — multi-replica overlay enabling every I4, I5 and I6 option (2 API replicas, API PDB, PVC, db CA, Ingress/TLS, OIDC and OTLP).
+- [`examples/values-workstation-profile.yaml`](../../examples/values-workstation-profile.yaml) — single-node private workstation profile (1 API replica, 1 worker replica, explicit per-component CPU/memory bounds, API PDB disabled so single-node drains are not blocked, `ReadWriteOnce` artifact PVC and explicit Ingress/PostgreSQL/OIDC/OTLP NetworkPolicy boundaries).
+
+Copy either example to a private location (or layer your gitignored `config/<site>.local.yaml` on top of the workstation profile so machine-specific digests, hosts, CIDRs, Secrets and StorageClass names stay out of source control) and review the render before any apply:
 
 ```sh
-helm template openmettle charts/openmettle-core --namespace openmettle -f config/site.local.yaml > /tmp/openmettle.yaml
+helm template openmettle charts/openmettle-core --namespace openmettle \
+  -f examples/values-workstation-profile.yaml -f config/site.local.yaml > /tmp/openmettle.yaml
 # review /tmp/openmettle.yaml, then (owner action) install with a timeout covering the migration:
-helm upgrade --install openmettle charts/openmettle-core --namespace openmettle -f config/site.local.yaml --timeout 15m
+helm upgrade --install openmettle charts/openmettle-core --namespace openmettle \
+  -f examples/values-workstation-profile.yaml -f config/site.local.yaml --timeout 15m
 ```
 
 The overlay references objects the chart never creates: the three database URL Secrets, the database CA ConfigMap, an existing artifact PVC (if used), the TLS Secret, the IngressClass, any Traefik Middleware, and (when `auth.enabled` is true) the auth settings ConfigMap, login-keys Secret and optional provider CA ConfigMap. Create them in the release namespace first. Configure browser sign-in under `auth:` and `networkPolicy.api.oidc:`; the schema still rejects an unknown top-level `oidc:` key.
@@ -163,7 +170,9 @@ kubectl --namespace openmettle create configmap openmettle-db-ca --from-file=ca.
 
 - **Core does not use the path yet.** Core has no artifact-directory setting today; filesystem storage is V1-15. Enabling the volume now only provisions and mounts it. The chart will pass the path once core defines a prefixed setting.
 - **Exactly one source while enabled.** Set `existingClaim` to mount a PVC you manage, or `size` for a chart-owned PVC `<fullname>-artifacts`. Rendering fails if both or neither are set. `accessModes`, `storageClassName` and `annotations` describe the chart-owned PVC only. With `existingClaim`, a non-null `storageClassName` or non-empty `annotations` is rejected rather than ignored.
-- **Access modes.** Both api and worker mount the claim, so only `ReadWriteOnce` and `ReadWriteMany` are accepted. `ReadWriteOnce` permits several pods on **one node** only: on a multi-node cluster, pods scheduled to another node stay `Pending`. Use `ReadWriteMany` (or co-locate with `nodeSelector`/`affinity`) for more than one node.
+- **Access modes and storage concurrency limits.** Both api and worker mount the claim, so only `ReadWriteOnce` and `ReadWriteMany` are accepted:
+  - **`ReadWriteOnce` (single-node / workstation profile):** attaches at node level and permits multiple pods (`api` + `worker`) only on **one node**. On a multi-node cluster, pods scheduled to another node stay `Pending` unless co-located via `nodeSelector`/`affinity`. Even at `replicas: 1`, the default rolling update (`maxSurge: 1`, `maxUnavailable: 0`) briefly starts a second pod during rollout; to avoid surge pods (and keep the database connection-budget peak flat) on a constrained workstation, set `api.strategy: {maxSurge: 0, maxUnavailable: 1}` and `worker.strategy: {maxSurge: 0, maxUnavailable: 1}` in your private overlay.
+  - **`ReadWriteMany` (multi-node scaling):** required when `api` and `worker` pods span multiple nodes. Application-level artifact coordination and quota accounting still live in PostgreSQL (core ADR 0005), not filesystem locks; see [Connection budget](#connection-budget) when raising `api.replicas` or `worker.replicas`.
 - **Ownership.** `fsGroup: 65532` with `fsGroupChangePolicy: OnRootMismatch` is added to the api and worker pods so that the non-root user can write a freshly provisioned volume. Whether a volume honours `fsGroup` depends on its CSI driver. `readOnlyRootFilesystem` and `runAsUser` stay unchanged.
 - **Kept on uninstall.** The chart-owned PVC carries `helm.sh/resource-policy: keep`, which takes precedence over a user annotation with the same key. `helm uninstall` leaves it and its data in place. A later install with the same release name and `size` fails, because the PVC exists outside the release. Set `existingClaim: <fullname>-artifacts` to reuse it. Deleting the claim (and data) is a separate, deliberate owner action.
 - **Backup and restore** are not provided by the chart (V1-30/V1-31). Not tested against any StorageClass.
@@ -266,7 +275,7 @@ The chart never creates ConfigMaps or Secrets. Every file comes from a pre-exist
 
 ## Telemetry / OTLP trace export
 
-`telemetry` exposes core ADR 0024's structured stderr logging settings across all three roles (minimum `openmettle-core` commit `13c5227`) and core ADR 0026's opt-in OTLP/HTTP protobuf trace export for `openmettle-api` and `openmettle-worker` (minimum `openmettle-core` commit `ac047ec`); both are satisfied by the chart's pinned core commit `e5ff673`. Both leave default renders completely unchanged (`telemetry.logging.{format,level}: null` and `telemetry.otlp.enabled: false`).
+`telemetry` exposes core ADR 0024's structured stderr logging settings across all three roles (minimum `openmettle-core` commit `13c5227`) and core ADR 0026's opt-in OTLP/HTTP protobuf trace export for `openmettle-api` and `openmettle-worker` (minimum `openmettle-core` commit `ac047ec`); both are satisfied by the chart's pinned core commit `a93a277`. Both leave default renders completely unchanged (`telemetry.logging.{format,level}: null` and `telemetry.otlp.enabled: false`).
 
 ### Structured logging (`telemetry.logging`, all roles)
 
@@ -313,7 +322,7 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 
 ### Kind smoke test (I2/I3/I7)
 
-[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `e5ff673`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
+[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `a93a277`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
 
 | Item | Smoke-tested |
 | --- | --- |
@@ -323,20 +332,20 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 | Worker scales to 2 while the API stays at 1 | Yes, through `worker.replicas` |
 | No optional package present (default install) | Yes |
 | Same-digest `helm upgrade` reruns migrate as a no-op and stays Ready | Yes |
-| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`) | Yes (implemented in I7; checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount, and ADR 0024 JSON/debug stderr logs on `api` and `worker`; hosted kind run pending CI) |
+| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`) | Yes (checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount, and ADR 0024 JSON/debug stderr logs on `api` and `worker`) |
 | `helm uninstall` leaves no non-kept release objects | Yes (release Deployments, Services, NetworkPolicies and PDB removed; chart-owned artifact PVC kept via `helm.sh/resource-policy: keep`) |
 | App namespace enforces Pod Security `restricted` | Yes |
-| NetworkPolicy enforced under namespace default-deny | Yes (implemented in I3; hosted kind run pending CI) |
+| NetworkPolicy enforced under namespace default-deny | Yes |
 | I4 database CA against TLS PostgreSQL, Ingress behind Traefik, multi-node/drain eviction | No (render tests and kubeconform only; owner's qualification) |
 | I5 browser sign-in / OIDC mounts & API OIDC egress | No. Off in the smoke run; render tests and kubeconform only |
 | I6 OTLP trace export (`api`/`worker` CA mount & collector egress) | No. Off in the smoke run; render tests and kubeconform only |
 | Registry pulls, TLS to PostgreSQL, ingress controller, multi-node | No (owner's qualification) |
 
-The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch the chart or the harness, and on manual dispatch. The I2 checks passed on [pull-request run 44505148955](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) (5 min 15 s), which tested the merge of `b8f2d79` into `main`; the workflow has not yet run on `main`, and the I3 NetworkPolicy and I7 enabled-profile checks have not yet run on a hosted kind cluster until pushed to CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch `CORE_COMMIT`, the chart or the harness, and on manual dispatch. All 10 checks—including I2 install/upgrade/uninstall, I3 NetworkPolicy enforcement and I7 enabled-profile upgrade—passed on hosted `kind-smoke` CI on core `e5ff673` (PR #12 and PR #13, ~3 min 20 s); hosted `kind-smoke` verification for the bumped pin `a93a277` (including core migration 15) is pending CI on pull request #14 (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
-- **I2/I3/I7:** hosted `kind-smoke` verification of I3 NetworkPolicy enforcement and I7 enabled-profile checks against core `e5ff673` on pull-request CI and `main`, and owner acceptance.
+- **I2/I3/I7/I8:** hosted `kind-smoke` verification on core `a93a277` (including migration 15) and owner acceptance.
 - **I4 (render contract delivered; API PDB and single-node RWO artifact PVC added to I7 kind smoke):** live verification of the database CA against TLS-enabled PostgreSQL, the API PDB during a real node drain, `ReadWriteMany` multi-node artifact storage, and the Ingress behind Traefik, including the access-log [acceptance check](#ingress-and-tls).
 - **I5 (render contract delivered):** live cluster qualification of `auth` mounts, Secret `0440`/`fsGroup: 65532` readability and `networkPolicy.api.oidc` egress against a real OIDC provider (such as Keycloak); optional pre-upgrade `--check-auth-config` hook if needed; and native sign-in runtime mounting (core ADR 0023).
 - **I6 (render contract delivered; `telemetry.logging` `json`/`debug` added to I7 kind smoke):** live cluster qualification of `telemetry.otlp` export, `/etc/openmettle/otlp-ca/ca.crt` trust verification and `networkPolicy.telemetry.otlp` egress against a real OTLP/HTTP collector (such as Grafana Alloy on TCP `4318`), and future metrics/contract updates (core ADR 0024 increments 3–4).

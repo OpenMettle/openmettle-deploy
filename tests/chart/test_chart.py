@@ -18,6 +18,7 @@ CHART = ROOT / "charts" / "openmettle-core"
 VALUES = ROOT / "tests" / "chart" / "values"
 CONTRACT = ROOT / "tests" / "fixtures" / "core" / "process-contract.json"
 EXAMPLE = ROOT / "examples" / "values-synthetic.yaml"
+WORKSTATION_EXAMPLE = ROOT / "examples" / "values-workstation-profile.yaml"
 HELM = os.environ.get("HELM", "helm")
 RELEASE = "openmettle"
 
@@ -48,7 +49,7 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at e5ff673; this test does not read core.
+# from core src/lib.rs and src/migrate.rs at a93a277; this test does not read core.
 DEFAULT_ENV = {
     "api": {"BIND": "0.0.0.0:8080", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
     "worker": {"BIND": "0.0.0.0:8081", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
@@ -1063,17 +1064,38 @@ class TelemetryTest(Rendered):
         self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
 
 
+def _render_standalone_example(path):
+    result = subprocess.run([HELM, "template", RELEASE, str(CHART), "--namespace", "openmettle", "-f", str(path)],
+                            capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0:
+        raise AssertionError(f"helm template failed for {path.name}: {result.stderr}")
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    values = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return docs, values
+
+
+def _assert_synthetic_example(case, path, values):
+    text = path.read_text(encoding="utf-8")
+    case.assertIn("SYNTHETIC EXAMPLE", text)
+    for host in values["ingress"]["hosts"] + [values["images"][r]["registry"] for r in ("api", "worker", "migrate")]:
+        case.assertTrue(host == "example" or host.endswith(".example"), host)
+    endpoint = values["telemetry"]["otlp"]["tracesEndpoint"]
+    case.assertIn(".example.test:", endpoint)
+    for role in ("api", "worker", "migrate"):
+        case.assertEqual(values["images"][role]["digest"], DIGEST)
+    for peer in (values["networkPolicy"]["database"]["to"]
+                 + values["networkPolicy"]["api"]["oidc"]["to"]
+                 + values["networkPolicy"]["telemetry"]["otlp"]["to"]):
+        case.assertTrue(peer["ipBlock"]["cidr"].startswith("192.0.2."))
+    case.assertNotIn("oidc", values)
+
+
 class ExampleOverlayTest(unittest.TestCase):
     """examples/values-synthetic.yaml renders standalone and stays synthetic."""
 
     @classmethod
     def setUpClass(cls):
-        result = subprocess.run([HELM, "template", RELEASE, str(CHART), "--namespace", "openmettle", "-f", str(EXAMPLE)],
-                                capture_output=True, text=True, timeout=120, check=False)
-        if result.returncode != 0:
-            raise AssertionError(f"helm template failed: {result.stderr}")
-        cls.docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
-        cls.values = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+        cls.docs, cls.values = _render_standalone_example(EXAMPLE)
 
     def test_shows_every_i4_i5_and_i6_feature(self):
         """Fails if the example stops demonstrating I4 (PVC, Ingress, PDB, db CA), I5 (API auth & OIDC egress) or I6 (telemetry & OTLP)."""
@@ -1110,25 +1132,66 @@ class ExampleOverlayTest(unittest.TestCase):
 
     def test_values_are_synthetic(self):
         """Fails if the example names a non-reserved domain, a real digest or a non-documentation address."""
-        text = EXAMPLE.read_text(encoding="utf-8")
-        self.assertIn("SYNTHETIC EXAMPLE", text)
-        for host in self.values["ingress"]["hosts"] + [self.values["images"][r]["registry"] for r in ("api", "worker", "migrate")]:
-            self.assertTrue(host == "example" or host.endswith(".example"), host)
-        endpoint = self.values["telemetry"]["otlp"]["tracesEndpoint"]
-        self.assertIn(".example.test:", endpoint)
-        for role in ("api", "worker", "migrate"):
-            self.assertEqual(self.values["images"][role]["digest"], DIGEST)
-        for peer in (self.values["networkPolicy"]["database"]["to"]
-                     + self.values["networkPolicy"]["api"]["oidc"]["to"]
-                     + self.values["networkPolicy"]["telemetry"]["otlp"]["to"]):
-            self.assertTrue(peer["ipBlock"]["cidr"].startswith("192.0.2."))
-        self.assertNotIn("oidc", self.values)
+        _assert_synthetic_example(self, EXAMPLE, self.values)
 
     def test_traefik_annotations_stay_strings(self):
         """Fails if a Traefik annotation such as router.tls: "true" is emitted as a YAML boolean."""
         annotations = find(self.docs, "Ingress", "-api")["metadata"]["annotations"]
         self.assertEqual(annotations["traefik.ingress.kubernetes.io/router.tls"], "true")
         self.assertTrue(all(isinstance(v, str) for v in annotations.values()))
+
+
+class WorkstationProfileTest(unittest.TestCase):
+    """examples/values-workstation-profile.yaml renders standalone as a single-node synthetic profile."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.docs, cls.values = _render_standalone_example(WORKSTATION_EXAMPLE)
+
+    def test_single_node_workstation_boundaries_and_resources(self):
+        """Fails if the workstation profile enables a 1-replica PDB, drops RWO/Ingress/auth/OTLP boundaries or omits resource bounds."""
+        kinds = {d["kind"] for d in self.docs}
+        self.assertIn("PersistentVolumeClaim", kinds)
+        self.assertIn("Ingress", kinds)
+        self.assertNotIn("PodDisruptionBudget", kinds)
+        api_dep = find(self.docs, "Deployment", "-api")["spec"]
+        worker_dep = find(self.docs, "Deployment", "-worker")["spec"]
+        self.assertEqual(api_dep["replicas"], 1)
+        self.assertEqual(worker_dep["replicas"], 1)
+        for dep in (api_dep, worker_dep):
+            res = dep["template"]["spec"]["containers"][0]["resources"]
+            self.assertIn("requests", res)
+            self.assertIn("limits", res)
+        pvc = find(self.docs, "PersistentVolumeClaim", "-artifacts")["spec"]
+        self.assertEqual(pvc["accessModes"], ["ReadWriteOnce"])
+        for role, pod in pods(self.docs):
+            env = env_map(pod["containers"][0])
+            vols = set(volumes(pod))
+            self.assertIn("db-ca", vols, role)
+            self.assertEqual(env[PREFIX[role] + "LOG_FORMAT"]["value"], "json")
+            self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"]["value"], "info")
+            if role == "api":
+                self.assertEqual(env["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
+                self.assertLessEqual(AUTH_VOLUMES, vols)
+            else:
+                self.assertFalse(AUTH_VOLUMES & vols, role)
+                self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
+            if role in ("api", "worker"):
+                self.assertIn("artifacts", vols, role)
+                self.assertIn("otlp-ca", vols, role)
+                self.assertEqual(env[PREFIX[role] + "OTLP_TRACES_ENDPOINT"]["value"],
+                                 "https://alloy.workstation.example.test:4318/v1/traces")
+            else:
+                self.assertNotIn("artifacts", vols)
+                self.assertNotIn("otlp-ca", vols)
+                self.assertFalse([k for k in env if "OTLP" in k])
+        self.assertEqual(len(find(self.docs, "NetworkPolicy", "-api")["spec"]["egress"]), 4)
+        self.assertEqual(len(find(self.docs, "NetworkPolicy", "-worker")["spec"]["egress"]), 3)
+        self.assertEqual(len(find(self.docs, "NetworkPolicy", "-migrate")["spec"]["egress"]), 2)
+
+    def test_values_are_synthetic(self):
+        """Fails if the workstation profile leaks any non-reserved domain, real digest or non-documentation address."""
+        _assert_synthetic_example(self, WORKSTATION_EXAMPLE, self.values)
 
 
 class NegativeCaseTest(unittest.TestCase):

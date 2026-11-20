@@ -1,0 +1,140 @@
+# SYNTHETIC EXAMPLE. NOT INSTALLABLE. Do not copy real values into this file.
+#
+# Single-node private workstation profile for charts/openmettle-core (V1-32 I8), defining explicit
+# service boundaries without committing machine-specific values. Keep site-specific hostnames,
+# digests, CIDRs, Secret names and StorageClass names in a gitignored private overlay (for example
+# config/<site>.local.yaml) or an external private configuration repository, and layer it on top:
+#
+#   helm template openmettle charts/openmettle-core --namespace openmettle \
+#     -f examples/values-workstation-profile.yaml -f config/<site>.local.yaml
+#
+# Profile assumptions (single-node Kubernetes / K3s workstation):
+# - API and worker scale independently, starting at 1 replica each with explicit CPU/memory bounds.
+# - API PodDisruptionBudget stays disabled at 1 replica (a PDB with replicas=1 blocks drains).
+# - Artifact storage uses a ReadWriteOnce PVC co-located on the single workstation node. Do not
+#   scale across multiple nodes with ReadWriteOnce; switch to ReadWriteMany for multi-node clusters.
+# - External PostgreSQL, OIDC provider and OTLP collector are reached only through explicit
+#   NetworkPolicy egress peers and externally provisioned Secrets/ConfigMaps.
+#
+# Placeholders: reserved .example/.example.test domains (RFC 2606), all-zero digests, RFC 5737
+# documentation IP blocks, and non-existent Secret/ConfigMap names.
+
+images:
+  api:
+    registry: registry.openmettle.example
+    repository: openmettle/api
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  worker:
+    registry: registry.openmettle.example
+    repository: openmettle/worker
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  migrate:
+    registry: registry.openmettle.example
+    repository: openmettle/migrate
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+database:
+  # External role-scoped URL Secrets (api, worker, owner) with sslmode=verify-full and
+  # sslrootcert=/etc/openmettle/db-ca/ca.crt.
+  api:
+    existingSecret: workstation-openmettle-api-database
+  worker:
+    existingSecret: workstation-openmettle-worker-database
+  migrate:
+    existingSecret: workstation-openmettle-owner-database
+  caBundle:
+    enabled: true
+    configMapName: workstation-openmettle-db-ca
+    key: ca.crt
+
+api:
+  replicas: 1
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+storage:
+  artifacts:
+    enabled: true
+    # Single-node workstation ReadWriteOnce PVC. Both api and worker mount it at
+    # /var/lib/openmettle/artifacts; keep both Deployments on one node (or use ReadWriteMany on
+    # multi-node clusters). Override storageClassName in your private site file if needed.
+    size: 50Gi
+    accessModes: [ReadWriteOnce]
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: openmettle-openmettle-request-limits@kubernetescrd
+  hosts: [workstation.openmettle.example]
+  tls:
+    - secretName: workstation-openmettle-tls
+      hosts: [workstation.openmettle.example]
+
+networkPolicy:
+  api:
+    ingressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+    oidc:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.20/32
+      port: 443
+  database:
+    to:
+      - ipBlock:
+          cidr: 192.0.2.10/32
+  telemetry:
+    otlp:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.30/32
+      port: 4318
+
+auth:
+  enabled: true
+  configMapName: workstation-openmettle-auth-config
+  configKey: auth.json
+  loginKeysSecretName: workstation-openmettle-auth-login-keys
+  providerCaBundle:
+    enabled: true
+    configMapName: workstation-openmettle-oidc-ca
+    key: ca.crt
+
+telemetry:
+  logging:
+    format: json
+    level: info
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.workstation.example.test:4318/v1/traces
+    privateRanges:
+      - 10.43.0.0/16
+    caBundle:
+      enabled: true
+      configMapName: workstation-openmettle-otlp-ca
+      key: ca.crt
