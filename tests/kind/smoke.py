@@ -36,9 +36,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts" / "openmettle-core"
-# The core commit whose images are built and whose harness pins and guards are imported. It must
-# equal CORE_COMMIT in .github/workflows/checks.yml and tests/fixtures/core-<sha7> (unit-tested).
-CORE_COMMIT = "e5ff67339f1e27a270c5bd2707a7a363c44276f0"
+def _read_core_commit() -> str:
+    pin = (ROOT / "CORE_COMMIT").read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", pin):
+        raise ValueError(f"CORE_COMMIT must be a 40-character lowercase hex SHA, got {pin!r}")
+    return pin
+
+
+# Single source of truth: root CORE_COMMIT file (also read by checks.yml and kind-smoke.yml).
+CORE_COMMIT = _read_core_commit()
 CORE_MODULE = Path("tests") / "kubernetes" / "qualify.py"
 # Everything this harness takes from core's qualify.py.
 CORE_IMPORTS = (
