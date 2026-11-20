@@ -312,7 +312,7 @@
       }
     },
     "telemetry": {
-      "description": "Optional structured logging overrides across all roles (core ADR 0024) and OTLP/HTTP protobuf trace export for api and worker only (core ADR 0026).",
+      "description": "Optional structured logging overrides across all roles (core ADR 0024) and OTLP/HTTP protobuf trace and/or metrics export for api and worker only (core ADRs 0026 and 0028).",
       "type": "object",
       "additionalProperties": false,
       "required": ["logging", "otlp"],
@@ -327,13 +327,14 @@
           }
         },
         "otlp": {
-          "description": "Optional OTLP/HTTP protobuf trace export for api and worker only (never migrate). Off by default.",
+          "description": "Optional OTLP/HTTP protobuf trace and/or metrics export for api and worker only (never migrate). Off by default.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "tracesEndpoint", "privateRanges", "caBundle"],
+          "required": ["enabled", "tracesEndpoint", "metricsEndpoint", "privateRanges", "caBundle"],
           "properties": {
             "enabled": {"type": "boolean"},
-            "tracesEndpoint": {"$ref": "#/$defs/optionalOtlpTracesEndpoint"},
+            "tracesEndpoint": {"$ref": "#/$defs/optionalOtlpEndpoint"},
+            "metricsEndpoint": {"$ref": "#/$defs/optionalOtlpEndpoint"},
             "privateRanges": {
               "description": "Up to 32 unique canonical private CIDRs (RFC 1918, CGNAT or ULA), joined with commas into OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES when non-empty. Must stay empty while telemetry.otlp.enabled is false.",
               "type": "array",
@@ -357,13 +358,15 @@
           },
           "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
           "then": {
-            "properties": {
-              "tracesEndpoint": {"minLength": 1}
-            }
+            "anyOf": [
+              {"properties": {"tracesEndpoint": {"minLength": 1}}, "required": ["tracesEndpoint"]},
+              {"properties": {"metricsEndpoint": {"minLength": 1}}, "required": ["metricsEndpoint"]}
+            ]
           },
           "else": {
             "properties": {
               "tracesEndpoint": {"const": ""},
+              "metricsEndpoint": {"const": ""},
               "privateRanges": {"maxItems": 0},
               "caBundle": {
                 "properties": {
@@ -377,7 +380,7 @@
     }
   },
   "$defs": {
-    "otlpTracesEndpoint": {
+    "otlpEndpoint": {
       "description": "Canonical HTTPS URL with a lowercase DNS host (at least two labels; final label not numeric or 0x-hex), optional non-default port and path; no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments.",
       "type": "string",
       "maxLength": 2048,
@@ -391,8 +394,8 @@
         ]
       }
     },
-    "optionalOtlpTracesEndpoint": {
-      "anyOf": [{"const": ""}, {"$ref": "#/$defs/otlpTracesEndpoint"}]
+    "optionalOtlpEndpoint": {
+      "anyOf": [{"const": ""}, {"$ref": "#/$defs/otlpEndpoint"}]
     },
     "hostname": {
       "description": "Lowercase DNS name with at least two labels; no wildcard, port or IP address.",

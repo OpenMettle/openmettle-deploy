@@ -128,11 +128,13 @@ telemetry:
   logging:
     format: json
     level: info
-  # Optional OTLP/HTTP protobuf trace export for api and worker only (off by default; core ADR 0026).
-  # Never exported from openmettle-migrate, and the chart never deploys a collector.
+  # Optional OTLP/HTTP protobuf trace and/or metrics export for api and worker only (off by
+  # default; core ADRs 0026 and 0028). Either or both endpoints may be set while enabled; never
+  # exported from openmettle-migrate, and the chart never deploys a collector.
   otlp:
     enabled: true
     tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+    metricsEndpoint: https://alloy.observability.example.test:4318/v1/metrics
     # Illustrative RFC 1918 Service ClusterIP CIDR for an in-cluster collector (RFC 1918, CGNAT or
     # ULA); distinct from the RFC 5737 TEST-NET-1 documentation placeholder in networkPolicy.telemetry.otlp.to.
     privateRanges:

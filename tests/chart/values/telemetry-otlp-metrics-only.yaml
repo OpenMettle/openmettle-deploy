@@ -1,0 +1,12 @@
+# Synthetic overlay on minimal.yaml: OTLP metrics-only export enabled (tracesEndpoint left
+# empty; core ADR 0028 permits either or both endpoints independently).
+telemetry:
+  otlp:
+    enabled: true
+    metricsEndpoint: https://alloy.observability.example.test:4318/v1/metrics
+networkPolicy:
+  telemetry:
+    otlp:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.30/32

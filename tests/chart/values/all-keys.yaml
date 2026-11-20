@@ -150,7 +150,7 @@ auth:
     enabled: true
     configMapName: example-oidc-ca
     key: idp-ca.pem
-# Reserved synthetic telemetry logging and OTLP trace export values (I6).
+# Reserved synthetic telemetry logging and OTLP trace + metrics export values (I6/I9).
 telemetry:
   logging:
     format: text
@@ -158,6 +158,7 @@ telemetry:
   otlp:
     enabled: true
     tracesEndpoint: https://alloy.observability.example.test:4319/v1/traces
+    metricsEndpoint: https://alloy.observability.example.test:4319/v1/metrics
     privateRanges:
       - 10.43.0.0/16
       - fd00:10::/64

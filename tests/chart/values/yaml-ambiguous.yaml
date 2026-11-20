@@ -57,6 +57,7 @@ telemetry:
   otlp:
     enabled: true
     tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+    metricsEndpoint: https://alloy.observability.example.test:4318/v1/metrics
     privateRanges:
       - 10.43.0.0/16
     caBundle:

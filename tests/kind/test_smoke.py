@@ -1557,5 +1557,15 @@ class CriContainerImageIdTests(unittest.TestCase):
                     smoke.parse_cri_container_image_id(output)
 
 
+    def test_allowed_log_fields_include_metric_export_drops_and_match_core(self):
+        """Fails if ALLOWED_LOG_FIELDS drifts from core telemetry::FIELDS plus flattened metadata."""
+        self.assertIn("dropped_metric_exports", smoke.ALLOWED_LOG_FIELDS)
+        core_dir = os.environ.get("OPENMETTLE_CORE_DIR")
+        if core_dir:
+            contract = json.loads((Path(core_dir) / "contracts" / "telemetry" / "v1.json").read_text(encoding="utf-8"))
+            expected = set(contract["logs"]["allowed_fields"]) | {"timestamp", "level"}
+            self.assertEqual(smoke.ALLOWED_LOG_FIELDS, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -228,13 +228,17 @@ telemetry:
     format: null
     level: null
   otlp:
-    # Optional OTLP/HTTP protobuf trace export for api and worker only (core ADR 0026).
-    # Off by default: when false, no OTLP_* env vars, CA mounts or collector egress are rendered.
-    # openmettle-migrate is stderr-only and never receives OTLP settings, CA mounts or egress.
+    # Optional OTLP/HTTP protobuf trace and/or metrics export for api and worker only
+    # (core ADRs 0026 and 0028). Off by default: when false, no OTLP_* env vars, CA mounts or
+    # collector egress are rendered. openmettle-migrate is stderr-only and never receives OTLP
+    # settings, CA mounts or egress.
     enabled: false
-    # Required when enabled: canonical HTTPS URL with a DNS host (no http://, no IP literal,
-    # no credentials, no query or fragment). Passed via OPENMETTLE_{API,WORKER}_OTLP_TRACES_ENDPOINT.
+    # At least one of tracesEndpoint or metricsEndpoint is required when enabled (both must stay
+    # empty while disabled): canonical HTTPS URL with a DNS host (no http://, no IP literal,
+    # numeric/hex final host label, credentials, query, fragment or default port :443).
+    # Non-empty values render OPENMETTLE_{API,WORKER}_OTLP_{TRACES,METRICS}_ENDPOINT respectively.
     tracesEndpoint: ""
+    metricsEndpoint: ""
     # Optional list of up to 32 unique canonical private CIDR strings (RFC 1918, CGNAT or ULA)
     # joined with commas into OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES when non-empty.
     # Must stay empty while telemetry.otlp.enabled is false.
