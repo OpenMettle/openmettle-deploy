@@ -10,6 +10,9 @@ database:
     key: "false"
   migrate:
     key: "null"
+  issuance:
+    existingSecret: "true"
+    key: "0x1"
 api:
   serviceAccount:
     name: "555"

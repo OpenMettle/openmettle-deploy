@@ -407,20 +407,24 @@ at least one voluntary eviction, or it blocks node drains.
 {{- end -}}
 {{- /*
 Peak while a rollout surges. Terminating pods keep their pools open for up to their grace period
-and are not counted; see the chart README.
+and are not counted; see the chart README. With auth, each API pod also opens its issuance pool.
 */ -}}
 {{- with .Values.database.connectionBudget -}}
-{{- $api := mul (add $.Values.api.replicas $.Values.api.strategy.maxSurge) $.Values.api.settings.dbMaxConnections -}}
+{{- $apiPool := $.Values.api.settings.dbMaxConnections -}}
+{{- if $.Values.auth.enabled -}}
+{{- $apiPool = add $apiPool $.Values.api.settings.issuanceDbMaxConnections -}}
+{{- end -}}
+{{- $api := mul (add $.Values.api.replicas $.Values.api.strategy.maxSurge) $apiPool -}}
 {{- $worker := mul (add $.Values.worker.replicas $.Values.worker.strategy.maxSurge) $.Values.worker.settings.dbMaxConnections -}}
 {{- $total := add $api $worker 1 -}}
 {{- if gt (int64 $total) (int64 .) -}}
-{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d (replicas plus maxSurge, times dbMaxConnections) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker)) -}}
+{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker)) -}}
 {{- end -}}
 {{- end -}}
 {{- /*
 Sign-in / OIDC and /v1/* application routes (core ADRs 0025, 0027 and 0029). Mounted into the API pod only; never into worker or
 migrate pods. The checks repeat the schema for --skip-schema-validation and enforce cross-field
-provider CA and NetworkPolicy egress guards.
+provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030) guards.
 */ -}}
 {{- $auth := .Values.auth -}}
 {{- if $auth.enabled -}}
@@ -444,7 +448,32 @@ provider CA and NetworkPolicy egress guards.
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
 {{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
 {{- end -}}
+{{- /*
+Session issuance (core ADR 0030): sign-in requires a second, API-only database credential for a
+login role of openmettle_issuance. Reusing another component's Secret key would hand the API the
+same login role twice (core exits 78) or mount a role's credential where it does not belong.
+*/ -}}
+{{- $issuance := .Values.database.issuance -}}
+{{- if not $issuance.existingSecret -}}
+{{- fail "database.issuance.existingSecret is required when auth.enabled is true (an existing Secret holding the openmettle_issuance PostgreSQL URL; core ADR 0030)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $issuance.key)) -}}
+{{- fail "database.issuance.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
+{{- end -}}
+{{- range $role := list "api" "worker" "migrate" -}}
+{{- $ref := index $.Values.database $role -}}
+{{- if and (eq (toString $issuance.existingSecret) (toString $ref.existingSecret)) (eq (toString $issuance.key) (toString $ref.key)) -}}
+{{- fail (printf "database.issuance must not reuse database.%s (Secret %q, key %q); session issuance needs its own openmettle_issuance login (core ADR 0030)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
+{{- end -}}
+{{- end -}}
+{{- $issuanceConnections := .Values.api.settings.issuanceDbMaxConnections -}}
+{{- if or (not (or (kindIs "int" $issuanceConnections) (kindIs "int64" $issuanceConnections) (kindIs "float64" $issuanceConnections))) (ne (float64 (int64 $issuanceConnections)) (float64 $issuanceConnections)) (lt (int64 $issuanceConnections) 1) (gt (int64 $issuanceConnections) 64) -}}
+{{- fail (printf "api.settings.issuanceDbMaxConnections (%v) must be an integer between 1 and 64" $issuanceConnections) -}}
+{{- end -}}
 {{- else -}}
+{{- if .Values.database.issuance.existingSecret -}}
+{{- fail "database.issuance.existingSecret must be empty when auth.enabled is false; the issuance URL is mounted only with sign-in (core ADR 0030)" -}}
+{{- end -}}
 {{- if $auth.providerCaBundle.enabled -}}
 {{- fail "auth.providerCaBundle.enabled cannot be true when auth.enabled is false" -}}
 {{- end -}}

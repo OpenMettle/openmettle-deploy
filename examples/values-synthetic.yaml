@@ -37,6 +37,10 @@ database:
     existingSecret: example-openmettle-worker-database
   migrate:
     existingSecret: example-openmettle-owner-database
+  # Sign-in (auth.enabled below) also needs the API-only session issuance URL of an openmettle_issuance
+  # login role (core ADR 0030), in its own Secret.
+  issuance:
+    existingSecret: example-openmettle-issuance-database
   # Existing ConfigMap with the PEM bundle of the CA that issued the PostgreSQL server certificate.
   caBundle:
     enabled: true

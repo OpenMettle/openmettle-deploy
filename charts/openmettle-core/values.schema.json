@@ -24,11 +24,15 @@
     "database": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["api", "worker", "migrate"],
+      "required": ["api", "worker", "migrate", "issuance"],
       "properties": {
         "api": {"$ref": "#/$defs/secretKeyRef"},
         "worker": {"$ref": "#/$defs/secretKeyRef"},
         "migrate": {"$ref": "#/$defs/secretKeyRef"},
+        "issuance": {
+          "description": "openmettle_issuance URL mounted into the API container only (core ADR 0030). Required while auth.enabled is true and empty otherwise; rendering also fails if it reuses the api, worker or migrate Secret key.",
+          "$ref": "#/$defs/secretKeyRef"
+        },
         "connectionBudget": {"type": ["integer", "null"], "minimum": 1},
         "caBundle": {
           "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/db-ca/ca.crt in api, worker and migrate pods.",
@@ -56,7 +60,7 @@
         "replicas": {"$ref": "#/$defs/replicas"},
         "resources": {"$ref": "#/$defs/resources"},
         "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
-        "settings": {"$ref": "#/$defs/processSettings"},
+        "settings": {"$ref": "#/$defs/apiSettings"},
         "terminationGracePeriodSeconds": {"$ref": "#/$defs/gracePeriod"},
         "strategy": {"$ref": "#/$defs/strategy"},
         "service": {
@@ -379,6 +383,9 @@
       }
     }
   },
+  "if": {"properties": {"auth": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}, "required": ["auth"]},
+  "then": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"minLength": 1}}}}}}},
+  "else": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"const": ""}}}}}}},
   "$defs": {
     "otlpEndpoint": {
       "description": "Canonical HTTPS URL with a lowercase DNS host (at least two labels; final label not numeric or 0x-hex), optional non-default port and path; no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments.",
@@ -531,6 +538,18 @@
         "dbMaxConnections": {"type": "integer", "minimum": 1, "maximum": 64},
         "dbTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 30000},
         "shutdownTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 60000}
+      }
+    },
+    "apiSettings": {
+      "description": "processSettings plus the API-only session issuance pool size (core ADR 0030), with the same 1-64 bound as dbMaxConnections.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dbMaxConnections", "dbTimeoutMs", "shutdownTimeoutMs", "issuanceDbMaxConnections"],
+      "properties": {
+        "dbMaxConnections": {"$ref": "#/$defs/processSettings/properties/dbMaxConnections"},
+        "dbTimeoutMs": {"$ref": "#/$defs/processSettings/properties/dbTimeoutMs"},
+        "shutdownTimeoutMs": {"$ref": "#/$defs/processSettings/properties/shutdownTimeoutMs"},
+        "issuanceDbMaxConnections": {"$ref": "#/$defs/processSettings/properties/dbMaxConnections"}
       }
     },
     "strategy": {

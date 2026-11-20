@@ -29,6 +29,7 @@ The chart refuses to render until you supply:
 
 - `images.{api,worker,migrate}.repository` and `.digest`. Images render as `[registry/]repository@sha256:<digest>`. Tags are not accepted in either field. `registry` is optional. The migrate image is not needed when `migration.enabled` is false.
 - `database.{api,worker,migrate}.existingSecret`: names of existing Secrets. Each holds a full `postgres://` URL under `key` (default `url`). The migrate Secret is not needed when `migration.enabled` is false.
+- `database.issuance.existingSecret` while `auth.enabled` is true: the session issuance URL (see [Database roles and Secrets](#database-roles-and-secrets)). It must stay empty while `auth.enabled` is false.
 - `networkPolicy.database.to`: at least one Kubernetes `NetworkPolicyPeer` for PostgreSQL while `networkPolicy.enabled` is true. An empty list is rejected at render time because Kubernetes treats an empty `to` list as allowing every destination.
 
 | Key | Default | Meaning |
@@ -37,6 +38,7 @@ The chart refuses to render until you supply:
 | `images.pullSecrets` | `[]` | Names of existing pull Secrets |
 | `images.<component>.{registry,repository,digest}` | `""` | See above |
 | `database.<component>.{existingSecret,key}` | `""`, `url` | See above |
+| `database.issuance.{existingSecret,key}` | `""`, `url` | Required while `auth.enabled` is true and refused while it is false: an `openmettle_issuance` login URL, rendered as `OPENMETTLE_API_ISSUANCE_DATABASE_URL` on the API container only. Rendering fails if it names the same Secret and key as `database.api`, `database.worker` or `database.migrate` |
 | `database.connectionBudget` | `null` | Optional; see [Connection budget](#connection-budget) |
 | `api.replicas`, `worker.replicas` | `1` | Independent |
 | `api.resources`, `worker.resources` | requests `100m` CPU, `64Mi` | Core's contract examples, not qualified sizing. Only `cpu`, `memory` and `ephemeral-storage` are accepted. |
@@ -44,6 +46,7 @@ The chart refuses to render until you supply:
 | `<component>.settings.dbMaxConnections` | `4` | `OPENMETTLE_<ROLE>_DB_MAX_CONNECTIONS`, 1–64 |
 | `<component>.settings.dbTimeoutMs` | `2000` | `OPENMETTLE_<ROLE>_DB_TIMEOUT_MS`, 1–30000 |
 | `<component>.settings.shutdownTimeoutMs` | `5000` | `OPENMETTLE_<ROLE>_SHUTDOWN_TIMEOUT_MS`, 1–60000 |
+| `api.settings.issuanceDbMaxConnections` | `2` | `OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS`, 1–64; rendered only while `auth.enabled` is true. The worker has no such setting |
 | `<component>.terminationGracePeriodSeconds` | `15` | Must exceed `shutdownTimeoutMs`; rendering fails otherwise |
 | `<component>.strategy.{maxSurge,maxUnavailable}` | `1`, `0` | Integers; both 0 is rejected |
 | `api.service.port` | `8080` | Service port; container ports are fixed |
@@ -92,7 +95,7 @@ The chart refuses to render until you supply:
 
 `<component>` is `api` or `worker`; `<ROLE>` is `API` or `WORKER` (plus `MIGRATE` for `telemetry.logging`).
 
-Every process gets an explicit environment: `BIND` (`0.0.0.0:8080` or `0.0.0.0:8081`; core otherwise binds loopback), `DATABASE_URL` from its own Secret through `secretKeyRef`, the settings above, optional `LOG_FORMAT`/`LOG_LEVEL` across all three roles when non-null, optional `OTLP_TRACES_ENDPOINT`/`OTLP_METRICS_ENDPOINT`/`OTLP_CA_FILE`/`OTLP_PRIVATE_RANGES` on `api` and `worker` when `telemetry.otlp.enabled` is true, `ARTIFACTS_DIR=/var/lib/openmettle/artifacts` on `api` and `worker` when `storage.artifacts.enabled` is true, and—when `auth.enabled` is true on the API only—`OPENMETTLE_API_AUTH_CONFIG=/etc/openmettle/auth/auth.json`. The chart never uses `envFrom`. Each variable carries its own component prefix, as core ADR 0002 requires. Set `sslmode` explicitly in every URL, because SQLx defaults to `prefer`, which permits plaintext fallback. Readiness `timeoutSeconds` is `ceil(dbTimeoutMs / 1000) + 1`, because `/readyz` waits up to the database timeout.
+Every process gets an explicit environment: `BIND` (`0.0.0.0:8080` or `0.0.0.0:8081`; core otherwise binds loopback), `DATABASE_URL` from its own Secret through `secretKeyRef`, the settings above, optional `LOG_FORMAT`/`LOG_LEVEL` across all three roles when non-null, optional `OTLP_TRACES_ENDPOINT`/`OTLP_METRICS_ENDPOINT`/`OTLP_CA_FILE`/`OTLP_PRIVATE_RANGES` on `api` and `worker` when `telemetry.otlp.enabled` is true, `ARTIFACTS_DIR=/var/lib/openmettle/artifacts` on `api` and `worker` when `storage.artifacts.enabled` is true, and—when `auth.enabled` is true on the API only—`OPENMETTLE_API_AUTH_CONFIG=/etc/openmettle/auth/auth.json`, `OPENMETTLE_API_ISSUANCE_DATABASE_URL` from `database.issuance` through `secretKeyRef` and `OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS`. Neither issuance variable is ever rendered without `auth.enabled`, or on the worker or the migrate Job: core exits 78 in each of those cases. The chart never uses `envFrom`. Each variable carries its own component prefix, as core ADR 0002 requires. Set `sslmode` explicitly in every URL, because SQLx defaults to `prefer`, which permits plaintext fallback. Readiness `timeoutSeconds` is `ceil(dbTimeoutMs / 1000) + 1`, because `/readyz` waits up to the database timeout.
 
 Keep site values in a private overlay outside this repository and pass it with `-f`; see [Private overlays](#private-overlays). The synthetic files under `tests/chart/values/` use reserved `example.test` names and all-zero digests; they render but cannot be installed.
 
@@ -100,9 +103,24 @@ Keep site values in a private overlay outside this repository and pass it with `
 
 Core ADR 0003 bounds PostgreSQL connections at the server. When `database.connectionBudget` is set, rendering fails unless
 
-`(api.replicas + api.maxSurge) × api.dbMaxConnections + (worker.replicas + worker.maxSurge) × worker.dbMaxConnections + 1 (migrator) ≤ connectionBudget`.
+`(api.replicas + api.maxSurge) × (api.dbMaxConnections + api.issuanceDbMaxConnections) + (worker.replicas + worker.maxSurge) × worker.dbMaxConnections + 1 (migrator) ≤ connectionBudget`,
+
+where `api.issuanceDbMaxConnections` counts only while `auth.enabled` is true, because each API pod then opens a second, lazy issuance pool (core ADR 0030). For example, with sign-in enabled, 2 API and 2 worker replicas and the default pool sizes, core's README budgets 2 × (4 + 2) + 2 × 4 + 1 + 3 headroom = 24 connections; the chart's check additionally counts each component's `maxSurge` replicas.
 
 Set it to the connections available to this release, after subtracting reserved and administrative or backup headroom. The check covers configured pools only. It also excludes Terminating pods: during a rollout, a replaced pod keeps its pool open while it drains, for up to `terminationGracePeriodSeconds`, so the actual peak can briefly exceed the computed one. Leave headroom for that. Enforce each role's share in PostgreSQL with `CONNECTION LIMIT`; the chart does not manage roles.
+
+### Database roles and Secrets
+
+Provision the PostgreSQL roles and the database outside the chart before the first migration, as core's README ("Schema migrations") describes. Core migration 18 refuses to run, and rolls back, while `openmettle_issuance` is missing, so existing installations must create it before upgrading to a core release that includes it (core ADR 0030):
+
+| Login role | Secret value | Mounted into |
+| --- | --- | --- |
+| `openmettle_owner` | `database.migrate` | migrate Job only |
+| `openmettle_api` | `database.api` | `api` |
+| `openmettle_issuance` | `database.issuance` | `api` only, and only while `auth.enabled` is true |
+| `openmettle_worker` | `database.worker` | `worker` |
+
+Each Secret must carry a different login: core's boundary audit refuses a login role that reaches more than one of `openmettle_api`, `openmettle_issuance` and `openmettle_worker`, and the API refuses an issuance URL whose user equals its primary URL's user. The chart can only compare Secret names and keys, so it rejects the obvious reuse and leaves the login check to core. Where `openmettle_api` SQL may have been exposed before the upgrade, revoke pre-upgrade sessions after migration 18 as core ADR 0030 ("Upgrade") describes; the chart does not do this.
 
 ## Security defaults
 
@@ -111,7 +129,7 @@ These are fixed and are not values:
 - Pod: `runAsNonRoot`, `runAsUser`/`runAsGroup` 65532 (the core image user), seccomp `RuntimeDefault`. `fsGroup: 65532` is added to api and worker pods when mounting the artifact volume (with `fsGroupChangePolicy: OnRootMismatch`) and to the api pod when `auth.enabled` is true (so mode `0440` login key Secret files are readable by GID `65532` without world-read permission).
 - Container: `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`, `privileged: false`. By default no volumes are mounted. The only optional volumes are the artifact claim (read-write, api and worker), the database CA ConfigMap (read-only, every component), browser sign-in config, login keys and optional provider CA (read-only, api only), and the optional OTLP collector CA ConfigMap (read-only, api and worker only). The root filesystem stays read-only either way.
 - `automountServiceAccountToken: false` on every ServiceAccount and every pod, plus `enableServiceLinks: false`. The processes never call the Kubernetes API, so the chart creates no RBAC.
-- Credentials come only from existing Secrets. The owner credential reaches only the migration Job. The chart never uses `lookup`.
+- Credentials come only from existing Secrets. The owner credential reaches only the migration Job, and the session issuance credential only the API container while `auth.enabled` is true. The chart never uses `lookup`.
 - `/healthz` and `/readyz` are unauthenticated. The Service is ClusterIP only, `networkPolicy.api.ingressFrom` defaults to empty, and the Ingress is off by default.
 
 ## NetworkPolicy
@@ -145,7 +163,7 @@ helm upgrade --install openmettle charts/openmettle-core --namespace openmettle 
   -f examples/values-workstation-profile.yaml -f config/site.local.yaml --timeout 15m
 ```
 
-The overlay references objects the chart never creates: the three database URL Secrets, the database CA ConfigMap, an existing artifact PVC (if used), the TLS Secret, the IngressClass, any Traefik Middleware, and (when `auth.enabled` is true) the auth settings ConfigMap, login-keys Secret and optional provider CA ConfigMap. Create them in the release namespace first. Configure browser sign-in under `auth:` and `networkPolicy.api.oidc:`; the schema still rejects an unknown top-level `oidc:` key.
+The overlay references objects the chart never creates: the three database URL Secrets (four, with the issuance Secret, when `auth.enabled` is true), the database CA ConfigMap, an existing artifact PVC (if used), the TLS Secret, the IngressClass, any Traefik Middleware, and (when `auth.enabled` is true) the auth settings ConfigMap, login-keys Secret and optional provider CA ConfigMap. Create them in the release namespace first. Configure browser sign-in under `auth:` and `networkPolicy.api.oidc:`; the schema still rejects an unknown top-level `oidc:` key.
 
 ## Database CA
 
@@ -258,7 +276,8 @@ The chart never creates ConfigMaps or Secrets. Every file comes from a pre-exist
 
 - **Non-overlapping sibling directories.** The three mounts sit side by side under `/etc/openmettle/` (`/etc/openmettle/auth`, `/etc/openmettle/auth-keys`, `/etc/openmettle/auth-ca`, alongside `/etc/openmettle/db-ca`). Kubernetes mounts ConfigMap volumes read-only, so nesting another volume inside `/etc/openmettle/auth` (such as `/etc/openmettle/auth/keys`) would fail container startup with `EROFS` when the runtime attempts to create the nested mountpoint. The `/etc/openmettle/auth-keys/<file>` path also matches core ADR 0015's document example.
 - **Why `worker` and `migrate` never mount auth or receive OIDC egress.** Core ADRs 0025, 0027 and 0029 restrict `OPENMETTLE_API_AUTH_CONFIG` to `openmettle-api`. Neither `openmettle-worker` nor `openmettle-migrate` serves sign-in or `/v1/*` routes, reads login keys or contacts an identity provider. Keeping the ConfigMap, login-keys Secret, provider CA and `networkPolicy.api.oidc` egress rule strictly on the API pod preserves least privilege so a worker or migration job never has access to login-key material or provider reachability.
-- **Strict guards.** When `auth.enabled` is true, `auth.configMapName` and `auth.loginKeysSecretName` are required, and while `networkPolicy.enabled` is true `networkPolicy.api.oidc.to` must list at least one OIDC provider peer (on TCP `networkPolicy.api.oidc.port`, default `443`, configurable `1`–`65535` for self-hosted providers such as Keycloak on `8443`). When `auth.enabled` is false, `auth.providerCaBundle.enabled: true` and non-empty `networkPolicy.api.oidc.to` are both rejected so unused CA mounts or egress rules are never silently left behind.
+- **Session issuance credential (core ADR 0030).** Sign-in completion issues sessions on a second database pool as `openmettle_issuance`, so `auth.enabled: true` also requires `database.issuance.existingSecret` and renders `OPENMETTLE_API_ISSUANCE_DATABASE_URL` and `OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS` on the API container. Both pools reach the same PostgreSQL peers, so `networkPolicy.database` needs no change. Core images before `2c62e8a` (migration 18) do not read either variable, so use matching images. See [Database roles and Secrets](#database-roles-and-secrets).
+- **Strict guards.** When `auth.enabled` is true, `auth.configMapName`, `auth.loginKeysSecretName` and `database.issuance.existingSecret` are required, and while `networkPolicy.enabled` is true `networkPolicy.api.oidc.to` must list at least one OIDC provider peer (on TCP `networkPolicy.api.oidc.port`, default `443`, configurable `1`–`65535` for self-hosted providers such as Keycloak on `8443`). When `auth.enabled` is false, `auth.providerCaBundle.enabled: true`, non-empty `networkPolicy.api.oidc.to` and a non-empty `database.issuance.existingSecret` are all rejected so unused CA mounts, egress rules or credentials are never silently left behind.
 
 ### Offline validation, rollout and prerequisites
 
@@ -323,17 +342,17 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 
 ### Kind smoke test (I2/I3/I7/I10)
 
-[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `94d21f8` (`CORE_COMMIT`), referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
+[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `2c62e8a` (`CORE_COMMIT`), referenced by digest, and a synthetic PostgreSQL fixture with the four login roles of [Database roles and Secrets](#database-roles-and-secrets). It checks these acceptance items against live state:
 
 | Item | Smoke-tested |
 | --- | --- |
 | api, worker and migrate images install by digest | Yes (digest read back from the node's containerd) |
-| Migration hook completes before the Deployments roll out | Yes (under namespace default-deny) |
+| Migration hook completes before the Deployments roll out | Yes (under namespace default-deny; the history must reach migration 18, `openmettle_issuance`) |
 | API and worker Ready; `/readyz` 200 | Yes |
 | Worker scales to 2 while the API stays at 1 | Yes, through `worker.replicas` |
-| No optional package present (default install; `/auth/*` and `/v1/*` answer `404`) | Yes |
+| No optional package present (default install; `/auth/*` and `/v1/*` answer `404`; no `*ISSUANCE*` variable on `api`, `worker` or the migrate hook Job) | Yes |
 | Same-digest `helm upgrade` reruns migrate as a no-op and stays Ready | Yes |
-| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`, `auth.enabled: true` with `browser` + `native` v2 profile) | Yes (checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount + `OPENMETTLE_{API,WORKER}_ARTIFACTS_DIR` + `staging/` and `revisions/` created `0700` by core at startup, API-only `auth` mounts + `0440`/`fsGroup: 65532` `openmettle-api --check-auth-config`, live `/auth/session` `403`, `/auth/native/session` `403` & `/v1/capabilities` `401` problem JSON body (`code: "unauthenticated"`), and ADR 0024 JSON/debug stderr logs on `api` and `worker`) |
+| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`, `auth.enabled: true` with `browser` + `native` v2 profile) | Yes (checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount + `OPENMETTLE_{API,WORKER}_ARTIFACTS_DIR` + `staging/` and `revisions/` created `0700` by core at startup, API-only `auth` mounts + `0440`/`fsGroup: 65532` `openmettle-api --check-auth-config`, `OPENMETTLE_API_ISSUANCE_DATABASE_URL` (required `secretKeyRef` to the issuance Secret) and `OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS=2` on `api` only, with no issuance variable or Secret reference on `worker` or the migrate hook Job, live `/auth/session` `403`, `/auth/native/session` `403` & `/v1/capabilities` `401` problem JSON body (`code: "unauthenticated"`), and ADR 0024 JSON/debug stderr logs on `api` and `worker`) |
 | `helm uninstall` leaves no non-kept release objects | Yes (release Deployments, Services, NetworkPolicies and PDB removed; chart-owned artifact PVC kept via `helm.sh/resource-policy: keep`) |
 | App namespace enforces Pod Security `restricted` | Yes |
 | NetworkPolicy enforced under namespace default-deny | Yes |
@@ -342,13 +361,14 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 | I6/I9 OTLP trace & metrics export (`api`/`worker` CA mount & collector egress) | No. Off in the chart smoke run (qualified in core `telemetry-qualification.yml`); chart render tests and kubeconform only |
 | Registry pulls, TLS to PostgreSQL, ingress controller, multi-node | No (owner's qualification) |
 
-The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch `CORE_COMMIT`, the chart or the harness, and on manual dispatch. All 10 checks—including I2 install/upgrade/uninstall, I3 NetworkPolicy enforcement, I7 enabled-profile upgrade, I9 core `b5ee68d` (`main`, PR #15) and I10 core `adef30a` (adding default-off `404` checks plus enabled-profile `auth.enabled: true` mounts, `--check-auth-config` and `/auth/*` + `/v1/*` route checks; [pull-request run 44761077005](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44761077005)) and V1-15 core `94d21f8` (adding `ARTIFACTS_DIR` in every api and worker pod spec and a live `stat` of the store's `staging/` and `revisions/` directories, UID `65532` mode `0700`, on the `local-path` PVC; [pull-request run 44778163598](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44778163598) on `19e770c`)—passed on hosted `kind-smoke` CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch `CORE_COMMIT`, the chart or the harness, and on manual dispatch. All 10 checks—including I2 install/upgrade/uninstall, I3 NetworkPolicy enforcement, I7 enabled-profile upgrade, I9 core `b5ee68d` (`main`, PR #15) and I10 core `adef30a` (adding default-off `404` checks plus enabled-profile `auth.enabled: true` mounts, `--check-auth-config` and `/auth/*` + `/v1/*` route checks; [pull-request run 44761077005](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44761077005)) and V1-15 core `94d21f8` (adding `ARTIFACTS_DIR` in every api and worker pod spec and a live `stat` of the store's `staging/` and `revisions/` directories, UID `65532` mode `0700`, on the `local-path` PVC; [pull-request run 44778163598](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44778163598) on `19e770c`)—passed on hosted `kind-smoke` CI (see [`tests/kind`](../../tests/kind/README.md)). AUTHSEC-01 moves the pin to core `2c62e8a` (migration 18) and adds the `openmettle_issuance` role, its Secret and the issuance isolation checks above; their hosted `kind-smoke` result is recorded on the pull request that introduced them and on core issue #73. The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
 - **I2/I3/I7/I8/I9/I10:** owner acceptance (hosted `kind-smoke` verification on core `adef30a`, including `auth` + `/v1/*` smoke checks, passed in [run 44761077005](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44761077005); on core `94d21f8`, including the `ARTIFACTS_DIR` store checks, it passed in [run 44778163598](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44778163598)).
 - **I4 (render contract delivered; API PDB and single-node RWO artifact PVC added to I7 kind smoke; `ARTIFACTS_DIR` wired for core V1-15 PR1):** artifact upload and download through `/v1` (V1-15 PR2) against the mounted volume, live verification of the database CA against TLS-enabled PostgreSQL, the API PDB during a real node drain, `ReadWriteMany` multi-node artifact storage, and the Ingress behind Traefik, including the access-log [acceptance check](#ingress-and-tls).
 - **I5/I10 (render contract delivered; API-only `auth` mounts, Secret `0440`/`fsGroup: 65532` `--check-auth-config` readability and `/auth/*` + `/v1/*` route mounting added to I10 kind smoke):** live cluster qualification of `networkPolicy.api.oidc` egress and `auth.providerCaBundle` against a real OIDC provider (core's `oidc-qualification.yml` already qualifies browser and native sign-in against Keycloak 26.8.2; owner cluster qualification remains separate), plus an optional pre-upgrade `--check-auth-config` hook if needed.
+- **AUTHSEC-01 (core #73):** `database.issuance` and `api.settings.issuanceDbMaxConnections` are delivered with render tests and kind smoke checks; owner acceptance of core ADR 0030 and live qualification of sign-in through both pools on the owner's cluster remain open. Core ADR 0030 ("Evidence required for acceptance") lists core's own two-pool tests.
 - **I6/I9 (render contract for `tracesEndpoint` + `metricsEndpoint` delivered; `telemetry.logging` `json`/`debug` added to I7 kind smoke):** chart-installed live cluster qualification of `telemetry.otlp` export, `/etc/openmettle/otlp-ca/ca.crt` trust verification and `networkPolicy.telemetry.otlp` egress against an OTLP/HTTP collector (core's own `telemetry-qualification.yml` already qualifies live Alloy + Prometheus ingestion on kind; owner cluster qualification remains separate).
 - **V1-20** (managed inference, accelerated tools) and **V1-06** (external providers or gateway): separate charts and releases, never subcharts of core.
 - Qualification on the owner's cluster is an owner action.

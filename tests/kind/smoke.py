@@ -6,9 +6,9 @@ pinned core checkout, loads them into a uniquely named kind cluster classified `
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
 migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
 (API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug structured logs, and
-API-only auth + /v1/* mounts), uninstall (with chart-owned PVC preservation), absence of
-optional packages and unmounted 404 routes on default install, Pod Security `restricted`
-enforcement and NetworkPolicy enforcement (I3). Every assertion reads
+API-only auth + /v1/* mounts and session issuance credential), uninstall (with chart-owned PVC
+preservation), absence of optional packages, issuance settings and unmounted 404 routes on
+default install, Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
 live cluster, Helm or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
 
@@ -68,8 +68,16 @@ WORKLOADS = ("api", "worker")
 REGISTRY = "openmettle-smoke.invalid"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SECRET = {"api": "openmettle-api-database", "worker": "openmettle-worker-database",
-          "migrate": "openmettle-owner-database"}
-DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "openmettle_owner"}
+          "migrate": "openmettle-owner-database", "issuance": "openmettle-issuance-database"}
+DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "openmettle_owner",
+           "issuance": "openmettle_issuance"}
+# Every PostgreSQL login the fixture provisions: one per image role, plus the API-only session
+# issuance login (core ADR 0030), which core migration 18 requires before it runs.
+DB_LOGINS = (*ROLES, "issuance")
+ISSUANCE_MIGRATION = 18  # core migrations/0018_session_issuance_role.sql
+ISSUANCE_URL_ENV = "OPENMETTLE_API_ISSUANCE_DATABASE_URL"
+ISSUANCE_POOL_ENV = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
+ISSUANCE_POOL = "2"  # chart default api.settings.issuanceDbMaxConnections
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
 MIGRATION_DEADLINE_SECONDS = 120
 OPTIONAL_KINDS = "ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
@@ -288,6 +296,7 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
             "to": [{"ipBlock": {"cidr": AUTH_OIDC_CIDR}}],
             "port": 443,
         }
+        values["database"]["issuance"] = {"existingSecret": SECRET["issuance"]}
     return values
 
 
@@ -372,14 +381,15 @@ def database_url(role: str, password: str) -> str:
 
 
 def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict:
-    """Namespaces, a synthetic PostgreSQL fixture and the three URL Secrets the chart reads.
+    """Namespaces, a synthetic PostgreSQL fixture and the four URL Secrets the chart reads.
 
-    passwords holds per-run random values for admin and each role in ROLES. Provisioning follows
-    core README "Schema migrations": three login roles and one database owned by the owner role.
+    passwords holds per-run random values for admin and each login in DB_LOGINS. Provisioning follows
+    core README "Schema migrations": four login roles (owner, api, issuance, worker), created before
+    migration 1, and one database owned by the owner role.
     """
     labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
     sql = "".join(f"CREATE ROLE {DB_ROLE[role]} LOGIN PASSWORD '{passwords[role]}';\n"
-                  for role in ROLES)
+                  for role in DB_LOGINS)
     sql += "CREATE DATABASE openmettle OWNER openmettle_owner;\n"
     selector = POSTGRES_LABELS
     items = [
@@ -447,7 +457,7 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
     # Created by the test, not the chart: the chart only references existing ConfigMaps and Secrets.
     items += [{"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
                "metadata": {"name": SECRET[role], "namespace": APP_NAMESPACE, "labels": labels},
-               "stringData": {"url": database_url(role, passwords[role])}} for role in ROLES]
+               "stringData": {"url": database_url(role, passwords[role])}} for role in DB_LOGINS]
     items += [
         {"apiVersion": "v1", "kind": "ConfigMap",
          "metadata": {"name": AUTH_CONFIG_MAP, "namespace": APP_NAMESPACE, "labels": labels},
@@ -767,6 +777,47 @@ def check_auth_mounts(pods_by_role: dict) -> dict:
             "keys_dir": AUTH_KEYS_DIR, "secret_mode": AUTH_SECRET_MODE, "worker_isolated": True}
 
 
+def check_issuance_env(pods_by_role: dict, hooks: str, *, enabled: bool) -> dict:
+    """Core ADR 0030: the issuance URL (a required Secret reference) and pool size reach the api
+    container exactly while auth is enabled, and never a worker pod or the migrate hook Job, whose
+    processes exit 78 if they receive the URL. `hooks` is the release's `helm get hooks` manifest."""
+    api_pods = pods_by_role.get("api") or []
+    worker_pods = pods_by_role.get("worker") or []
+    if not api_pods or not worker_pods:
+        raise SmokeFailure("api and worker pods are required to verify issuance credential isolation")
+    for pod in api_pods:
+        container = next((c for c in pod.get("spec", {}).get("containers") or [] if c.get("name") == "api"), None)
+        if container is None:
+            raise SmokeFailure("api pod has no container named 'api'")
+        env = {e.get("name"): e for e in container.get("env") or []}
+        names = sorted(name for name in env if "ISSUANCE" in str(name))
+        if not enabled:
+            if names:
+                raise SmokeFailure(f"api container receives {names} without auth")
+            continue
+        if names != sorted([ISSUANCE_URL_ENV, ISSUANCE_POOL_ENV]):
+            raise SmokeFailure(f"api container issuance env is {names}")
+        url = env[ISSUANCE_URL_ENV]
+        ref = url.get("valueFrom", {}).get("secretKeyRef", {})
+        if "value" in url or (ref.get("name"), ref.get("key")) != (SECRET["issuance"], "url") \
+                or ref.get("optional", False) is not False:
+            raise SmokeFailure(f"api {ISSUANCE_URL_ENV} is not a required reference to "
+                               f"Secret {SECRET['issuance']} key url")
+        if env[ISSUANCE_POOL_ENV].get("value") != ISSUANCE_POOL:
+            raise SmokeFailure(f"api {ISSUANCE_POOL_ENV} is not {ISSUANCE_POOL}")
+    for pod in worker_pods:
+        spec = json.dumps(pod.get("spec", {}))
+        if "ISSUANCE" in spec or SECRET["issuance"] in spec:
+            raise SmokeFailure("worker pod must not receive the issuance credential")
+    if "OPENMETTLE_MIGRATE_DATABASE_URL" not in hooks:
+        raise SmokeFailure("release hooks do not contain the migrate Job")
+    if "ISSUANCE" in hooks or SECRET["issuance"] in hooks:
+        raise SmokeFailure("migrate hook Job must not receive the issuance credential")
+    return {"api_pods": len(api_pods), "api_issuance_env": enabled,
+            "issuance_pool": ISSUANCE_POOL if enabled else None,
+            "worker_isolated": True, "migrate_isolated": True}
+
+
 def evaluate_mounted_auth_http(responses: dict) -> dict:
     """Verify mounted browser (403), native (403) and /v1/capabilities (401 problem JSON body) responses."""
     for path, expected_status in MOUNTED_AUTH_HTTP.items():
@@ -1080,7 +1131,7 @@ class Smoke:
 
     def deploy_fixtures(self):
         self.passwords = {
-            **{k: secrets.token_hex(16) for k in ("admin", *ROLES)},
+            **{k: secrets.token_hex(16) for k in ("admin", *DB_LOGINS)},
             "auth_login_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
         }
         manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id)
@@ -1208,6 +1259,7 @@ class Smoke:
         self.expect(self.migrations() == history, "migration history changed on enabled-profile upgrade")
         pods_by_role = {c: self.pods(c) for c in WORKLOADS}
         auth_mounts = check_auth_mounts(pods_by_role)
+        issuance = check_issuance_env(pods_by_role, self.helm_run("get", "hooks", RELEASE).stdout, enabled=True)
         for pod_name in profile["pods"]["api"]:
             checked = self.kube("--namespace", APP_NAMESPACE, "exec", pod_name, "--container", "api", "--",
                                 AUTH_CHECK_BINARY, "--check-auth-config", AUTH_CONFIG_PATH, timeout=60)
@@ -1246,10 +1298,11 @@ class Smoke:
                     require_debug_http=dbg),
                 timeout=30)
         auth_summary = {**auth_mounts, "checked_pods": len(profile["pods"]["api"]), "routes": auth_routes}
-        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and ARTIFACTS_DIR store, auth + /v1/* mounts and JSON/debug logs",
+        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and ARTIFACTS_DIR store, auth + /v1/* mounts, "
+                    "API-only issuance credential and JSON/debug logs",
                     ready_replicas=profile["ready_replicas"],
                     healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
-                    pdb=pdb, pvc=pvc, auth=auth_summary, logs=logs_summary)
+                    pdb=pdb, pvc=pvc, auth=auth_summary, issuance=issuance, logs=logs_summary)
 
     def scenario(self):
         # 1-3, 5, 8: install by digest; migrate hook; Ready; no optional package; PSA restricted.
@@ -1262,6 +1315,9 @@ class Smoke:
         history = self.migrations()
         self.expect(history and all(row[1] == "t" for row in history),
                     "migration history is empty or has a failed entry")
+        self.expect(int(history[-1][0]) >= ISSUANCE_MIGRATION,
+                    f"migration history ends at version {history[-1][0]}, before the session issuance "
+                    f"migration {ISSUANCE_MIGRATION}")
         created = {c: parse_time(self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
                                                 f"{FULLNAME}-{c}")["metadata"]["creationTimestamp"])
                    for c in WORKLOADS}
@@ -1301,8 +1357,10 @@ class Smoke:
         extra = unexpected_resources(all_pods)
         self.expect(not extra, f"pods request optional resources: {extra}")
         unmounted_http = self.probe_api_http(AUTH_ROUTE_PATHS, expected_status=404)
+        issuance = check_issuance_env({c: self.pods(c) for c in WORKLOADS},
+                                      self.helm_run("get", "hooks", RELEASE).stdout, enabled=False)
         self.passed("no optional package present", release_objects=inventory, helm_releases=1,
-                    unmounted_http=unmounted_http)
+                    unmounted_http=unmounted_http, issuance=issuance)
 
         namespace = self.kube_json("get", "namespace", APP_NAMESPACE)["metadata"]["labels"]
         self.expect(namespace.get("pod-security.kubernetes.io/enforce") == "restricted",
@@ -1368,7 +1426,8 @@ class Smoke:
                                                 "--selector", f"app.kubernetes.io/instance={RELEASE}")["items"])
         self.expect(kept_pvcs == [f"PersistentVolumeClaim/{ARTIFACTS_CLAIM}"],
                     f"kept artifact PVC after uninstall: {kept_pvcs}")
-        # The test, not the chart, owns the URL Secrets, synthetic auth fixtures and namespace default-deny.
+        # The test, not the chart, owns the four URL Secrets (including issuance), synthetic auth
+        # fixtures and namespace default-deny.
         remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get",
                                                 "configmaps,secrets,networkpolicies",
                                                 "--selector", RUN_LABEL)["items"])
@@ -1376,7 +1435,7 @@ class Smoke:
             f"ConfigMap/{AUTH_CONFIG_MAP}",
             f"NetworkPolicy/{NAMESPACE_DENY}",
             f"Secret/{AUTH_LOGIN_KEYS_SECRET}",
-            *(f"Secret/{SECRET[r]}" for r in ROLES),
+            *(f"Secret/{SECRET[r]}" for r in DB_LOGINS),
         ])
         self.expect(remaining == expected_owned,
                     f"test-owned objects after uninstall: {remaining}")
