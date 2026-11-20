@@ -483,8 +483,8 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- end -}}
 {{- $endpoint := $otlp.tracesEndpoint -}}
 {{- $endpointPattern := "^https://([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(:[1-9][0-9]{0,4})?/[-A-Za-z0-9._~!$&'()*+,;=:/]*$" -}}
-{{- if or (gt (len $endpoint) 2048) (not (regexMatch $endpointPattern $endpoint)) (regexMatch "^https://[0-9.]+(:|/)" $endpoint) (regexMatch "/\\.\\.?(/|$)" $endpoint) -}}
-{{- fail "telemetry.otlp.tracesEndpoint must be a canonical https:// URL with a lowercase DNS host (no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments)" -}}
+{{- if or (gt (len $endpoint) 2048) (not (regexMatch $endpointPattern $endpoint)) (regexMatch "^https://[0-9.]+(:|/)" $endpoint) (regexMatch "^https://[^/:]+\\.([0-9]+|0[xX][0-9a-fA-F]*)(:|/)" $endpoint) (regexMatch "/\\.\\.?(/|$)" $endpoint) -}}
+{{- fail "telemetry.otlp.tracesEndpoint must be a canonical https:// URL with a lowercase DNS host (no http://, IP literal, numeric/hex final host label, credentials, query, fragment, percent-encoding or dot-segments)" -}}
 {{- end -}}
 {{- $authority := index (splitList "/" (trimPrefix "https://" $endpoint)) 0 -}}
 {{- $authorityParts := splitList ":" $authority -}}

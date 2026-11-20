@@ -378,13 +378,14 @@
   },
   "$defs": {
     "otlpTracesEndpoint": {
-      "description": "Canonical HTTPS URL with a lowercase DNS host (at least two labels), optional non-default port and path; no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments.",
+      "description": "Canonical HTTPS URL with a lowercase DNS host (at least two labels; final label not numeric or 0x-hex), optional non-default port and path; no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments.",
       "type": "string",
       "maxLength": 2048,
       "pattern": "^https://([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(:[1-9][0-9]{0,4})?/[-A-Za-z0-9._~!$&'()*+,;=:/]*$",
       "not": {
         "anyOf": [
           {"pattern": "^https://[0-9.]+(:|/)"},
+          {"pattern": "^https://[^/:]+\\.([0-9]+|0[xX][0-9a-fA-F]*)(:|/)"},
           {"pattern": "^https://[^/]+:443/"},
           {"pattern": "/\\.\\.?(/|$)"}
         ]

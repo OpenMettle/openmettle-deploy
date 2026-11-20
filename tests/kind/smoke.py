@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2/I3 smoke test).
+"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2/I3/I7 smoke test).
 
 Test harness only; not an installer. It builds core's api, worker and migrate images from a
 pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
-migration hook, readiness, worker scaling, an idempotent upgrade, uninstall, absence of optional
-packages, Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion
-reads live cluster, Helm or database state. Core's process-contract assertions are not repeated
+migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
+(API replicas=2, PodDisruptionBudget, artifact PVC and ADR 0024 JSON/debug structured logs),
+uninstall (with chart-owned PVC preservation), absence of optional packages on default install,
+Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
+live cluster, Helm or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
 
 Safety guards, tool and image pins are imported from core tests/kubernetes/qualify.py at
@@ -36,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts" / "openmettle-core"
 # The core commit whose images are built and whose harness pins and guards are imported. It must
 # equal CORE_COMMIT in .github/workflows/checks.yml and tests/fixtures/core-<sha7> (unit-tested).
-CORE_COMMIT = "5cd8a9dcdd31989eb09adb425115e3d187a5d0e7"
+CORE_COMMIT = "e5ff67339f1e27a270c5bd2707a7a363c44276f0"
 CORE_MODULE = Path("tests") / "kubernetes" / "qualify.py"
 # Everything this harness takes from core's qualify.py.
 CORE_IMPORTS = (
@@ -63,8 +65,19 @@ DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "o
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
 MIGRATION_DEADLINE_SECONDS = 120
 OPTIONAL_KINDS = "ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
-RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies"
+RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies,poddisruptionbudgets"
 INVENTORY_KINDS = "deployments,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies"
+API_PDB = f"{FULLNAME}-api"
+ARTIFACTS_CLAIM = f"{FULLNAME}-artifacts"
+ARTIFACTS_MOUNT_PATH = "/var/lib/openmettle/artifacts"
+PROFILE_ROLLOUT_TIMEOUT = "180s"
+LOG_LEVELS = {"ERROR", "WARN", "INFO", "DEBUG"}
+# Matches core src/telemetry.rs FIELDS plus tracing-subscriber flattened JSON metadata.
+ALLOWED_LOG_FIELDS = {
+    "timestamp", "level", "event", "role", "signal", "request_id",
+    "http.route", "http.request.method", "http.response.status_code",
+    "duration_us", "error.type", "schema_version", "dropped_lines", "dropped_spans",
+}
 # NetworkPolicy fixtures. The app namespace denies all traffic by default, as the owner's application
 # namespaces do; the release must work under it. PEER is a second PostgreSQL server in the database
 # namespace that is not a configured database peer; it is also the one configured API ingress peer.
@@ -210,7 +223,7 @@ def digest_reference(role: str, digest: str) -> str:
     return f"{REGISTRY}/openmettle/{role}@{digest}"
 
 
-def smoke_values(digests: dict, worker_replicas: int) -> dict:
+def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool = False) -> dict:
     """Chart values for the smoke release. Shorter migration timeouts bound a hung hook."""
     if set(digests) != set(ROLES):
         raise SmokeFailure("a digest is required for each of api, worker and migrate")
@@ -218,7 +231,7 @@ def smoke_values(digests: dict, worker_replicas: int) -> dict:
         digest_reference(role, digests[role])
     if worker_replicas not in (1, 2):
         raise SmokeFailure("worker replicas must be 1 or 2")
-    return {
+    values = {
         "images": {"pullPolicy": "Never", **{
             role: {"registry": REGISTRY, "repository": f"openmettle/{role}", "digest": digests[role]}
             for role in ROLES}},
@@ -231,6 +244,17 @@ def smoke_values(digests: dict, worker_replicas: int) -> dict:
         "networkPolicy": {"api": {"ingressFrom": [database_namespace_peer(PEER_LABELS)]},
                           "database": {"to": [database_namespace_peer(POSTGRES_LABELS)]}},
     }
+    if enabled_profile:
+        # Single-node kind cluster: local-path-provisioner binds RWO across all pods on the node.
+        values["api"] = {
+            "replicas": 2,
+            "podDisruptionBudget": {"enabled": True, "maxUnavailable": 1},
+        }
+        values["telemetry"] = {"logging": {"format": "json", "level": "debug"}}
+        values["storage"] = {
+            "artifacts": {"enabled": True, "size": "64Mi", "accessModes": ["ReadWriteOnce"]},
+        }
+    return values
 
 
 def database_namespace_peer(labels: dict) -> dict:
@@ -497,6 +521,114 @@ def unexpected_resources(pods: list) -> list:
     return sorted(found)
 
 
+def evaluate_pdb(pdb: dict, *, expected_max_unavailable: int = 1, min_healthy: int = 2) -> dict | None:
+    """Verify API PodDisruptionBudget spec immediately; return summary once disruptionsAllowed >= 1."""
+    name = pdb.get("metadata", {}).get("name")
+    if name != API_PDB:
+        raise SmokeFailure(f"unexpected PodDisruptionBudget name: {name!r}")
+    spec = pdb.get("spec", {})
+    if spec.get("maxUnavailable") != expected_max_unavailable:
+        raise SmokeFailure(f"PodDisruptionBudget maxUnavailable is {spec.get('maxUnavailable')!r}, "
+                           f"expected {expected_max_unavailable}")
+    if spec.get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
+        raise SmokeFailure(f"PodDisruptionBudget unhealthyPodEvictionPolicy is "
+                           f"{spec.get('unhealthyPodEvictionPolicy')!r}, expected 'AlwaysAllow'")
+    status = pdb.get("status", {})
+    healthy = status.get("currentHealthy", 0)
+    allowed = status.get("disruptionsAllowed", 0)
+    if not isinstance(healthy, int) or not isinstance(allowed, int) or healthy < min_healthy or allowed < 1:
+        return None
+    return {"name": name, "max_unavailable": expected_max_unavailable,
+            "current_healthy": healthy, "disruptions_allowed": allowed}
+
+
+def check_artifacts_pvc(pvc: dict, pods_by_role: dict) -> dict:
+    """Verify the artifact PVC is Bound with keep policy and mounted in every api and worker pod."""
+    metadata = pvc.get("metadata", {})
+    name = metadata.get("name")
+    if name != ARTIFACTS_CLAIM:
+        raise SmokeFailure(f"unexpected artifact PVC name: {name!r}")
+    policy = metadata.get("annotations", {}).get("helm.sh/resource-policy")
+    if policy != "keep":
+        raise SmokeFailure(f"artifact PVC lacks helm.sh/resource-policy=keep annotation: {policy!r}")
+    phase = pvc.get("status", {}).get("phase")
+    if phase != "Bound":
+        raise SmokeFailure(f"artifact PVC {name} is not Bound (phase={phase!r})")
+    mounted_pods = 0
+    for role in WORKLOADS:
+        items = pods_by_role.get(role) or []
+        if not items:
+            raise SmokeFailure(f"no {role} pods found to verify artifact volume mount")
+        for pod in items:
+            spec = pod.get("spec", {})
+            if spec.get("securityContext", {}).get("fsGroup") != 65532:
+                raise SmokeFailure(f"{role} pod lacks fsGroup 65532 for artifact volume")
+            volumes = spec.get("volumes") or []
+            if not any(v.get("name") == "artifacts"
+                       and v.get("persistentVolumeClaim", {}).get("claimName") == ARTIFACTS_CLAIM
+                       for v in volumes):
+                raise SmokeFailure(f"{role} pod does not attach PVC {ARTIFACTS_CLAIM}")
+            containers = spec.get("containers") or []
+            container = next((c for c in containers if c.get("name") == role),
+                             containers[0] if containers else {})
+            mounts = container.get("volumeMounts") or []
+            if not any(m.get("name") == "artifacts" and m.get("mountPath") == ARTIFACTS_MOUNT_PATH
+                       for m in mounts):
+                raise SmokeFailure(f"{role} container does not mount artifacts at {ARTIFACTS_MOUNT_PATH}")
+            mounted_pods += 1
+    return {"claim": name, "phase": phase, "mount_path": ARTIFACTS_MOUNT_PATH, "mounted_pods": mounted_pods}
+
+
+def parse_structured_logs(output: str, role: str) -> list:
+    """Parse container stderr as ADR 0024 flattened JSON lines; fail immediately on any non-JSON line."""
+    records = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except ValueError as exc:
+            raise SmokeFailure(f"{role} stderr emitted non-JSON log line") from exc
+        if not isinstance(record, dict):
+            raise SmokeFailure(f"{role} stderr log line is not a JSON object")
+        if "message" in record:
+            raise SmokeFailure(f"{role} JSON log line contains forbidden ADR 0024 'message' field")
+        extra = sorted(set(record) - ALLOWED_LOG_FIELDS)
+        if extra:
+            raise SmokeFailure(f"{role} JSON log line contains unexpected fields: {extra}")
+        if not isinstance(record.get("timestamp"), str) or not record["timestamp"]:
+            raise SmokeFailure(f"{role} JSON log line missing timestamp")
+        if record.get("level") not in LOG_LEVELS:
+            raise SmokeFailure(f"{role} JSON log line has invalid level: {record.get('level')!r}")
+        if not isinstance(record.get("event"), str) or not record["event"]:
+            raise SmokeFailure(f"{role} JSON log line missing event")
+        records.append(record)
+    return records
+
+
+def evaluate_structured_logs(role: str, pod_logs: dict, *, require_debug_http: bool = False) -> dict | None:
+    """Verify ADR 0024 JSON logs across all pods of `role`; return None while expected events flush."""
+    if not pod_logs:
+        raise SmokeFailure(f"no {role} pods to inspect for structured logs")
+    total_lines = 0
+    debug_http = 0
+    all_started = True
+    for output in pod_logs.values():
+        records = parse_structured_logs(output, role)
+        total_lines += len(records)
+        if not any(r.get("event") == "process.started" and r.get("role") == role
+                   and r.get("level") == "INFO" for r in records):
+            all_started = False
+        debug_http += sum(1 for r in records if r.get("event") == "http.request.completed"
+                          and r.get("level") == "DEBUG")
+    if not all_started:
+        return None
+    if require_debug_http and debug_http == 0:
+        return None
+    return {"pods": len(pod_logs), "lines": total_lines, "debug_http_events": debug_http}
+
+
 def assert_no_secrets(text: str, values) -> None:
     if any(value and value in text for value in values):
         raise SmokeFailure("refusing to publish output containing a fixture credential")
@@ -755,11 +887,20 @@ class Smoke:
                               "FROM openmettle._sqlx_migrations ORDER BY version").stdout
         return [line.split("|") for line in out.splitlines() if line]
 
-    def helm_deploy(self, command: str, worker_replicas: int):
-        self.values.write_text(json.dumps(smoke_values(self.digests, worker_replicas)))
+    def helm_deploy(self, command: str, worker_replicas: int, *, enabled_profile: bool = False):
+        self.values.write_text(json.dumps(smoke_values(self.digests, worker_replicas,
+                                                       enabled_profile=enabled_profile)))
         self.verify_identity()
         self.helm_run(command, RELEASE, str(CHART), "--values", str(self.values),
                       "--wait=watcher", "--timeout", HELM_TIMEOUT)
+
+    def probe_api_http(self, paths=("/readyz",)) -> dict:
+        forward = PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080)
+        try:
+            return {path: self.wait_for(f"API {path} 200", lambda p=path: (
+                self.core.http_get(forward.port, p)[0] == 200 and 200), timeout=30) for path in paths}
+        finally:
+            forward.close()
 
     def observe_release(self, revision: int) -> dict:
         """Common state after each install or upgrade."""
@@ -793,12 +934,7 @@ class Smoke:
         self.expect(not self.kube("--namespace", APP_NAMESPACE, "get", "job", f"{FULLNAME}-migrate",
                                   "--ignore-not-found", "--output=name").stdout.strip(),
                     "migrate Job remains after success (hook-succeeded delete policy)")
-        forward = PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080)
-        try:
-            readyz = self.wait_for("API /readyz 200", lambda: (
-                self.core.http_get(forward.port, "/readyz")[0] == 200 and 200), timeout=30)
-        finally:
-            forward.close()
+        readyz = self.probe_api_http(("/readyz",))["/readyz"]
         return {"ready_replicas": counts, "readyz": readyz,
                 "pods": {c: sorted(p["metadata"]["name"] for p in pods[c]) for c in WORKLOADS},
                 "generations": {c: self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
@@ -837,6 +973,45 @@ class Smoke:
 
     def completions(self) -> list:
         return job_completions(self.events("involvedObject.kind=Job"), f"{FULLNAME}-migrate")
+
+    def enabled_profile(self, history: list):
+        """Upgrade to an enabled profile and verify live PDB, artifact PVC and ADR 0024 JSON/debug logs."""
+        self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True)
+        for component in WORKLOADS:
+            self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
+                      f"deployment/{FULLNAME}-{component}", f"--timeout={PROFILE_ROLLOUT_TIMEOUT}",
+                      timeout=210)
+        profile = self.observe_release(revision=4)
+        self.expect(profile["ready_replicas"] == {"api": 2, "worker": 1},
+                    f"enabled-profile ready replicas: {profile['ready_replicas']}")
+        self.expect(len(self.completions()) == 4, "enabled-profile upgrade did not run the migrate hook")
+        self.expect(self.migrations() == history, "migration history changed on enabled-profile upgrade")
+        http_status = self.probe_api_http(("/healthz", "/readyz"))
+        pdb = self.wait_for(
+            "API PodDisruptionBudget disruptionsAllowed >= 1",
+            lambda: evaluate_pdb(self.kube_json("--namespace", APP_NAMESPACE,
+                                                "get", "poddisruptionbudget", API_PDB)),
+            timeout=60)
+        pods_by_role = {c: self.pods(c) for c in WORKLOADS}
+        pvc = check_artifacts_pvc(
+            self.kube_json("--namespace", APP_NAMESPACE, "get", "persistentvolumeclaim", ARTIFACTS_CLAIM),
+            pods_by_role)
+        logs_summary = {}
+        for role, require_debug in (("api", True), ("worker", False)):
+            names = profile["pods"][role]
+            logs_summary[role] = self.wait_for(
+                f"{role} ADR 0024 JSON structured logs",
+                lambda r=role, ns=names, dbg=require_debug: evaluate_structured_logs(
+                    r,
+                    {name: self.kube("--namespace", APP_NAMESPACE, "logs", name,
+                                     "--container", r, timeout=60).stdout
+                     for name in ns},
+                    require_debug_http=dbg),
+                timeout=30)
+        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and JSON/debug structured logs",
+                    ready_replicas=profile["ready_replicas"],
+                    healthz=http_status["/healthz"], readyz=http_status["/readyz"],
+                    pdb=pdb, pvc=pvc, logs=logs_summary)
 
     def scenario(self):
         # 1-3, 5, 8: install by digest; migrate hook; Ready; no optional package; PSA restricted.
@@ -930,7 +1105,10 @@ class Smoke:
                     migrate_runs=3, migrations_applied=len(history),
                     ready_replicas=repeated["ready_replicas"], readyz=repeated["readyz"])
 
-        # 7: uninstall leaves no release objects.
+        # 10: enabled-profile upgrade on the same ephemeral cluster before uninstall.
+        self.enabled_profile(history)
+
+        # 7: uninstall leaves no non-kept release objects (chart-owned artifact PVC stays via resource-policy keep).
         self.verify_identity()
         self.helm_run("uninstall", RELEASE, "--wait", "--timeout", HELM_TIMEOUT)
 
@@ -945,13 +1123,19 @@ class Smoke:
         self.wait_for("release objects to be removed", lambda: not residue(), timeout=120)
         releases = json.loads(self.helm_run("list", "--output", "json").stdout)
         self.expect(releases == [], f"Helm still lists a release: {releases}")
+        # Chart-owned artifact PVC carries helm.sh/resource-policy: keep and survives uninstall.
+        kept_pvcs = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "persistentvolumeclaims",
+                                                "--selector", f"app.kubernetes.io/instance={RELEASE}")["items"])
+        self.expect(kept_pvcs == [f"PersistentVolumeClaim/{ARTIFACTS_CLAIM}"],
+                    f"kept artifact PVC after uninstall: {kept_pvcs}")
         # The test, not the chart, owns the URL Secrets and namespace default-deny: uninstall leaves them alone.
         remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "secrets,networkpolicies",
                                                 "--selector", RUN_LABEL)["items"])
         expected_owned = sorted([f"NetworkPolicy/{NAMESPACE_DENY}", *(f"Secret/{SECRET[r]}" for r in ROLES)])
         self.expect(remaining == expected_owned,
                     f"test-owned objects after uninstall: {remaining}")
-        self.passed("uninstall leaves no release objects", test_owned_remaining=remaining)
+        self.passed("uninstall leaves no release objects", test_owned_remaining=remaining,
+                    kept_pvcs=kept_pvcs)
         self.report["result"] = "passed"
 
     def diagnostics(self):
@@ -963,6 +1147,7 @@ class Smoke:
                       "--all-containers", "--prefix", "--tail=100"],
                      ["--namespace", DB_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"],
                      ["--namespace", APP_NAMESPACE, "get", "networkpolicies", "--output=wide"],
+                     ["--namespace", APP_NAMESPACE, "get", "pvc,pdb", "--output=wide"],
                      # kindnet enforces NetworkPolicy; its log shows whether the policy controller started.
                      ["--namespace", "kube-system", "logs", "--selector", "app=kindnet", "--tail=50"]):
             try:

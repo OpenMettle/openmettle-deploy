@@ -266,7 +266,7 @@ The chart never creates ConfigMaps or Secrets. Every file comes from a pre-exist
 
 ## Telemetry / OTLP trace export
 
-`telemetry` exposes core ADR 0024's structured stderr logging settings across all three roles and core ADR 0026's opt-in OTLP/HTTP protobuf trace export for `openmettle-api` and `openmettle-worker`. Both leave default renders completely unchanged (`telemetry.logging.{format,level}: null` and `telemetry.otlp.enabled: false`).
+`telemetry` exposes core ADR 0024's structured stderr logging settings across all three roles (minimum `openmettle-core` commit `13c5227`) and core ADR 0026's opt-in OTLP/HTTP protobuf trace export for `openmettle-api` and `openmettle-worker` (minimum `openmettle-core` commit `ac047ec`); both are satisfied by the chart's pinned core commit `e5ff673`. Both leave default renders completely unchanged (`telemetry.logging.{format,level}: null` and `telemetry.otlp.enabled: false`).
 
 ### Structured logging (`telemetry.logging`, all roles)
 
@@ -277,8 +277,8 @@ The chart never creates ConfigMaps or Secrets. Every file comes from a pre-exist
 ### OTLP trace export (`telemetry.otlp`, `api` and `worker` only)
 
 - **Off by default.** While `telemetry.otlp.enabled` is `false`, no `OTLP_*` variables, CA bundle mounts or collector egress rules are rendered. Leftover `tracesEndpoint`, non-empty `privateRanges`, `caBundle.enabled: true` and non-empty `networkPolicy.telemetry.otlp.to` are all refused while `telemetry.otlp.enabled` is `false`, matching core ADR 0026's rule that a set key is never silently ignored.
-- **HTTPS only.** `telemetry.otlp.tracesEndpoint` must be a canonical `https://` URL with a lowercase DNS host (at least two labels, no `http://`, no IP literal, no credentials, no query, fragment, percent-encoding, dot-segments or explicit `:443`). Core sends OTLP/HTTP protobuf (`application/x-protobuf`) over its bounded HTTP/1.1 transport with no proxy, redirect, retry or collector authentication header.
-- **In-cluster collectors and `privateRanges`.** Core refuses private IP answers by default (core ADR 0010). To export to an in-cluster collector such as Grafana Alloy on TCP `4318`, list the collector's private CIDR block(s) (RFC 1918, CGNAT or ULA; up to 32 unique canonical CIDRs) in `telemetry.otlp.privateRanges` (emitted comma-joined as `OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES`) and allow the collector peer(s) in `networkPolicy.telemetry.otlp.to` on TCP `networkPolicy.telemetry.otlp.port` (default `4318`).
+- **HTTPS only.** `telemetry.otlp.tracesEndpoint` must be a canonical `https://` URL with a lowercase DNS host (at least two labels; final label neither all-digits nor `0x`/`0X`-hex per WHATWG URL rules, no `http://`, no IP literal, no credentials, no query, fragment, percent-encoding, dot-segments or explicit `:443`). Core sends OTLP/HTTP protobuf (`application/x-protobuf`) over its bounded HTTP/1.1 transport with no proxy, redirect, retry or collector authentication header.
+- **In-cluster collectors and `privateRanges`.** Core refuses private IP answers by default (core ADR 0010). Helm and the values schema check CIDR syntax, uniqueness and count (`<= 32`), while `openmettle-core` enforces canonical host-bit masking and RFC 1918 / CGNAT / ULA private-range membership fail-closed at startup (exit `78`). For an in-cluster collector such as Grafana Alloy on TCP `4318`, `telemetry.otlp.privateRanges` (emitted comma-joined as `OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES`) must cover the address DNS resolves to (typically the Service ClusterIP CIDR), while `networkPolicy.telemetry.otlp.to` and `networkPolicy.telemetry.otlp.port` (default `4318`) are evaluated post-DNAT against the collector pods and their target port.
 - **Optional CA bundle at sibling path `/etc/openmettle/otlp-ca/ca.crt`.** When `telemetry.otlp.caBundle.enabled` is `true`, the chart mounts one key of a pre-existing ConfigMap read-only at `/etc/openmettle/otlp-ca` (volume `otlp-ca`, projected via `items` as `ca.crt`, no `subPath`) in `api` and `worker` pods only, and sets `OPENMETTLE_{API,WORKER}_OTLP_CA_FILE=/etc/openmettle/otlp-ca/ca.crt`. Sitting at `/etc/openmettle/otlp-ca` keeps it a non-overlapping sibling of `/etc/openmettle/db-ca`, `/etc/openmettle/auth`, `/etc/openmettle/auth-keys` and `/etc/openmettle/auth-ca`. The chart never creates ConfigMaps or Secrets.
 - **Why `migrate` is excluded.** `openmettle-migrate` is a one-shot stderr-only process (core ADR 0026) and never reads `OTLP_*` variables. It never receives `OPENMETTLE_MIGRATE_OTLP_*` env vars, never mounts `otlp-ca`, and `<fullname>-migrate` never receives OTLP egress.
 - **No probe spans, no ambient `OTEL_*`, no live reload, no bundled collector.** Core never exports spans for `/healthz` or `/readyz`, ignores inbound `traceparent`/`tracestate`, and neutralizes ambient `OTEL_*` environment variables (core ADR 0026). The chart sets no `OTEL_*` variables and deploys no collector; Grafana Alloy or another OTLP/HTTP collector is provisioned separately. Core reads `OTLP_CA_FILE` once at startup—after rotating the collector CA ConfigMap, restart `api` and `worker` (`kubectl rollout restart deployment/<fullname>-api deployment/<fullname>-worker`).
@@ -311,9 +311,9 @@ python3 -m unittest discover -s tests/chart -v  # policy, negative-case and cont
 
 Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the kind node version pinned by core). These are test pins, not a compatibility claim; `render.sh` fails on any other Helm version. The chart sets no `kubeVersion` floor.
 
-### Kind smoke test (I2/I3)
+### Kind smoke test (I2/I3/I7)
 
-[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `5cd8a9d`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
+[`tests/kind/smoke.py`](../../tests/kind/README.md) installs the chart on an ephemeral kind cluster (Kubernetes 1.37.0, kind v0.33.0; core's pins). It uses core images built from the pinned core commit `e5ff673`, referenced by digest, and a synthetic PostgreSQL fixture. It checks these acceptance items against live state:
 
 | Item | Smoke-tested |
 | --- | --- |
@@ -321,23 +321,24 @@ Tested on: Helm 4.3.0 and kubeconform 0.8.0, with Kubernetes 1.37.0 schemas (the
 | Migration hook completes before the Deployments roll out | Yes (under namespace default-deny) |
 | API and worker Ready; `/readyz` 200 | Yes |
 | Worker scales to 2 while the API stays at 1 | Yes, through `worker.replicas` |
-| No optional package present | Yes |
+| No optional package present (default install) | Yes |
 | Same-digest `helm upgrade` reruns migrate as a no-op and stays Ready | Yes |
-| `helm uninstall` leaves no release objects | Yes (including release NetworkPolicies) |
+| Enabled-profile upgrade (`api.replicas: 2`, API PDB, `storage.artifacts` RWO PVC, `telemetry.logging` `json`/`debug`) | Yes (implemented in I7; checks rollout, `/healthz` + `/readyz` 200, PDB `maxUnavailable: 1` & `disruptionsAllowed >= 1`, PVC `Bound` + `/var/lib/openmettle/artifacts` mount, and ADR 0024 JSON/debug stderr logs on `api` and `worker`; hosted kind run pending CI) |
+| `helm uninstall` leaves no non-kept release objects | Yes (release Deployments, Services, NetworkPolicies and PDB removed; chart-owned artifact PVC kept via `helm.sh/resource-policy: keep`) |
 | App namespace enforces Pod Security `restricted` | Yes |
 | NetworkPolicy enforced under namespace default-deny | Yes (implemented in I3; hosted kind run pending CI) |
-| I4 artifact volume, database CA, Ingress, PDB | No. Off in the smoke run; render tests and kubeconform only |
+| I4 database CA against TLS PostgreSQL, Ingress behind Traefik, multi-node/drain eviction | No (render tests and kubeconform only; owner's qualification) |
 | I5 browser sign-in / OIDC mounts & API OIDC egress | No. Off in the smoke run; render tests and kubeconform only |
-| I6 telemetry logging & OTLP trace export (`api`/`worker` CA mount & egress) | No. Off in the smoke run; render tests and kubeconform only |
+| I6 OTLP trace export (`api`/`worker` CA mount & collector egress) | No. Off in the smoke run; render tests and kubeconform only |
 | Registry pulls, TLS to PostgreSQL, ingress controller, multi-node | No (owner's qualification) |
 
-The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch the chart or the harness, and on manual dispatch. The I2 checks passed on [pull-request run 44505148955](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) (5 min 15 s), which tested the merge of `b8f2d79` into `main`; the workflow has not yet run on `main`, and the I3 NetworkPolicy checks have not yet run on a hosted kind cluster until pushed to CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-5cd8a9d/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
+The workflow ([`kind-smoke.yml`](../../.github/workflows/kind-smoke.yml)) runs on pull requests and pushes to `main` that touch the chart or the harness, and on manual dispatch. The I2 checks passed on [pull-request run 44505148955](https://github.com/OpenMettle/openmettle-deploy/actions/runs/44505148955) (5 min 15 s), which tested the merge of `b8f2d79` into `main`; the workflow has not yet run on `main`, and the I3 NetworkPolicy and I7 enabled-profile checks have not yet run on a hosted kind cluster until pushed to CI (see [`tests/kind`](../../tests/kind/README.md)). The tests check chart defaults against a byte-verified copy of core's `runtime/process-contract.json` (`tests/fixtures/core-e5ff673/`). The chart's default ServiceAccount names (`<fullname>-api`) differ from the contract's example names (`openmettle-api`); set `serviceAccount.name` to use those.
 
 ## Pending
 
-- **I2/I3:** hosted `kind-smoke` verification of I3 NetworkPolicy enforcement (including whether kind v0.33 kindnet enforces policies live) on pull-request CI and `main`, and owner acceptance.
-- **I4 (render contract delivered):** live verification of the artifact volume (StorageClass binding, `fsGroup`), the database CA against TLS-enabled PostgreSQL, the API PDB during a drain, and the Ingress behind Traefik, including the access-log [acceptance check](#ingress-and-tls). None has run on a cluster.
+- **I2/I3/I7:** hosted `kind-smoke` verification of I3 NetworkPolicy enforcement and I7 enabled-profile checks against core `e5ff673` on pull-request CI and `main`, and owner acceptance.
+- **I4 (render contract delivered; API PDB and single-node RWO artifact PVC added to I7 kind smoke):** live verification of the database CA against TLS-enabled PostgreSQL, the API PDB during a real node drain, `ReadWriteMany` multi-node artifact storage, and the Ingress behind Traefik, including the access-log [acceptance check](#ingress-and-tls).
 - **I5 (render contract delivered):** live cluster qualification of `auth` mounts, Secret `0440`/`fsGroup: 65532` readability and `networkPolicy.api.oidc` egress against a real OIDC provider (such as Keycloak); optional pre-upgrade `--check-auth-config` hook if needed; and native sign-in runtime mounting (core ADR 0023).
-- **I6 (render contract delivered):** live cluster qualification of `telemetry.otlp` export, `/etc/openmettle/otlp-ca/ca.crt` trust verification and `networkPolicy.telemetry.otlp` egress against a real OTLP/HTTP collector (such as Grafana Alloy on TCP `4318`), and future metrics/contract updates (core ADR 0024 increments 3–4).
+- **I6 (render contract delivered; `telemetry.logging` `json`/`debug` added to I7 kind smoke):** live cluster qualification of `telemetry.otlp` export, `/etc/openmettle/otlp-ca/ca.crt` trust verification and `networkPolicy.telemetry.otlp` egress against a real OTLP/HTTP collector (such as Grafana Alloy on TCP `4318`), and future metrics/contract updates (core ADR 0024 increments 3–4).
 - **V1-20** (managed inference, accelerated tools) and **V1-06** (external providers or gateway): separate charts and releases, never subcharts of core.
 - Qualification on the owner's cluster is an owner action.
