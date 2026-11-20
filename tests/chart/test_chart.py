@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts" / "openmettle-core"
 VALUES = ROOT / "tests" / "chart" / "values"
-CONTRACT = ROOT / "tests" / "fixtures" / "core-5cd8a9d" / "process-contract.json"
+CONTRACT = ROOT / "tests" / "fixtures" / "core-e5ff673" / "process-contract.json"
 EXAMPLE = ROOT / "examples" / "values-synthetic.yaml"
 HELM = os.environ.get("HELM", "helm")
 RELEASE = "openmettle"
@@ -48,7 +48,7 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at 5cd8a9d; this test does not read core.
+# from core src/lib.rs and src/migrate.rs at e5ff673; this test does not read core.
 DEFAULT_ENV = {
     "api": {"BIND": "0.0.0.0:8080", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
     "worker": {"BIND": "0.0.0.0:8081", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
@@ -1428,6 +1428,54 @@ class NegativeCaseTest(unittest.TestCase):
          ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://127.0.0.1:4318/v1/traces"],
          ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
          ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP numeric final host label refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.123/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP numeric final host label refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.123/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP numeric final host label with port refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.123:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP numeric final host label with port refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.123:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP 0x-hex final host label refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0x1f/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP 0x-hex final host label refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0x1f/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP 0x-hex final host label with port refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0x1f:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP 0x-hex final host label with port refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0x1f:4318/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP bare 0x final host label refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0x/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP bare 0x final host label refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0x/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
+        ("telemetry OTLP 0X-hex final host label refused",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0X1f/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+         [SCHEMA, "/telemetry/otlp/tracesEndpoint"]),
+        ("telemetry OTLP 0X-hex final host label refused without schema",
+         ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://c.0X1f/v1/traces"],
+         ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]', "--skip-schema-validation"],
+         ["telemetry.otlp.tracesEndpoint must be a canonical https:// URL"]),
         ("telemetry OTLP IPv6 literal endpoint refused",
          ["telemetry.otlp.enabled=true", "telemetry.otlp.tracesEndpoint=https://[::1]:4318/v1/traces"],
          ["--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
@@ -1631,6 +1679,12 @@ class NegativeCaseTest(unittest.TestCase):
             ["--set", "telemetry.otlp.enabled=true",
              "--set", "telemetry.otlp.tracesEndpoint=https://alloy.observability.example.test/",
              "--set-json", "telemetry.otlp.privateRanges=" + json.dumps([f"10.{i}.0.0/16" for i in range(32)]),
+             "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+            ["--set", "telemetry.otlp.enabled=true",
+             "--set", "telemetry.otlp.tracesEndpoint=https://c.0x1f.example.test/v1/traces",
+             "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
+            ["--set", "telemetry.otlp.enabled=true",
+             "--set", "telemetry.otlp.tracesEndpoint=https://c.123a/v1/traces",
              "--set-json", 'networkPolicy.telemetry.otlp.to=[{"ipBlock":{"cidr":"192.0.2.30/32"}}]'],
         ):
             with self.subTest(extra=extra):

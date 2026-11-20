@@ -30,7 +30,7 @@ jobs:
     env:
       # openmettle-core commit whose runtime/process-contract.json is copied under tests/fixtures
       # and whose kind harness guards tests/kind imports. Must equal tests/kind/smoke.py (unit-tested).
-      CORE_COMMIT: 5cd8a9dcdd31989eb09adb425115e3d187a5d0e7
+      CORE_COMMIT: e5ff67339f1e27a270c5bd2707a7a363c44276f0
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14

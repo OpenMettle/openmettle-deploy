@@ -213,6 +213,9 @@ class FakeCluster:
         self.installed = False
         self.replicas = {"api": 1, "worker": 1}
         self.generation = {"api": 1, "worker": 1}
+        self.profile_enabled = False
+        self.artifacts_pvc_created = False
+        self.healthz = 200
         self.readyz = 200
         self.core = self.make_core()
 
@@ -237,7 +240,7 @@ class FakeCluster:
         return mock.Mock(
             spec=list(smoke.CORE_IMPORTS), KIND_VERSION="v0", KUBECTL_VERSION="v0", NODE_IMAGE="node",
             POSTGRES_IMAGE="postgres@sha256:" + "e" * 64, Refusal=Refusal, QualificationFailure=QualificationFailure,
-            Runner=runner, http_get=lambda port, path: (fake.readyz, ""),
+            Runner=runner, http_get=lambda port, path: (fake.healthz if path == "/healthz" else fake.readyz, ""),
             check_opt_in=lambda environ: "default", check_tools=lambda run: None,
             check_docker_context=lambda run, context: None, check_cluster_absent=lambda run, name: None,
             check_cluster_identity=check_cluster_identity,
@@ -326,11 +329,18 @@ class FakeCluster:
 
     def pod(self, component, index):
         name = f"{smoke.FULLNAME}-{component}-{index}"
+        container = {"name": component, "imagePullPolicy": "Never",
+                     "image": smoke.digest_reference(component, DIGEST[component]),
+                     "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}
+        spec = {"containers": [container]}
+        if self.profile_enabled:
+            spec["securityContext"] = {"fsGroup": 65532}
+            spec["volumes"] = [{"name": "artifacts",
+                                "persistentVolumeClaim": {"claimName": smoke.ARTIFACTS_CLAIM}}]
+            container["volumeMounts"] = [{"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH}]
         return {"metadata": {"name": name, "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
-                "spec": {"containers": [{"name": component, "imagePullPolicy": "Never",
-                                         "image": smoke.digest_reference(component, DIGEST[component]),
-                                         "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}]},
+                "spec": spec,
                 "status": {"conditions": [{"type": "Ready", "status": "True"}],
                            "containerStatuses": [{"restartCount": 0, "containerID": f"containerd://cid-{component}-"
                                                                                     f"{index}",
@@ -418,8 +428,24 @@ class FakeCluster:
                 return listing([self.running_pod(f"{smoke.PEER}-0", PEER_IP)])
         if namespace == "kube-system" and args[:2] == ["get", "pods"] and selector == smoke.DNS_SELECTOR:
             return listing([self.running_pod("coredns-1", DNS_IP), self.running_pod("coredns-0", DNS_IP)])
+        if args[:2] == ["rollout", "status"]:
+            return 0, "rolled out", ""
         if args[:2] == ["get", "networkpolicies"]:
             return listing(self.network_policies())
+        if args[:2] == ["get", "pvc,pdb"]:
+            return ok("NAME\n")
+        if args[:3] == ["get", "poddisruptionbudget", smoke.API_PDB]:
+            healthy = self.replicas["api"]
+            return ok({"metadata": {"name": smoke.API_PDB},
+                       "spec": {"maxUnavailable": 1, "unhealthyPodEvictionPolicy": "AlwaysAllow"},
+                       "status": {"currentHealthy": healthy, "disruptionsAllowed": max(0, healthy - 1)}})
+        if args[:3] == ["get", "persistentvolumeclaim", smoke.ARTIFACTS_CLAIM]:
+            return ok({"metadata": {"name": smoke.ARTIFACTS_CLAIM,
+                                    "annotations": {"helm.sh/resource-policy": "keep"}},
+                       "status": {"phase": "Bound"}})
+        if args[:2] == ["get", "persistentvolumeclaims"]:
+            names = [f"PersistentVolumeClaim/{smoke.ARTIFACTS_CLAIM}"] if self.artifacts_pvc_created else []
+            return listing(self.items(names))
         if args[:2] == ["get", "deployment"]:
             component = args[2].rsplit("-", 1)[1]
             return ok({"metadata": {"name": args[2], "generation": self.generation[component],
@@ -456,6 +482,17 @@ class FakeCluster:
                 return listing(self.items(owned))
             return listing([])
         if args[:1] == ["logs"]:
+            if "--container" in args:
+                role = args[args.index("--container") + 1]
+                lines = [json.dumps({"timestamp": "2026-11-19T10:04:00.000000Z", "level": "INFO",
+                                     "event": "process.started", "role": role})]
+                if role == "api":
+                    lines.append(json.dumps({
+                        "timestamp": "2026-11-19T10:04:01.000000Z", "level": "DEBUG",
+                        "event": "http.request.completed", "request_id": "11111111-1111-4111-8111-111111111111",
+                        "http.route": "/readyz", "http.request.method": "GET",
+                        "http.response.status_code": 200, "duration_us": 42}))
+                return 0, "\n".join(lines) + "\n", ""
             return ok("log line\n")
         self.unknown.append(args)
         return 1, "", "unmodelled kubectl command"
@@ -463,10 +500,18 @@ class FakeCluster:
     def helm(self, args):
         if args[0] in ("install", "upgrade"):
             values = json.loads(Path(args[args.index("--values") + 1]).read_text())
-            replicas = values["worker"]["replicas"]
-            if self.installed and replicas != self.replicas["worker"]:
+            worker_replicas = values["worker"]["replicas"]
+            api_replicas = values.get("api", {}).get("replicas", 1)
+            profile = bool(values.get("storage", {}).get("artifacts", {}).get("enabled"))
+            if self.installed and (worker_replicas != self.replicas["worker"] or profile != self.profile_enabled):
                 self.generation["worker"] += 1
-            self.replicas["worker"] = replicas
+            if self.installed and (api_replicas != self.replicas["api"] or profile != self.profile_enabled):
+                self.generation["api"] += 1
+            self.replicas["worker"] = worker_replicas
+            self.replicas["api"] = api_replicas
+            self.profile_enabled = profile
+            if profile:
+                self.artifacts_pvc_created = True
             self.installed, self.revision = True, self.revision + 1
             return 0, "", ""
         if args[:1] == ["list"]:
@@ -561,19 +606,32 @@ class OrchestrationTest(unittest.TestCase):
         status, report, _ = self.run_main()
         self.assertEqual(self.fake.unknown, [])
         self.assertEqual((status, report["result"]), (0, "passed"), report.get("error"))
-        self.assertEqual(len(report["checks"]), 9)
+        self.assertEqual(len(report["checks"]), 10)
         netpol_check = next(c for c in report["checks"] if "NetworkPolicy enforced" in c["check"])
         self.assertEqual(netpol_check["namespace_policies"],
                          sorted([f"NetworkPolicy/{smoke.NAMESPACE_DENY}", *smoke.release_network_policies()]))
         self.assertEqual(len(netpol_check["probes"]), len(smoke.probe_plan(DNS_IP, PEER_IP)))
+        profile_check = next(c for c in report["checks"] if "enabled-profile upgrade" in c["check"])
+        self.assertEqual(profile_check["ready_replicas"], {"api": 2, "worker": 1})
+        self.assertEqual((profile_check["healthz"], profile_check["readyz"]), (200, 200))
+        self.assertEqual(profile_check["pdb"], {"name": smoke.API_PDB, "max_unavailable": 1,
+                                                "current_healthy": 2, "disruptions_allowed": 1})
+        self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
+                                                "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3})
+        self.assertEqual(profile_check["logs"]["api"]["pods"], 2)
+        self.assertGreaterEqual(profile_check["logs"]["api"]["debug_http_events"], 1)
+        self.assertEqual(profile_check["logs"]["worker"]["pods"], 1)
+        uninstall_check = next(c for c in report["checks"] if "uninstall leaves no release objects" in c["check"])
+        self.assertEqual(uninstall_check["kept_pvcs"], [f"PersistentVolumeClaim/{smoke.ARTIFACTS_CLAIM}"])
         self.assertIn("networkpolicies", smoke.RELEASE_KINDS.split(","))
+        self.assertIn("poddisruptionbudgets", smoke.RELEASE_KINDS.split(","))
         self.assertIn("networkpolicies", smoke.INVENTORY_KINDS.split(","))
         self.assertNotIn("networkpolicies", smoke.OPTIONAL_KINDS.split(","))
         self.assertNotIn("error", report)
         self.assert_cleaned_up()
         self.assertEqual([c[1:3] for c in self.fake.commands("helm") if c[1] in ("install", "upgrade", "uninstall")],
                          [["install", smoke.RELEASE], ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE],
-                          ["uninstall", smoke.RELEASE]])
+                          ["upgrade", smoke.RELEASE], ["uninstall", smoke.RELEASE]])
         for role in smoke.ROLES:
             self.assertEqual(report["images"][role], {"reference": smoke.digest_reference(role, DIGEST[role]),
                                                       "cri_image_id": IMAGE_ID[role],
@@ -590,7 +648,7 @@ class OrchestrationTest(unittest.TestCase):
                 mutations += 1
             if call[:3] != ["kubectl", "get", "namespace"]:
                 previous = call
-        self.assertEqual(mutations, 5)  # apply, install, upgrade, upgrade, uninstall
+        self.assertEqual(mutations, 6)  # apply, install, upgrade, upgrade, upgrade, uninstall
 
     def test_namespace_from_another_run_is_refused_before_any_change(self):
         self.fake.namespaces[smoke.APP_NAMESPACE] = {smoke.RUN_LABEL: "ffffffff"}
@@ -856,6 +914,52 @@ class OrchestrationTest(unittest.TestCase):
                 [f"--selector {smoke.RUN_LABEL} "],
                 lambda data: data.__setitem__("items", [i for i in data["items"] if i["metadata"]["name"] != smoke.SECRET["api"]])),
                 "test-owned objects after uninstall:"),
+            "enabled-profile ready replicas": (doctor_json(
+                [f"deployment {api} --output=json"], lambda data: data["status"].__setitem__("readyReplicas", 1),
+                when=revision(4)), "enabled-profile ready replicas"),
+            "enabled-profile skipped migrate": (job_events(lambda e: e["involvedObject"]["uid"] != "job-4"),
+                                                "enabled-profile upgrade did not run the migrate hook"),
+            "enabled-profile healthz": (lambda args, result: setattr(fake_ref(), "healthz", 503),
+                                        "API /healthz 200"),
+            "enabled-profile pdb wrong maxUnavailable": (doctor_json(
+                ["get poddisruptionbudget", smoke.API_PDB],
+                lambda data: data["spec"].__setitem__("maxUnavailable", 2)),
+                "PodDisruptionBudget maxUnavailable is 2"),
+            "enabled-profile pdb zero disruptionsAllowed": (doctor_json(
+                ["get poddisruptionbudget", smoke.API_PDB],
+                lambda data: data["status"].__setitem__("disruptionsAllowed", 0)),
+                "API PodDisruptionBudget disruptionsAllowed >= 1"),
+            "enabled-profile pvc not Bound": (doctor_json(
+                ["get persistentvolumeclaim", smoke.ARTIFACTS_CLAIM],
+                lambda data: data["status"].__setitem__("phase", "Pending")),
+                "is not Bound"),
+            "enabled-profile pvc missing mount": (doctor_json(
+                ["app.kubernetes.io/component=worker"],
+                pod_status(lambda p: p["spec"]["containers"][0].__setitem__("volumeMounts", [])),
+                when=revision(4)), "worker container does not mount artifacts"),
+            "enabled-profile non-JSON stderr": (doctor_output(
+                ["logs", "--container api"], returncode=0, stdout="plain text log line\n"),
+                "api stderr emitted non-JSON log line"),
+            "enabled-profile forbidden message log field": (doctor_output(
+                ["logs", "--container worker"], returncode=0,
+                stdout=json.dumps({"timestamp": "2026-11-19T10:04:00Z", "level": "INFO",
+                                   "event": "process.started", "role": "worker", "message": "oops"}) + "\n"),
+                "forbidden ADR 0024 'message' field"),
+            "enabled-profile api missing debug http log": (doctor_output(
+                ["logs", "--container api"], returncode=0,
+                stdout=json.dumps({"timestamp": "2026-11-19T10:04:00Z", "level": "INFO",
+                                   "event": "process.started", "role": "api"}) + "\n"),
+                "api ADR 0024 JSON structured logs"),
+            "enabled-profile worker missing process.started": (doctor_output(
+                ["logs", "--container worker"], returncode=0, stdout=""),
+                "worker ADR 0024 JSON structured logs"),
+            "pdb residue after uninstall": (doctor_json(
+                [smoke.RELEASE_KINDS],
+                lambda data: data["items"].append({"kind": "PodDisruptionBudget", "metadata": {"name": "leftover"}})),
+                "release objects to be removed"),
+            "kept artifact PVC deleted by uninstall": (doctor_json(
+                ["get persistentvolumeclaims"], lambda data: data.__setitem__("items", []),
+                when=lambda: not fake_ref().installed), "kept artifact PVC after uninstall:"),
         }
         # History changes only after the install was observed: compare against the first reading.
         readings = []
@@ -870,8 +974,13 @@ class OrchestrationTest(unittest.TestCase):
             if "deployment/postgres" in args and "exec" in args and "psql" in args and fake_ref().revision == 3:
                 return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
         cases["upgrade changed history"] = (history_changes, "migration history changed on a same-digest upgrade")
+        def history_changes_on_profile(args, result):
+            if "deployment/postgres" in args and "exec" in args and "psql" in args and fake_ref().revision == 4:
+                return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
         cases["repeated upgrade changed history"] = (history_changes_on_repeat,
                                                      "migration history changed on a repeated upgrade")
+        cases["enabled-profile changed history"] = (history_changes_on_profile,
+                                                    "migration history changed on enabled-profile upgrade")
         for name, (doctor, message) in cases.items():
             with self.subTest(name):
                 self.fake = FakeCluster()
@@ -998,6 +1107,101 @@ class ValuesTest(unittest.TestCase):
             if kind:
                 rendered.append(f"{kind.group(1)}/{name.group(1)}")
         self.assertEqual(sorted(rendered), smoke.expected_release_objects())
+
+    def test_values_enabled_profile(self):
+        values = smoke.smoke_values(DIGEST, worker_replicas=1, enabled_profile=True)
+        self.assertEqual(values["api"], {"replicas": 2, "podDisruptionBudget": {"enabled": True, "maxUnavailable": 1}})
+        self.assertEqual(values["telemetry"], {"logging": {"format": "json", "level": "debug"}})
+        self.assertEqual(values["storage"], {"artifacts": {"enabled": True, "size": "64Mi",
+                                                           "accessModes": ["ReadWriteOnce"]}})
+
+    def test_chart_accepts_enabled_profile_smoke_values(self):
+        """The enabled-profile values pass chart schema and render guards and emit PDB, PVC and LOG_* env."""
+        if shutil.which(HELM) is None:
+            self.skipTest("helm not on PATH")
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            json.dump(smoke.smoke_values(DIGEST, 1, enabled_profile=True), handle)
+            handle.flush()
+            result = subprocess.run([HELM, "template", smoke.RELEASE, str(smoke.CHART), "--values", handle.name],
+                                    capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kind: PodDisruptionBudget", result.stdout)
+        self.assertIn("kind: PersistentVolumeClaim", result.stdout)
+        self.assertIn("helm.sh/resource-policy: keep", result.stdout)
+        self.assertIn(smoke.ARTIFACTS_MOUNT_PATH, result.stdout)
+        for prefix in ("OPENMETTLE_API_", "OPENMETTLE_WORKER_", "OPENMETTLE_MIGRATE_"):
+            self.assertIn(f"name: {prefix}LOG_FORMAT", result.stdout)
+            self.assertIn(f"name: {prefix}LOG_LEVEL", result.stdout)
+
+
+class EnabledProfileChecksTest(unittest.TestCase):
+    def test_evaluate_pdb(self):
+        pdb = {"metadata": {"name": smoke.API_PDB},
+               "spec": {"maxUnavailable": 1, "unhealthyPodEvictionPolicy": "AlwaysAllow"},
+               "status": {"currentHealthy": 2, "disruptionsAllowed": 1}}
+        self.assertEqual(smoke.evaluate_pdb(pdb), {"name": smoke.API_PDB, "max_unavailable": 1,
+                                                   "current_healthy": 2, "disruptions_allowed": 1})
+        pending = json.loads(json.dumps(pdb))
+        pending["status"]["disruptionsAllowed"] = 0
+        self.assertIsNone(smoke.evaluate_pdb(pending))
+        for bad in (
+            {**pdb, "metadata": {"name": "wrong"}},
+            {**pdb, "spec": {"maxUnavailable": 2, "unhealthyPodEvictionPolicy": "AlwaysAllow"}},
+            {**pdb, "spec": {"maxUnavailable": 1, "unhealthyPodEvictionPolicy": "IfHealthyBudget"}},
+        ):
+            with self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_pdb(bad)
+
+    def test_check_artifacts_pvc(self):
+        pvc = {"metadata": {"name": smoke.ARTIFACTS_CLAIM, "annotations": {"helm.sh/resource-policy": "keep"}},
+               "status": {"phase": "Bound"}}
+        def make_pod(role):
+            return {"spec": {"securityContext": {"fsGroup": 65532},
+                             "volumes": [{"name": "artifacts",
+                                          "persistentVolumeClaim": {"claimName": smoke.ARTIFACTS_CLAIM}}],
+                             "containers": [{"name": role, "volumeMounts": [
+                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH}]}]}}
+        pods = {"api": [make_pod("api"), make_pod("api")], "worker": [make_pod("worker")]}
+        self.assertEqual(smoke.check_artifacts_pvc(pvc, pods),
+                         {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
+                          "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3})
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.check_artifacts_pvc({**pvc, "status": {"phase": "Pending"}}, pods)
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.check_artifacts_pvc({**pvc, "metadata": {"name": smoke.ARTIFACTS_CLAIM, "annotations": {}}}, pods)
+        bad_pod = make_pod("worker")
+        bad_pod["spec"]["securityContext"]["fsGroup"] = 1000
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.check_artifacts_pvc(pvc, {"api": pods["api"], "worker": [bad_pod]})
+        no_vol = make_pod("worker")
+        no_vol["spec"]["volumes"] = []
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.check_artifacts_pvc(pvc, {"api": pods["api"], "worker": [no_vol]})
+
+    def test_structured_logs_validation(self):
+        started_api = json.dumps({"timestamp": "2026-11-19T10:04:00Z", "level": "INFO",
+                                  "event": "process.started", "role": "api"})
+        http_debug = json.dumps({"timestamp": "2026-11-19T10:04:01Z", "level": "DEBUG",
+                                 "event": "http.request.completed", "http.route": "/healthz",
+                                 "http.request.method": "GET", "http.response.status_code": 200,
+                                 "duration_us": 12})
+        summary = smoke.evaluate_structured_logs(
+            "api", {"api-0": started_api + "\n" + http_debug + "\n", "api-1": started_api + "\n"},
+            require_debug_http=True)
+        self.assertEqual(summary, {"pods": 2, "lines": 3, "debug_http_events": 1})
+        self.assertIsNone(smoke.evaluate_structured_logs("api", {"api-0": started_api}, require_debug_http=True))
+        self.assertIsNone(smoke.evaluate_structured_logs("worker", {"worker-0": ""}))
+        for bad in (
+            "not json",
+            "[]",
+            json.dumps({"timestamp": "t", "level": "INFO", "event": "x", "message": "forbidden"}),
+            json.dumps({"timestamp": "t", "level": "INFO", "event": "x", "unknown": 1}),
+            json.dumps({"timestamp": "t", "level": "TRACE", "event": "x"}),
+            json.dumps({"level": "INFO", "event": "x"}),
+            json.dumps({"timestamp": "t", "level": "INFO"}),
+        ):
+            with self.subTest(bad=bad), self.assertRaises(smoke.SmokeFailure):
+                smoke.parse_structured_logs(bad, "api")
 
 
 class FixtureTest(unittest.TestCase):
