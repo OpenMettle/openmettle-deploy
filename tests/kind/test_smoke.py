@@ -365,6 +365,8 @@ class FakeCluster:
             spec["volumes"] = [{"name": "artifacts",
                                 "persistentVolumeClaim": {"claimName": smoke.ARTIFACTS_CLAIM}}]
             container["volumeMounts"] = [{"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH}]
+            container["env"] = [{"name": f"OPENMETTLE_{component.upper()}_ARTIFACTS_DIR",
+                                 "value": smoke.ARTIFACTS_MOUNT_PATH}]
             if component == "api":
                 spec["volumes"] += [
                     {"name": "auth-config", "configMap": {
@@ -378,8 +380,8 @@ class FakeCluster:
                     {"name": "auth-config", "mountPath": smoke.AUTH_CONFIG_DIR, "readOnly": True},
                     {"name": "auth-login-keys", "mountPath": smoke.AUTH_KEYS_DIR, "readOnly": True},
                 ]
-                container["env"] = [{"name": "OPENMETTLE_API_AUTH_CONFIG",
-                                     "value": smoke.AUTH_CONFIG_PATH}]
+                container["env"] += [{"name": "OPENMETTLE_API_AUTH_CONFIG",
+                                      "value": smoke.AUTH_CONFIG_PATH}]
         return {"metadata": {"name": name, "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
                 "spec": spec,
@@ -463,6 +465,9 @@ class FakeCluster:
             return self.probe(args)
         if namespace == smoke.APP_NAMESPACE and args[:1] == ["exec"] and smoke.AUTH_CHECK_BINARY in args:
             return 0, smoke.AUTH_CHECK_OK, ""
+        if namespace == smoke.APP_NAMESPACE and args[:1] == ["exec"] and "stat" in args:
+            return 0, "".join(f"{smoke.ARTIFACTS_MOUNT_PATH}/{d}|directory|2700|65532\n"
+                              for d in smoke.ARTIFACT_SUBDIRS), ""
         if namespace == smoke.DB_NAMESPACE:
             if args[:2] == ["rollout", "status"]:
                 return 0, "rolled out", ""
@@ -669,7 +674,10 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(optional_check["unmounted_http"],
                          {"/auth/session": 404, "/auth/native/session": 404, "/v1/capabilities": 404})
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
-                                                "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3})
+                                                "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3,
+                                                "store_subdirectories": ["staging", "revisions"]})
+        stats = [c for c in self.fake.commands("kubectl") if "exec" in c and "stat" in c]
+        self.assertEqual(sorted(c[c.index("--container") + 1] for c in stats), ["api", "api", "worker"])
         self.assertEqual(profile_check["auth"], {
             "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "keys_dir": smoke.AUTH_KEYS_DIR,
             "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True, "checked_pods": 2,
@@ -1016,6 +1024,18 @@ class OrchestrationTest(unittest.TestCase):
                 ["app.kubernetes.io/component=worker"],
                 pod_status(lambda p: p["spec"]["containers"][0].__setitem__("volumeMounts", [])),
                 when=revision(4)), "worker container does not mount artifacts"),
+            "enabled-profile api lacks ARTIFACTS_DIR": (doctor_json(
+                ["app.kubernetes.io/component=api"],
+                pod_status(lambda p: p["spec"]["containers"][0].__setitem__("env", [
+                    e for e in p["spec"]["containers"][0]["env"] if "ARTIFACTS" not in e["name"]])),
+                when=revision(4)), "api container lacks OPENMETTLE_API_ARTIFACTS_DIR"),
+            "enabled-profile store subdirectory missing": (doctor_output(
+                ["exec", " stat --format="], returncode=1, stderr="stat: cannot statx: No such file or directory\n"),
+                "exited 1"),
+            "enabled-profile store subdirectory world-readable": (doctor_output(
+                ["exec", " stat --format="], stdout=f"{smoke.ARTIFACTS_MOUNT_PATH}/staging|directory|755|65532\n"
+                                         f"{smoke.ARTIFACTS_MOUNT_PATH}/revisions|directory|700|65532\n"),
+                "expected a 0700 directory owned by 65532"),
             "enabled-profile non-JSON stderr": (doctor_output(
                 ["logs", "--container api"], returncode=0, stdout="plain text log line\n"),
                 "api stderr emitted non-JSON log line"),
@@ -1254,7 +1274,9 @@ class EnabledProfileChecksTest(unittest.TestCase):
                              "volumes": [{"name": "artifacts",
                                           "persistentVolumeClaim": {"claimName": smoke.ARTIFACTS_CLAIM}}],
                              "containers": [{"name": role, "volumeMounts": [
-                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH}]}]}}
+                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH}], "env": [
+                                 {"name": f"OPENMETTLE_{role.upper()}_ARTIFACTS_DIR",
+                                  "value": smoke.ARTIFACTS_MOUNT_PATH}]}]}}
         pods = {"api": [make_pod("api"), make_pod("api")], "worker": [make_pod("worker")]}
         self.assertEqual(smoke.check_artifacts_pvc(pvc, pods),
                          {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
@@ -1271,6 +1293,36 @@ class EnabledProfileChecksTest(unittest.TestCase):
         no_vol["spec"]["volumes"] = []
         with self.assertRaises(smoke.SmokeFailure):
             smoke.check_artifacts_pvc(pvc, {"api": pods["api"], "worker": [no_vol]})
+        for env in ([], [{"name": "OPENMETTLE_WORKER_ARTIFACTS_DIR", "value": "/tmp"}],
+                    [{"name": "OPENMETTLE_API_ARTIFACTS_DIR", "value": smoke.ARTIFACTS_MOUNT_PATH}]):
+            wrong_env = make_pod("worker")
+            wrong_env["spec"]["containers"][0]["env"] = env
+            with self.subTest(env=env), self.assertRaisesRegex(smoke.SmokeFailure, "OPENMETTLE_WORKER_ARTIFACTS_DIR"):
+                smoke.check_artifacts_pvc(pvc, {"api": pods["api"], "worker": [wrong_env]})
+
+    def test_artifact_dirs(self):
+        self.assertEqual(smoke.artifact_dirs_command(),
+                         ["stat", "--format=%n|%F|%a|%u", f"{smoke.ARTIFACTS_MOUNT_PATH}/staging",
+                          f"{smoke.ARTIFACTS_MOUNT_PATH}/revisions"])
+        def listing(*rows):
+            return "".join(f"{smoke.ARTIFACTS_MOUNT_PATH}/{'|'.join(row)}\n" for row in rows)
+        for good in (listing(("staging", "directory", "700", "65532"), ("revisions", "directory", "700", "65532")),
+                     listing(("staging", "directory", "2700", "65532"), ("revisions", "directory", "2700", "65532"))):
+            self.assertIsNone(smoke.evaluate_artifact_dirs("pod", good))
+        bad = {
+            "empty": "",
+            "one directory": listing(("staging", "directory", "700", "65532")),
+            "reordered": listing(("revisions", "directory", "700", "65532"), ("staging", "directory", "700", "65532")),
+            "symlink": listing(("staging", "symbolic link", "777", "65532"), ("revisions", "directory", "700", "65532")),
+            "group readable": listing(("staging", "directory", "700", "65532"), ("revisions", "directory", "750", "65532")),
+            "root owned": listing(("staging", "directory", "700", "0"), ("revisions", "directory", "700", "65532")),
+            "bad mode": listing(("staging", "directory", "rwx", "65532"), ("revisions", "directory", "700", "65532")),
+            "extra field": listing(("staging", "directory", "700", "65532", "x"),
+                                   ("revisions", "directory", "700", "65532")),
+        }
+        for name, output in bad.items():
+            with self.subTest(name), self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_artifact_dirs("pod", output)
 
     def test_structured_logs_validation(self):
         started_api = json.dumps({"timestamp": "2026-11-19T10:04:00Z", "level": "INFO",

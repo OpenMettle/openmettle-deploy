@@ -168,8 +168,8 @@ networkPolicy:
 
 storage:
   # Optional artifact volume, mounted read-write at /var/lib/openmettle/artifacts in api and worker
-  # pods (never in the migration Job). Core does not read this path yet (V1-15); see README.
-  # When enabled, set exactly one of existingClaim or size.
+  # pods (never in the migration Job), passed to both as OPENMETTLE_{API,WORKER}_ARTIFACTS_DIR
+  # (core ADR 0031); see README. When enabled, set exactly one of existingClaim or size.
   artifacts:
     enabled: false
     # Name of an existing PersistentVolumeClaim in the release namespace; the chart renders no PVC.

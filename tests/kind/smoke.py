@@ -78,6 +78,8 @@ INVENTORY_KINDS = "deployments,services,serviceaccounts,jobs,configmaps,secrets,
 API_PDB = f"{FULLNAME}-api"
 ARTIFACTS_CLAIM = f"{FULLNAME}-artifacts"
 ARTIFACTS_MOUNT_PATH = "/var/lib/openmettle/artifacts"
+# Created by core's artifact_fs::Store::open at startup when ARTIFACTS_DIR is set (core ADR 0031).
+ARTIFACT_SUBDIRS = ("staging", "revisions")
 AUTH_CONFIG_MAP = "openmettle-smoke-auth-config"
 AUTH_LOGIN_KEYS_SECRET = "openmettle-smoke-auth-login-keys"
 AUTH_CONFIG_DIR = "/etc/openmettle/auth"
@@ -684,8 +686,31 @@ def check_artifacts_pvc(pvc: dict, pods_by_role: dict) -> dict:
             if not any(m.get("name") == "artifacts" and m.get("mountPath") == ARTIFACTS_MOUNT_PATH
                        for m in mounts):
                 raise SmokeFailure(f"{role} container does not mount artifacts at {ARTIFACTS_MOUNT_PATH}")
+            variable = f"OPENMETTLE_{role.upper()}_ARTIFACTS_DIR"
+            if {"name": variable, "value": ARTIFACTS_MOUNT_PATH} not in (container.get("env") or []):
+                raise SmokeFailure(f"{role} container lacks {variable}={ARTIFACTS_MOUNT_PATH}")
             mounted_pods += 1
     return {"claim": name, "phase": phase, "mount_path": ARTIFACTS_MOUNT_PATH, "mounted_pods": mounted_pods}
+
+
+def artifact_dirs_command() -> list:
+    """stat(1) core's ADR 0031 subdirectories; the debian:bookworm-slim runtime image ships coreutils."""
+    return ["stat", "--format=%n|%F|%a|%u", *(f"{ARTIFACTS_MOUNT_PATH}/{d}" for d in ARTIFACT_SUBDIRS)]
+
+
+def evaluate_artifact_dirs(pod: str, output: str) -> None:
+    """Require the staging and revisions directories that core's artifact_fs::Store::open creates at
+    startup: real directories owned by UID 65532 with permission bits 0700. A set-group-ID bit that a
+    volume's fsGroup handling may add is not a permission bit and is ignored."""
+    expected = [f"{ARTIFACTS_MOUNT_PATH}/{d}" for d in ARTIFACT_SUBDIRS]
+    rows = [line.split("|") for line in output.splitlines()]
+    if [row[0] for row in rows] != expected or any(len(row) != 4 for row in rows):
+        raise SmokeFailure(f"{pod}: unexpected artifact directory listing {output!r}")
+    for path, kind, mode, uid in rows:
+        if kind != "directory" or not re.fullmatch(r"[0-7]{3,4}", mode) or int(mode, 8) & 0o777 != 0o700 \
+                or uid != "65532":
+            raise SmokeFailure(f"{pod}: {path} is {kind} mode {mode} owner {uid}, "
+                               f"expected a 0700 directory owned by 65532")
 
 
 def check_auth_mounts(pods_by_role: dict) -> dict:
@@ -1170,7 +1195,7 @@ class Smoke:
         return job_completions(self.events("involvedObject.kind=Job"), f"{FULLNAME}-migrate")
 
     def enabled_profile(self, history: list):
-        """Upgrade to an enabled profile and verify live PDB, PVC, auth + /v1/* mounts and JSON/debug logs."""
+        """Upgrade to an enabled profile and verify live PDB, PVC and ARTIFACTS_DIR store, auth + /v1/* mounts and JSON/debug logs."""
         self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True)
         for component in WORKLOADS:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
@@ -1202,6 +1227,12 @@ class Smoke:
         pvc = check_artifacts_pvc(
             self.kube_json("--namespace", APP_NAMESPACE, "get", "persistentvolumeclaim", ARTIFACTS_CLAIM),
             pods_by_role)
+        for role in WORKLOADS:
+            for pod_name in profile["pods"][role]:
+                listed = self.kube("--namespace", APP_NAMESPACE, "exec", pod_name, "--container", role, "--",
+                                   *artifact_dirs_command(), timeout=60)
+                evaluate_artifact_dirs(pod_name, listed.stdout)
+        pvc["store_subdirectories"] = list(ARTIFACT_SUBDIRS)
         logs_summary = {}
         for role, require_debug in (("api", True), ("worker", False)):
             names = profile["pods"][role]
@@ -1215,7 +1246,7 @@ class Smoke:
                     require_debug_http=dbg),
                 timeout=30)
         auth_summary = {**auth_mounts, "checked_pods": len(profile["pods"]["api"]), "routes": auth_routes}
-        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC, auth + /v1/* mounts and JSON/debug logs",
+        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and ARTIFACTS_DIR store, auth + /v1/* mounts and JSON/debug logs",
                     ready_replicas=profile["ready_replicas"],
                     healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
                     pdb=pdb, pvc=pvc, auth=auth_summary, logs=logs_summary)

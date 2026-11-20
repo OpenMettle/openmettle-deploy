@@ -202,7 +202,7 @@
       "required": ["artifacts"],
       "properties": {
         "artifacts": {
-          "description": "Read-write volume at /var/lib/openmettle/artifacts in api and worker pods. Rendering fails unless exactly one of existingClaim or size is set while enabled; storageClassName and annotations apply to the chart-owned PVC only.",
+          "description": "Read-write volume at /var/lib/openmettle/artifacts in api and worker pods, passed as OPENMETTLE_API_ARTIFACTS_DIR and OPENMETTLE_WORKER_ARTIFACTS_DIR. Rendering fails unless exactly one of existingClaim or size is set while enabled; storageClassName and annotations apply to the chart-owned PVC only.",
           "type": "object",
           "additionalProperties": false,
           "required": ["enabled", "existingClaim", "size", "accessModes", "annotations"],
