@@ -51,7 +51,7 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at 2c62e8a; this test does not read core.
+# from core src/lib.rs and src/migrate.rs at 3613a51 (unchanged since 2c62e8a); this test does not read core.
 ISSUANCE_URL = "OPENMETTLE_API_ISSUANCE_DATABASE_URL"
 ISSUANCE_POOL = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
 ISSUANCE_SECRET = "openmettle-issuance-database"

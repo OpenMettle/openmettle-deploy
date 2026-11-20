@@ -7,15 +7,19 @@ the chart installs; only a `kind-smoke` workflow run is. Set OPENMETTLE_CORE_DIR
 tests/kubernetes/qualify.py at CORE_COMMIT to also exercise the imported core guards. CI does.
 """
 import base64
+import hashlib
+import http.server
 import io
 import json
 import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -221,6 +225,108 @@ API_HOST = f"{smoke.FULLNAME}-api.{smoke.APP_NAMESPACE}.svc.cluster.local"
 MUTATING = (("helm", "install"), ("helm", "upgrade"), ("helm", "uninstall"), ("kubectl", "apply"))
 
 
+def session_hash(cookie: str) -> tuple:
+    """(session id, secret hash hex) of a browser cookie, framed as core sessions.rs, written here
+    independently of smoke.session_credential."""
+    session_id, _, secret = cookie.partition(".")
+    raw = base64.urlsafe_b64decode(secret + "=")
+    framed = b"openmettle/session-secret/1\x00"
+    for field in (session_id.encode(), raw):
+        framed += struct.pack(">Q", len(field)) + field
+    return session_id, hashlib.sha256(framed).hexdigest()
+
+
+def parse_form(content_type: str, body: bytes) -> dict:
+    """{part name: (filename, media type, bytes)} of a multipart/form-data body."""
+    boundary = content_type.partition("multipart/form-data; boundary=")[2].encode()
+    assert boundary and body.endswith(b"--" + boundary + b"--\r\n"), body
+    parts = {}
+    for chunk in body.split(b"--" + boundary)[1:-1]:
+        assert chunk.startswith(b"\r\n") and chunk.endswith(b"\r\n"), chunk
+        head, _, data = chunk[2:-2].partition(b"\r\n\r\n")
+        name = re.search(rb'name="([^"]+)"', head).group(1).decode()
+        filename = re.search(rb'filename="([^"]+)"', head)
+        media = re.search(rb"Content-Type: (\S+)", head).group(1).decode()
+        parts[name] = (filename and filename.group(1).decode(), media, data)
+    return parts
+
+
+class FakeArtifacts:
+    """The /v1 artifact routes over a fake port-forward: session check, idempotent multipart uploads,
+    revision metadata and single byte ranges. `doctor(method, path, headers, response)` may replace
+    a response."""
+
+    def __init__(self, cluster):
+        self.cluster = cluster
+        self.calls = []
+        self.uploads = {}
+        self.revisions = {}  # revision id -> (document, payload)
+        self.doctor = None
+
+    @staticmethod
+    def reply(status, document, content_type="application/json", extra=None):
+        headers = {"openmettle-api-version": "1.0", "cache-control": "no-store", "content-type": content_type,
+                   **(extra or {})}
+        return status, headers, json.dumps(document).encode()
+
+    def problem(self, status, code, extra=None):
+        return self.reply(status, {"type": "about:blank", "title": "t", "status": status, "detail": "d",
+                                   "code": code, "request_id": "11111111-1111-4111-8111-111111111111"},
+                          "application/problem+json", extra)
+
+    def __call__(self, port, method, path, headers, body=b""):
+        self.calls.append((port, method, path, dict(headers)))
+        cookie = headers.get("Cookie", "").partition(f"{smoke.SESSION_COOKIE}=")[2]
+        self.cluster.passwords["session"] = cookie
+        if self.cluster.session is None or headers.get("Origin") != smoke.AUTH_ORIGIN \
+                or session_hash(cookie) != self.cluster.session:
+            response = self.problem(401, "unauthenticated")
+        else:
+            response = self.route(method, path, headers, body)
+        return (self.doctor and self.doctor(method, path, headers, response)) or response
+
+    def route(self, method, path, headers, body):
+        route, _, query = path.partition("?")
+        segments = route.split("/")[1:]
+        if method == "POST" and segments[:2] == ["v1", "artifacts"] and segments[3:] in ([], ["revisions"]):
+            form = parse_form(headers["Content-Type"], body)
+            request = (route, query, form["file"], form["metadata"][2])
+            key = (route, headers["Idempotency-Key"])
+            if key in self.uploads:
+                previous, document = self.uploads[key]
+                return self.reply(201, document) if previous == request else self.problem(409, "idempotency_conflict")
+            filename, media, payload = form["file"]
+            artifact = segments[2] if len(segments) > 2 else f"00000000-0000-4000-8000-{len(self.uploads) + 1:012x}"
+            number = 1 + sum(d["artifact_id"] == artifact for d, _ in self.revisions.values())
+            document = {"artifact_id": artifact, "revision_id": f"00000000-0000-4000-9000-{len(self.revisions) + 1:012x}",
+                        "revision": str(number), "scope_kind": "personal",
+                        "scope_id": "00000000-0000-4000-a000-000000000001", "project_id": None,
+                        "media_type": media, "size_bytes": str(len(payload)),
+                        "sha256": hashlib.sha256(payload).hexdigest(), "display_name": filename,
+                        "state": "active", "created_at": "2026-11-20T10:00:00Z"}
+            self.uploads[key] = (request, document)
+            self.revisions[document["revision_id"]] = (document, payload)
+            return self.reply(201, document)
+        if method == "GET" and len(segments) in (5, 6) and segments[3] == "revisions" \
+                and segments[4] in self.revisions:
+            document, payload = self.revisions[segments[4]]
+            if len(segments) == 5:
+                return self.reply(200, document)
+            total = len(payload)
+            content = {"openmettle-api-version": "1.0", "cache-control": "no-store", "content-type": document["media_type"],
+                       "accept-ranges": "bytes", "x-content-type-options": "nosniff",
+                       "content-disposition": f"attachment; filename*=UTF-8''{document['display_name']}"}
+            first, _, last = headers.get("Range", "").removeprefix("bytes=").partition("-")
+            if not first:
+                return 200, {**content, "content-length": str(total)}, payload
+            first, last = int(first), min(int(last or total - 1), total - 1)
+            if first >= total:
+                return self.problem(416, "range_not_satisfiable", {"content-range": f"bytes */{total}"})
+            return 206, {**content, "content-length": str(last - first + 1),
+                         "content-range": f"bytes {first}-{last}/{total}"}, payload[first:last + 1]
+        return self.problem(404, "not_found")
+
+
 class FakeCluster:
     """Answers every command smoke.py runs as a healthy kind cluster would, and records them.
 
@@ -246,6 +352,9 @@ class FakeCluster:
         self.healthz = 200
         self.readyz = 200
         self.auth_http_overrides = {}
+        self.run_admission = ["t" if expected else "f" for _, expected in smoke.RUN_ADMISSION_CHECKS]
+        self.session = None  # (session id, secret hash hex) as seeded
+        self.artifacts = FakeArtifacts(self)
         self.core = self.make_core()
 
     def make_core(self):
@@ -380,6 +489,19 @@ class FakeCluster:
             })
         return 404, ""
 
+    def database(self, sql):
+        """`psql` on stdin in the fixture database: migration history, migration 19 grants, session seed."""
+        if "openmettle._sqlx_migrations" in sql:
+            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in (17, 18, 19)), ""
+        if sql == smoke.run_admission_sql():
+            return 0, "|".join(self.run_admission) + "\n", ""
+        seeded = re.search(r"SELECT '([A-Za-z0-9_-]{43})', decode\('([0-9a-f]{64})', 'hex'\)", sql)
+        if seeded and "INSERT INTO openmettle.local_sessions" in sql and "personal_limit_bytes" in sql:
+            self.session = seeded.groups()
+            return 0, "", ""
+        self.unknown.append(["psql", sql])
+        return 1, "", "unmodelled SQL"
+
     def pod(self, component, index):
         name = f"{smoke.FULLNAME}-{component}-{index}"
         container = {"name": component, "imagePullPolicy": "Never",
@@ -498,7 +620,7 @@ class FakeCluster:
             if args[:2] == ["rollout", "status"]:
                 return 0, "rolled out", ""
             if args[:1] == ["exec"]:
-                return 0, "17|t|aa|2026-11-19 10:01:00\n18|t|bb|2026-11-19 10:01:00\n", ""
+                return self.database(input)
             if args[:2] == ["get", "events"]:
                 return ok("No events")
             if args[:2] == ["get", "pods"] and selector == f"app.kubernetes.io/name={smoke.PEER}":
@@ -620,8 +742,10 @@ class FakeClock:
 
 
 class FakePortForward:
+    """A Service keeps its port; pod `<name>-<index>` gets 9000 + index, so callers can tell pods apart."""
+
     def __init__(self, kubectl, env, target, port):
-        self.port = port
+        self.port = port if target.startswith("service/") else 9000 + int(target.rsplit("-", 1)[1])
 
     def close(self):
         pass
@@ -654,6 +778,30 @@ def doctor_output(match, returncode=0, stdout="", stderr=""):
     return doctor
 
 
+class HttpDoctor:
+    """A FakeArtifacts doctor: for responses `when(method, path, request headers, response)` selects,
+    rewrites the JSON document, the response headers or the body, or replaces the response."""
+
+    def __init__(self, when, document=None, *, headers=None, body=None, replace=None):
+        self.when, self.document, self.headers, self.body, self.replace = when, document, headers, body, replace
+
+    def __call__(self, method, path, request_headers, response):
+        if not self.when(method, path, request_headers, response):
+            return None
+        if self.replace:
+            return self.replace(response)
+        status, headers, payload = response[0], dict(response[1]), response[2]
+        if self.document:
+            document = json.loads(payload)
+            self.document(document, payload)
+            payload = json.dumps(document).encode()
+        if self.headers:
+            self.headers(headers)
+        if self.body:
+            payload = self.body(payload)
+        return status, headers, payload
+
+
 class OrchestrationTest(unittest.TestCase):
     """main() and Smoke against a recording fake cluster: ordering, refusals, cleanup and reporting."""
 
@@ -670,6 +818,7 @@ class OrchestrationTest(unittest.TestCase):
         with mock.patch.object(smoke, "core_checkout_state", return_value=(smoke.CORE_COMMIT, "")), \
                 mock.patch.object(smoke, "load_core", return_value=self.fake.core), \
                 mock.patch.object(smoke, "PortForward", FakePortForward), \
+                mock.patch.object(smoke, "http_exchange", self.fake.artifacts), \
                 mock.patch.object(smoke, "time", FakeClock()), \
                 mock.patch.object(smoke.subprocess, "run", side_effect=AssertionError("real subprocess")), \
                 mock.patch.object(smoke.subprocess, "Popen", side_effect=AssertionError("real subprocess")), \
@@ -706,7 +855,25 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(profile_check["issuance"], {"api_pods": 2, "api_issuance_env": True, "issuance_pool": "2",
                                                      "worker_isolated": True, "migrate_isolated": True})
         install_check = next(c for c in report["checks"] if c["check"].startswith("install by digest"))
-        self.assertEqual(install_check["latest_version"], smoke.ISSUANCE_MIGRATION)
+        self.assertEqual(install_check["latest_version"], smoke.REQUIRED_MIGRATION)
+        self.assertEqual(install_check["run_admission"], {"dispatch_lock_singleton": True,
+                                                          "privileges_checked": len(smoke.RUN_ADMISSION_CHECKS) - 1})
+        self.assertEqual(profile_check["artifacts"], {
+            "session": "synthetic browser session (cookie channel)", "api_pods": 2, "revisions": 2,
+            "idempotent_retry": "same revision from the other replica",
+            "downloads": {"full_bytes": len(smoke.ARTIFACT_PAYLOADS[1]), "range": "bytes=0-9", "range_status": 206,
+                          "unsatisfiable_status": 416}})
+        # Writes alternate between the two API pods; every read goes to the pod that did not write.
+        self.assertEqual([(port, method, path.split("?")[0].count("/")) for port, method, path, _ in self.fake.artifacts.calls],
+                         [(9000, "POST", 2), (9001, "POST", 2), (9000, "POST", 4), (9001, "GET", 5),
+                          (9001, "GET", 6), (9001, "GET", 6), (9001, "GET", 6)])
+        self.assertEqual([h.get("Range") for *_, h in self.fake.artifacts.calls][-3:],
+                         [None, "bytes=0-9", smoke.UNSATISFIABLE_RANGE])
+        # The idempotent retry used another boundary under the same key; the revision a new key.
+        keys = [(h.get("Idempotency-Key"), h.get("Content-Type")) for *_, h in self.fake.artifacts.calls[:3]]
+        self.assertEqual([k for k, _ in keys], ["kind-smoke-create", "kind-smoke-create", "kind-smoke-revision"])
+        self.assertNotEqual(keys[0][1], keys[1][1])
+        self.assertEqual(len(self.fake.artifacts.revisions), 2)
         self.assertEqual(len(self.fake.commands("helm", "get", "hooks", smoke.RELEASE)), 2)
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
                                                 "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3,
@@ -809,8 +976,20 @@ class OrchestrationTest(unittest.TestCase):
         (text, values), _ = guard.call_args
         self.assertEqual(json.loads(text), report)
         self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
-        self.assertEqual(len(self.fake.passwords), 6)
+        self.assertEqual(len(self.fake.passwords), 7)
         self.assertIn("issuance", self.fake.passwords)
+        self.assertEqual(len(self.fake.passwords["session"]), 87)
+
+    def test_a_v1_failure_echoing_the_session_cookie_is_redacted(self):
+        def echo(method, path, headers, response):
+            return 500, response[1], ("echo " + headers["Cookie"]).encode()
+        self.fake.artifacts.doctor = echo
+        status, report, stderr = self.run_main()
+        self.assertEqual(status, 1)
+        self.assertIn("HTTP 500, expected 201", report["error"])
+        self.assertIn("[redacted]", report["error"])
+        self.assertNotIn(self.fake.passwords["session"], json.dumps(report) + stderr)
+        self.assert_cleaned_up()
 
     def test_cleanup_failure_fails_a_passing_run(self):
         self.fake.doctors.append(doctor_output(["kind", "delete"], returncode=1))
@@ -1013,9 +1192,61 @@ class OrchestrationTest(unittest.TestCase):
                 pod_status(lambda p: p["spec"]["containers"][0].__setitem__(
                     "env", [{"name": "OPENMETTLE_WORKER_AUTH_CONFIG", "value": smoke.AUTH_CONFIG_PATH}])),
                 when=revision(4)), "worker container must not receive AUTH_CONFIG env"),
-            "migration history before the issuance migration": (doctor_output(
-                ["exec", "deployment/postgres", "psql"], stdout="1|t|aa|t\n17|t|bb|t\n"),
-                "before the session issuance migration 18"),
+            "migration history before the run admission migration": (doctor_output(
+                ["exec", "--stdin", "deployment/postgres", "psql"], stdout="1|t|aa|t\n18|t|bb|t\n"),
+                "before the run admission migration 19"),
+            "run_dispatch_lock singleton row missing": (
+                lambda args, result: fake_ref().run_admission.__setitem__(0, "f"),
+                f"(SELECT count(*) = 1 AND bool_and(id AND NOT lock_guard) FROM {smoke.RUN_DISPATCH_LOCK}) "
+                "is 'f', expected 't'"),
+            "api can read run_dispatch_lock": (
+                lambda args, result: fake_ref().run_admission.__setitem__(-2, "t"),
+                f"has_any_column_privilege('openmettle_api', '{smoke.RUN_DISPATCH_LOCK}', 'SELECT') is 't'"),
+            "worker lacks the lock_guard column grant": (
+                lambda args, result: fake_ref().run_admission.__setitem__(2, "f"),
+                "migration 19 role boundary"),
+            "migration 19 privilege query truncated": (
+                lambda args, result: fake_ref().run_admission.__delitem__(slice(3, None)),
+                "migration 19 privilege query returned"),
+            "v1 session rejected": (
+                lambda args, result: setattr(fake_ref(), "session", None) if fake_ref().session else None,
+                "POST /v1/artifacts: HTTP 401, expected 201"),
+            "artifact upload sha256 differs": (HttpDoctor(
+                lambda m, p, h, r: m == "POST", lambda doc, body: doc.__setitem__("sha256", "0" * 64)),
+                "artifact revision 1:"),
+            "artifact retry creates another revision": (HttpDoctor(
+                lambda m, p, h, r: smoke.ARTIFACT_BOUNDARIES[1] in h.get("Content-Type", ""),
+                lambda doc, body: doc.__setitem__("revision_id", "00000000-0000-4000-9000-0000000000ff")),
+                "idempotent artifact upload retry did not return the same artifact and revision"),
+            "artifact revision 2 on another artifact": (HttpDoctor(
+                lambda m, p, h, r: m == "POST" and p.split("?")[0].endswith("/revisions"),
+                lambda doc, body: doc.__setitem__("artifact_id", "00000000-0000-4000-8000-0000000000ff")),
+                "revision 2 did not append a new revision to the same artifact"),
+            "revision metadata differs": (HttpDoctor(
+                lambda m, p, h, r: m == "GET" and not p.endswith("/content"),
+                lambda doc, body: doc.__setitem__("created_at", "2026-11-20T11:00:00Z")),
+                "revision 2 metadata differs from its upload response"),
+            "v1 response lacks no-store": (HttpDoctor(
+                lambda m, p, h, r: m == "GET", headers=lambda hs: hs.pop("cache-control")),
+                "missing OpenMettle-API-Version 1.0 or Cache-Control no-store"),
+            "download lacks nosniff": (HttpDoctor(
+                lambda m, p, h, r: p.endswith("/content") and "Range" not in h,
+                headers=lambda hs: hs.pop("x-content-type-options")), "full download:"),
+            "download serves other bytes": (HttpDoctor(
+                lambda m, p, h, r: p.endswith("/content") and "Range" not in h, body=lambda b: b[::-1]),
+                "full download:"),
+            "range ignored": (HttpDoctor(
+                lambda m, p, h, r: h.get("Range") == "bytes=0-9",
+                replace=lambda r: (200, r[1], smoke.ARTIFACT_PAYLOADS[1])), "HTTP 200, expected 206"),
+            "range serves the wrong slice": (HttpDoctor(
+                lambda m, p, h, r: h.get("Range") == "bytes=0-9", body=lambda b: b[1:] + b"x"),
+                "range download:"),
+            "unsatisfiable range without Content-Range": (HttpDoctor(
+                lambda m, p, h, r: h.get("Range") == smoke.UNSATISFIABLE_RANGE,
+                headers=lambda hs: hs.pop("content-range")), "unsatisfiable range:"),
+            "unsatisfiable range wrong code": (HttpDoctor(
+                lambda m, p, h, r: h.get("Range") == smoke.UNSATISFIABLE_RANGE,
+                lambda doc, body: doc.__setitem__("code", "validation")), "unsatisfiable range:"),
             "default install api receives issuance env": (doctor_json(
                 ["app.kubernetes.io/component=api"],
                 pod_status(lambda p: p["spec"]["containers"][0].__setitem__("env", issuance_env())),
@@ -1133,18 +1364,22 @@ class OrchestrationTest(unittest.TestCase):
         # History changes only after the install was observed: compare against the first reading.
         readings = []
 
+        def history_read(args, result):
+            """A psql read of the migration history; other psql reads (grants, seed) are not one."""
+            return "psql" in args and result.stdout[:1].isdigit()
+
         def history_changes(args, result):
-            if "deployment/postgres" in args and "exec" in args and "psql" in args:
+            if history_read(args, result):
                 readings.append(1)
                 if len(readings) > 1:
                     return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
 
         def history_changes_on_repeat(args, result):
-            if "deployment/postgres" in args and "exec" in args and "psql" in args and fake_ref().revision == 3:
+            if history_read(args, result) and fake_ref().revision == 3:
                 return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
         cases["upgrade changed history"] = (history_changes, "migration history changed on a same-digest upgrade")
         def history_changes_on_profile(args, result):
-            if "deployment/postgres" in args and "exec" in args and "psql" in args and fake_ref().revision == 4:
+            if history_read(args, result) and fake_ref().revision == 4:
                 return subprocess.CompletedProcess(args, 0, "1|t|changed|t\n", "")
         cases["repeated upgrade changed history"] = (history_changes_on_repeat,
                                                      "migration history changed on a repeated upgrade")
@@ -1153,7 +1388,10 @@ class OrchestrationTest(unittest.TestCase):
         for name, (doctor, message) in cases.items():
             with self.subTest(name):
                 self.fake = FakeCluster()
-                self.fake.doctors.append(doctor)
+                if isinstance(doctor, HttpDoctor):
+                    self.fake.artifacts.doctor = doctor
+                else:
+                    self.fake.doctors.append(doctor)
                 readings.clear()
                 status, report, _ = self.run_main()
                 self.assertEqual((status, report["result"]), (1, "failed"))
@@ -1534,6 +1772,206 @@ class EnabledProfileChecksTest(unittest.TestCase):
         ):
             with self.subTest(bad=bad), self.assertRaises(smoke.SmokeFailure):
                 smoke.evaluate_mounted_auth_http(bad)
+
+
+def revision_document(payload=smoke.ARTIFACT_PAYLOADS[0], revision=1):
+    return {"artifact_id": "00000000-0000-4000-8000-000000000001", "revision_id": "00000000-0000-4000-9000-000000000001",
+            "revision": str(revision), "scope_kind": "personal", "scope_id": "00000000-0000-4000-a000-000000000001",
+            "project_id": None, "media_type": "text/plain", "size_bytes": str(len(payload)),
+            "sha256": hashlib.sha256(payload).hexdigest(), "display_name": "smoke.txt", "state": "active",
+            "created_at": "2026-11-20T10:00:00Z"}
+
+
+class RunAdmissionTest(unittest.TestCase):
+    def test_query_reads_every_check_in_one_row(self):
+        sql = smoke.run_admission_sql()
+        self.assertTrue(sql.startswith("SELECT ") and sql.endswith(";"))
+        for expression, _ in smoke.RUN_ADMISSION_CHECKS:
+            self.assertIn(expression, sql)
+        self.assertNotIn("FROM openmettle.runs", sql)
+
+    def test_checks_cover_migration_19_grants_and_api_denials(self):
+        checks = dict(smoke.RUN_ADMISSION_CHECKS)
+        lock = smoke.RUN_DISPATCH_LOCK
+        self.assertIs(checks[f"has_column_privilege('openmettle_worker', '{lock}', 'lock_guard', 'UPDATE')"], True)
+        self.assertIs(checks[f"has_table_privilege('openmettle_worker', '{lock}', 'UPDATE')"], False)
+        for column in ("actor_approval_id", "round_limit", "queue_expires_at"):
+            self.assertIs(checks[f"has_column_privilege('openmettle_api', 'openmettle.runs', '{column}', 'INSERT')"],
+                          True)
+        for privilege in ("SELECT", "UPDATE"):
+            self.assertIs(checks[f"has_any_column_privilege('openmettle_api', '{lock}', '{privilege}')"], False)
+
+    def test_evaluate(self):
+        good = "|".join("t" if value else "f" for _, value in smoke.RUN_ADMISSION_CHECKS)
+        self.assertEqual(smoke.evaluate_run_admission(good + "\n"),
+                         {"dispatch_lock_singleton": True, "privileges_checked": len(smoke.RUN_ADMISSION_CHECKS) - 1})
+        flipped = good.split("|")
+        flipped[-1] = "t"
+        with self.assertRaisesRegex(smoke.SmokeFailure, r"'UPDATE'\) is 't', expected 'f'"):
+            smoke.evaluate_run_admission("|".join(flipped))
+        for output in ("", good + "|t", good.rsplit("|", 1)[0]):
+            with self.assertRaisesRegex(smoke.SmokeFailure, "privilege query returned"):
+                smoke.evaluate_run_admission(output)
+        # psql prints NULL (an empty dispatch-lock table under bool_and) as an empty field.
+        with self.assertRaisesRegex(smoke.SmokeFailure, "is '', expected 't'"):
+            smoke.evaluate_run_admission("|" + good.split("|", 1)[1])
+
+
+class SessionSeedTest(unittest.TestCase):
+    RAW = bytes(range(64))
+
+    def test_credential_matches_core_framing(self):
+        session_id, cookie, secret_hash = smoke.session_credential(self.RAW)
+        self.assertEqual(session_id, base64.urlsafe_b64encode(self.RAW[:32]).decode().rstrip("="))
+        self.assertEqual(len(cookie), 87)  # core sessions::parse requires exactly 87 bytes
+        self.assertEqual(cookie.split("."), [session_id, base64.urlsafe_b64encode(self.RAW[32:]).decode().rstrip("=")])
+        self.assertEqual(session_hash(cookie), (session_id, secret_hash))
+        self.assertNotEqual(smoke.session_credential(bytes(64))[2], secret_hash)
+        with self.assertRaises(ValueError):
+            smoke.session_credential(bytes(63))
+
+    def test_seed_stores_only_the_hash_and_configures_storage_limits(self):
+        session_id, cookie, secret_hash = smoke.session_credential(self.RAW)
+        login = smoke.b64url(bytes(32))
+        sql = smoke.session_seed_sql(session_id, secret_hash, login)
+        self.assertNotIn(cookie.split(".")[1], sql)
+        self.assertIn(f"SELECT '{session_id}', decode('{secret_hash}', 'hex'), '{login}'", sql)
+        self.assertIn(f"SET instance_budget_bytes = {smoke.STORAGE_LIMIT_BYTES}, "
+                      f"personal_limit_bytes = {smoke.STORAGE_LIMIT_BYTES}", sql)
+        self.assertGreater(smoke.STORAGE_LIMIT_BYTES, 2 * smoke.ARTIFACT_MAX_BYTES)
+        self.assertGreaterEqual(smoke.ARTIFACT_MAX_BYTES, max(map(len, smoke.ARTIFACT_PAYLOADS)))
+        for table in ("login_providers", "login_provider_revisions", "users", "scopes", "user_identities",
+                      "local_identity_approvals", "login_nonce_reservations", "login_transactions", "local_sessions"):
+            self.assertIn(f"INSERT INTO openmettle.{table} ", sql)
+        # The seeded provider is not the auth document's; validation reads only the database.
+        self.assertNotIn(smoke.SESSION_IDS["provider"], json.dumps(smoke.smoke_auth_document()))
+
+    def test_seed_refuses_values_that_could_alter_the_sql(self):
+        session_id, _, secret_hash = smoke.session_credential(self.RAW)
+        login = smoke.b64url(bytes(32))
+        for args in ((session_id + "'", secret_hash, login), (session_id, secret_hash.upper(), login),
+                     (session_id, secret_hash, "x';--"), (session_id[:-1], secret_hash, login)):
+            with self.assertRaises(smoke.SmokeFailure):
+                smoke.session_seed_sql(*args)
+
+
+class ArtifactHttpTest(unittest.TestCase):
+    PAYLOAD = smoke.ARTIFACT_PAYLOADS[1]
+
+    def test_multipart_form_in_either_order(self):
+        boundary = smoke.ARTIFACT_BOUNDARIES[0]
+        content_type = f"multipart/form-data; boundary={boundary}"
+        metadata_first = smoke.multipart_form(boundary, self.PAYLOAD)
+        file_first = smoke.multipart_form(boundary, self.PAYLOAD, file_first=True)
+        expected = {"metadata": (None, "application/json", b"{}"), "file": ("smoke.txt", "text/plain", self.PAYLOAD)}
+        self.assertEqual(parse_form(content_type, metadata_first), expected)
+        self.assertEqual(parse_form(content_type, file_first), expected)
+        self.assertLess(metadata_first.index(b'name="metadata"'), metadata_first.index(b'name="file"'))
+        self.assertLess(file_first.index(b'name="file"'), file_first.index(b'name="metadata"'))
+        self.assertTrue(metadata_first.startswith(f"--{boundary}\r\n".encode()))
+        self.assertTrue(metadata_first.endswith(f"\r\n--{boundary}--\r\n".encode()))
+        for payload in smoke.ARTIFACT_PAYLOADS:
+            for candidate in smoke.ARTIFACT_BOUNDARIES:
+                self.assertNotIn(candidate.encode(), payload)
+
+    def test_v1_headers(self):
+        self.assertEqual(smoke.v1_headers("c"), {"Cookie": "__Host-openmettle-session=c",
+                                                 "Origin": "https://app.example.test"})
+        self.assertEqual(smoke.v1_headers("c", key="k", boundary="b", byte_range="bytes=0-9"), {
+            "Cookie": "__Host-openmettle-session=c", "Origin": "https://app.example.test", "Idempotency-Key": "k",
+            "Content-Type": "multipart/form-data; boundary=b", "Range": "bytes=0-9"})
+        self.assertEqual(smoke.smoke_auth_document()["browser"]["origin"], smoke.AUTH_ORIGIN)
+
+    def test_expect_v1(self):
+        headers = {"openmettle-api-version": "1.0", "cache-control": "no-store"}
+        self.assertEqual(smoke.expect_v1("x", (201, headers, b"{}"), 201), (headers, b"{}"))
+        with self.assertRaisesRegex(smoke.SmokeFailure, r"x: HTTP 404, expected 201: b'nope'"):
+            smoke.expect_v1("x", (404, headers, b"nope"), 201)
+        for missing in headers:
+            with self.assertRaisesRegex(smoke.SmokeFailure, "missing OpenMettle-API-Version"):
+                smoke.expect_v1("x", (201, {k: v for k, v in headers.items() if k != missing}, b"{}"), 201)
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.expect_v1("x", (201, {**headers, "openmettle-api-version": "2.0"}, b"{}"), 201)
+
+    def test_evaluate_artifact_revision(self):
+        document = revision_document(self.PAYLOAD, 2)
+        self.assertEqual(smoke.evaluate_artifact_revision(json.dumps(document).encode(), self.PAYLOAD, 2), document)
+        doctored = {"state": "pending", "revision": 2, "size_bytes": len(self.PAYLOAD), "sha256": "0" * 64,
+                    "display_name": "other.txt", "media_type": "application/octet-stream",
+                    "scope_kind": "project", "project_id": "00000000-0000-4000-b000-000000000001",
+                    "artifact_id": "not-a-uuid", "revision_id": None, "scope_id": "ABC"}
+        for key, value in doctored.items():
+            with self.subTest(key), self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_artifact_revision(json.dumps({**document, key: value}).encode(), self.PAYLOAD, 2)
+        for body in (b"not json", b"[]"):
+            with self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_artifact_revision(body, self.PAYLOAD, 2)
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.evaluate_artifact_revision(json.dumps(document).encode(), self.PAYLOAD, 1)
+
+    def downloads(self):
+        total = len(self.PAYLOAD)
+        full = {"content-type": "text/plain", "content-length": str(total), "accept-ranges": "bytes",
+                "x-content-type-options": "nosniff", "content-disposition": "attachment; filename*=UTF-8''smoke.txt"}
+        partial = {**full, "content-length": "10", "content-range": f"bytes 0-9/{total}"}
+        refused = {"content-type": "application/problem+json", "content-range": f"bytes */{total}"}
+        problem = json.dumps({"status": 416, "code": "range_not_satisfiable"}).encode()
+        return [(full, self.PAYLOAD), (partial, self.PAYLOAD[:10]), (refused, problem)]
+
+    def test_evaluate_artifact_downloads(self):
+        self.assertEqual(smoke.evaluate_artifact_downloads(self.PAYLOAD, *self.downloads()), {
+            "full_bytes": len(self.PAYLOAD), "range": "bytes=0-9", "range_status": 206, "unsatisfiable_status": 416})
+        cases = {
+            "full body": (0, None, self.PAYLOAD[:-1], "full download"),
+            "full nosniff": (0, ("x-content-type-options", None), None, "full download"),
+            "full accept-ranges": (0, ("accept-ranges", "none"), None, "full download"),
+            "full disposition inline": (0, ("content-disposition", "inline"), None, "full download"),
+            "full content-length": (0, ("content-length", "1"), None, "full download"),
+            "range slice": (1, None, self.PAYLOAD[1:11], "range download"),
+            "range header": (1, ("content-range", "bytes 0-9/*"), None, "range download"),
+            "range length": (1, ("content-length", "37"), None, "range download"),
+            "unsatisfiable content-range": (2, ("content-range", None), None, "unsatisfiable range"),
+            "unsatisfiable media type": (2, ("content-type", "application/json"), None, "unsatisfiable range"),
+            "unsatisfiable code": (2, None, json.dumps({"status": 416, "code": "validation"}).encode(),
+                                   "unsatisfiable range"),
+            "unsatisfiable body": (2, None, b"<html>", "unsatisfiable range body is not JSON"),
+        }
+        for name, (index, header, body, message) in cases.items():
+            with self.subTest(name):
+                responses = self.downloads()
+                headers, original = responses[index]
+                if header:
+                    headers = {k: v for k, v in headers.items() if k != header[0]}
+                    if header[1] is not None:
+                        headers[header[0]] = header[1]
+                responses[index] = (headers, original if body is None else body)
+                with self.assertRaisesRegex(smoke.SmokeFailure, message):
+                    smoke.evaluate_artifact_downloads(self.PAYLOAD, *responses)
+
+    def test_http_exchange_against_a_loopback_server(self):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, dict(self.headers), self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(206)
+                self.send_header("Content-Range", "bytes 0-1/2")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        status, headers, body = smoke.http_exchange(server.server_port, "POST", "/v1/artifacts?max_bytes=1",
+                                                    {"Origin": smoke.AUTH_ORIGIN}, b"\x00\xff")
+        self.assertEqual((status, headers["content-range"], body), (206, "bytes 0-1/2", b"ok"))
+        self.assertEqual(seen[0][0], "/v1/artifacts?max_bytes=1")
+        self.assertEqual((seen[0][1]["Origin"], seen[0][2]), (smoke.AUTH_ORIGIN, b"\x00\xff"))
 
 
 class FixtureTest(unittest.TestCase):
