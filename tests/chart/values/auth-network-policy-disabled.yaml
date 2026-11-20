@@ -1,5 +1,8 @@
 # Synthetic overlay on minimal.yaml: browser sign-in / OIDC enabled without the chart's
 # NetworkPolicies, so networkPolicy.api.oidc.to is not required.
+database:
+  issuance:
+    existingSecret: openmettle-issuance-database
 networkPolicy:
   enabled: false
   database:

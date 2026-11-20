@@ -1,5 +1,6 @@
 """Policy tests over `helm template` output for charts/openmettle-core (V1-32 I1 render contract, I3 network
-policy, I4 storage, database CA, Ingress and PodDisruptionBudget, I5 browser sign-in / OIDC).
+policy, I4 storage, database CA, Ingress and PodDisruptionBudget, I5 browser sign-in / OIDC, AUTHSEC-01
+session issuance database credential).
 
 These tests render the chart; they do not install it. Each test docstring names a template or
 schema change that would make it fail. Requires helm (or HELM) and PyYAML (test-only).
@@ -50,7 +51,10 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at 94d21f8; this test does not read core.
+# from core src/lib.rs and src/migrate.rs at 2c62e8a; this test does not read core.
+ISSUANCE_URL = "OPENMETTLE_API_ISSUANCE_DATABASE_URL"
+ISSUANCE_POOL = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
+ISSUANCE_SECRET = "openmettle-issuance-database"
 DEFAULT_ENV = {
     "api": {"BIND": "0.0.0.0:8080", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
     "worker": {"BIND": "0.0.0.0:8081", "DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
@@ -361,7 +365,8 @@ class ReleasePolicyTest(Rendered):
         """Fails if a settings value or Secret key is not plumbed into the matching env var."""
         docs = self.renders["all-keys"]
         expected = {
-            "api": {"DB_MAX_CONNECTIONS": "6", "DB_TIMEOUT_MS": "2500", "SHUTDOWN_TIMEOUT_MS": "8000"},
+            "api": {"DB_MAX_CONNECTIONS": "6", "DB_TIMEOUT_MS": "2500", "SHUTDOWN_TIMEOUT_MS": "8000",
+                    "ISSUANCE_DB_MAX_CONNECTIONS": "3"},
             "worker": {"DB_MAX_CONNECTIONS": "2", "DB_TIMEOUT_MS": "1000", "SHUTDOWN_TIMEOUT_MS": "3000"},
             "migrate": {"CONNECT_TIMEOUT_MS": "10000", "LOCK_TIMEOUT_MS": "30000", "STATEMENT_TIMEOUT_MS": "600000"},
         }
@@ -371,6 +376,8 @@ class ReleasePolicyTest(Rendered):
             for key, value in expected[role].items():
                 self.assertEqual(env[PREFIX[role] + key]["value"], value)
             self.assertEqual(env[PREFIX[role] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]["key"], keys[role])
+        api = env_map(find(docs, "Deployment", "-api")["spec"]["template"]["spec"]["containers"][0])
+        self.assertEqual(api[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["key"], "issuance-url")
 
     def test_default_environment(self):
         """Fails if any default env value in values.yaml changes from DEFAULT_ENV, or a variable is added or dropped."""
@@ -672,6 +679,9 @@ class OptionalDefaultsTest(Rendered):
         """Fails if values.yaml enables or pre-fills the artifact volume, database CA, Ingress, API PDB, auth or telemetry."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
         self.assertEqual(defaults["database"]["caBundle"], {"enabled": False, "configMapName": "", "key": "ca.crt"})
+        self.assertEqual(defaults["database"]["issuance"], {"existingSecret": "", "key": "url"})
+        self.assertEqual(defaults["api"]["settings"]["issuanceDbMaxConnections"], 2)
+        self.assertNotIn("issuanceDbMaxConnections", defaults["worker"]["settings"])
         self.assertEqual(defaults["api"]["podDisruptionBudget"],
                          {"enabled": False, "minAvailable": None, "maxUnavailable": None})
         self.assertEqual(defaults["storage"], {"artifacts": {
@@ -931,7 +941,8 @@ class AuthTest(Rendered):
                 non_api_yaml = yaml.safe_dump_all(
                     d for d in docs if not (d["kind"] in ("Deployment", "NetworkPolicy") and component(d) == "api")
                 )
-                for ref in ("example-auth-config", "example-auth-login-keys", "example-oidc-ca", "AUTH_CONFIG"):
+                for ref in ("example-auth-config", "example-auth-login-keys", "example-oidc-ca", "AUTH_CONFIG",
+                            ISSUANCE_SECRET, "ISSUANCE"):
                     self.assertNotIn(ref, non_api_yaml)
 
     def test_provider_ca_uses_default_key_ca_crt(self):
@@ -953,6 +964,67 @@ class AuthTest(Rendered):
         """Fails if enabling auth while networkPolicy.enabled=false still renders a NetworkPolicy."""
         docs = self.renders["auth-network-policy-disabled"]
         self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
+
+
+class IssuanceTest(Rendered):
+    """database.issuance and api.settings.issuanceDbMaxConnections reach the API container only, and only
+    while auth.enabled is true (core ADR 0030: the API exits 78 on either setting without AUTH_CONFIG; the
+    worker and migrator exit 78 if they receive the URL)."""
+
+    EXPECTED = {
+        "auth-enabled": ({"name": ISSUANCE_SECRET, "key": "url"}, "2"),
+        "auth-network-policy-disabled": ({"name": ISSUANCE_SECRET, "key": "url"}, "2"),
+        "all-keys": ({"name": ISSUANCE_SECRET, "key": "issuance-url"}, "3"),
+    }
+
+    def test_api_receives_issuance_env_exactly_with_auth(self):
+        """Fails if the issuance URL or pool size is missing with auth, rendered without it, or not a Secret reference."""
+        with_auth = []
+        for name, docs in self.renders.items():
+            for role, pod in pods(docs):
+                with self.subTest(values=name, component=role):
+                    env = env_map(pod["containers"][0])
+                    issuance = sorted(key for key in env if "ISSUANCE" in key)
+                    if role == "api" and "OPENMETTLE_API_AUTH_CONFIG" in env:
+                        with_auth.append(name)
+                        ref, pool = self.EXPECTED[name]
+                        self.assertEqual(issuance, [ISSUANCE_URL, ISSUANCE_POOL])
+                        self.assertEqual(env[ISSUANCE_URL], {"name": ISSUANCE_URL, "valueFrom": {"secretKeyRef": ref}})
+                        self.assertEqual(env[ISSUANCE_POOL], {"name": ISSUANCE_POOL, "value": pool})
+                    else:
+                        self.assertEqual(issuance, [])
+        self.assertEqual(sorted(with_auth), sorted(self.EXPECTED))
+
+    def test_worker_and_migrate_never_reference_the_issuance_secret(self):
+        """Fails if a worker or migrate pod (or any object but the API Deployment) names the issuance Secret."""
+        for name in self.EXPECTED:
+            docs = self.renders[name]
+            with self.subTest(values=name):
+                others = yaml.safe_dump_all(d for d in docs if not (d["kind"] == "Deployment" and component(d) == "api"))
+                self.assertNotIn(ISSUANCE_SECRET, others)
+                self.assertNotIn("ISSUANCE", others)
+                self.assertEqual(sorted(role for role, _ in pods(docs)), ["api", "migrate", "worker"])
+
+    def test_pool_size_bounds_reach_the_api(self):
+        """Fails if a valid issuanceDbMaxConnections is clamped, rejected or rendered as a number."""
+        for value in (1, 64):
+            with self.subTest(value=value):
+                docs = render(("auth-enabled.yaml",), [f"api.settings.issuanceDbMaxConnections={value}"])
+                env = env_map(find(docs, "Deployment", "-api")["spec"]["template"]["spec"]["containers"][0])
+                self.assertEqual(env[ISSUANCE_POOL]["value"], str(value))
+
+    def test_boundaries_render(self):
+        """Fails if a guard rejects another key of a shared Secret or a budget equal to the issuance-inclusive peak."""
+        for set_values in (["database.issuance.existingSecret=openmettle-api-database", "database.issuance.key=issuance-url"],
+                           # (1 + 1) * (4 + 2) + (1 + 1) * 4 + 1 = 21
+                           ["database.connectionBudget=21"]):
+            for extra in ((), (SKIP,)):
+                with self.subTest(values=set_values, extra=extra):
+                    result = helm_template(("auth-enabled.yaml",), set_values, extra)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        # Without auth the issuance pool is not opened, so it is not counted.
+        result = helm_template(set_values=["database.connectionBudget=17"])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TelemetryTest(Rendered):
@@ -1137,10 +1209,13 @@ class ExampleOverlayTest(unittest.TestCase):
             self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"]["value"], "info")
             if role == "api":
                 self.assertEqual(env["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
+                self.assertEqual(env[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["name"],
+                                 "example-openmettle-issuance-database")
                 self.assertLessEqual(AUTH_VOLUMES, set(volumes(pod)))
             else:
                 self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
                 self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
+                self.assertFalse([k for k in env if "ISSUANCE" in k], role)
             if role in ("api", "worker"):
                 self.assertEqual(env[PREFIX[role] + "OTLP_TRACES_ENDPOINT"]["value"],
                                  "https://alloy.observability.example.test:4318/v1/traces")
@@ -1205,10 +1280,13 @@ class WorkstationProfileTest(unittest.TestCase):
             self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"]["value"], "info")
             if role == "api":
                 self.assertEqual(env["OPENMETTLE_API_AUTH_CONFIG"]["value"], AUTH_CONFIG_PATH)
+                self.assertEqual(env[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["name"],
+                                 "workstation-openmettle-issuance-database")
                 self.assertLessEqual(AUTH_VOLUMES, vols)
             else:
                 self.assertFalse(AUTH_VOLUMES & vols, role)
                 self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
+                self.assertFalse([k for k in env if "ISSUANCE" in k], role)
             if role in ("api", "worker"):
                 self.assertIn("artifacts", vols, role)
                 self.assertIn("otlp-ca", vols, role)
@@ -1228,6 +1306,13 @@ class WorkstationProfileTest(unittest.TestCase):
     def test_values_are_synthetic(self):
         """Fails if the workstation profile leaks any non-reserved domain, real digest or non-documentation address."""
         _assert_synthetic_example(self, WORKSTATION_EXAMPLE, self.values)
+
+
+# --set values for an auth-enabled render on minimal.yaml (OIDC egress peer via --set-json).
+AUTH = ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"]
+ISSUANCE = f"database.issuance.existingSecret={ISSUANCE_SECRET}"
+OIDC_PEER = ["--set-json", 'networkPolicy.api.oidc.to=[{"ipBlock":{"cidr":"192.0.2.20/32"}}]']
+SKIP = "--skip-schema-validation"
 
 
 class NegativeCaseTest(unittest.TestCase):
@@ -1464,8 +1549,7 @@ class NegativeCaseTest(unittest.TestCase):
          ["auth.providerCaBundle.key must be a ConfigMap key"]),
         ("auth provider CA bad ConfigMap name", ["auth.providerCaBundle.configMapName=OIDC_CA"], [],
          [SCHEMA, "/auth/providerCaBundle/configMapName"]),
-        ("auth enabled without OIDC egress peers",
-         ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"], [],
+        ("auth enabled without OIDC egress peers", [*AUTH, ISSUANCE], [],
          ["networkPolicy.api.oidc.to must list at least one OIDC provider peer"]),
         ("auth enabled without OIDC egress peers without schema",
          ["auth.enabled=true", "auth.configMapName=auth-cm", "auth.loginKeysSecretName=auth-keys"],
@@ -1483,6 +1567,45 @@ class NegativeCaseTest(unittest.TestCase):
          ["--set-json", "networkPolicy.api.oidc.to=[{}]", "--skip-schema-validation"],
          ["networkPolicy.api.oidc.to[0] must be a non-empty NetworkPolicyPeer object"]),
         ("unknown auth key", ["auth.mountPath=/tmp"], [], [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        # Session issuance (AUTHSEC-01, core ADR 0030).
+        ("auth without issuance Secret", AUTH, OIDC_PEER, [SCHEMA, "/database/issuance/existingSecret"]),
+        ("auth without issuance Secret without schema", AUTH, [*OIDC_PEER, SKIP],
+         ["database.issuance.existingSecret is required when auth.enabled is true"]),
+        ("issuance Secret without auth", [ISSUANCE], [], [SCHEMA, "/database/issuance/existingSecret"]),
+        ("issuance Secret without auth without schema", [ISSUANCE], [SKIP],
+         ["database.issuance.existingSecret must be empty when auth.enabled is false"]),
+        *[(f"issuance reuses {role}{suffix}", [*AUTH, f"database.issuance.existingSecret={secret}"], [*OIDC_PEER, *extra],
+           [f'database.issuance must not reuse database.{role} (Secret "{secret}", key "url")'])
+          for role, secret in (("api", "openmettle-api-database"), ("worker", "openmettle-worker-database"),
+                               ("migrate", "openmettle-owner-database"))
+          for suffix, extra in (("", []), (" without schema", [SKIP]))],
+        ("issuance reuses a custom api key",
+         [*AUTH, "database.api.key=db", "database.issuance.existingSecret=openmettle-api-database", "database.issuance.key=db"],
+         OIDC_PEER, ['database.issuance must not reuse database.api (Secret "openmettle-api-database", key "db")']),
+        ("issuance bad Secret name", [*AUTH, "database.issuance.existingSecret=Issuance_DB"], OIDC_PEER,
+         [SCHEMA, "/database/issuance/existingSecret"]),
+        ("issuance key with path", [*AUTH, ISSUANCE, "database.issuance.key=a/b"], OIDC_PEER,
+         [SCHEMA, "/database/issuance/key"]),
+        ("issuance key with path without schema", [*AUTH, ISSUANCE, "database.issuance.key=a/b"], [*OIDC_PEER, SKIP],
+         ["database.issuance.key must be a Secret key"]),
+        ("issuance empty key without schema", [*AUTH, ISSUANCE, "database.issuance.key="], [*OIDC_PEER, SKIP],
+         ["database.issuance.key must be a Secret key"]),
+        *[(f"issuance pool {value}{suffix}", [*AUTH, ISSUANCE, f"api.settings.issuanceDbMaxConnections={value}"],
+           [*OIDC_PEER, *extra], fragments)
+          for value in ("0", "65", "1.5")
+          for suffix, extra, fragments in (
+              ("", [], [SCHEMA_ERROR, "/api/settings/issuanceDbMaxConnections"]),
+              (" without schema", [SKIP],
+               [f"api.settings.issuanceDbMaxConnections ({value}) must be an integer between 1 and 64"]))],
+        ("issuance pool string without schema", [*AUTH, ISSUANCE],
+         [*OIDC_PEER, "--set-string", "api.settings.issuanceDbMaxConnections=2", SKIP],
+         ["api.settings.issuanceDbMaxConnections (2) must be an integer between 1 and 64"]),
+        ("worker has no issuance pool", ["worker.settings.issuanceDbMaxConnections=2"], [],
+         [SCHEMA, "additional properties 'issuanceDbMaxConnections' not allowed"]),
+        ("unknown issuance key", ["database.issuance.optional=false"], [],
+         [SCHEMA, "additional properties 'optional' not allowed"]),
+        ("connection budget counts the issuance pool", [*AUTH, ISSUANCE, "database.connectionBudget=20"], OIDC_PEER,
+         ["database.connectionBudget (20) is below the release's peak of 21 connections"]),
         ("unknown auth providerCaBundle key", ["auth.providerCaBundle.mountPath=/tmp"], [],
          [SCHEMA, "additional properties 'mountPath' not allowed"]),
         ("unknown OIDC policy key", ["networkPolicy.api.oidc.protocol=UDP"], [],
@@ -1899,6 +2022,7 @@ class BoundsTest(unittest.TestCase):
             ("strategy.maxSurge", 0, None, [f"{role}.strategy.maxUnavailable=1"]),
             ("strategy.maxUnavailable", 0, None, []),
         )],
+        ("api.settings.issuanceDbMaxConnections", 1, 64, []),
         ("api.service.port", 1, 65535, []),
         ("networkPolicy.database.port", 1, 65535, []),
         ("networkPolicy.api.oidc.port", 1, 65535, []),
@@ -1963,6 +2087,8 @@ class YamlScalarTest(unittest.TestCase):
                 self.assertEqual(ref, {"name": secret, "key": key})
                 self.assertIsInstance(pod["containers"][0]["imagePullPolicy"], str)
         api_pod = find(self.docs, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(env_map(api_pod["containers"][0])[ISSUANCE_URL]["valueFrom"]["secretKeyRef"],
+                         {"name": "true", "key": "0x1"})
         self.assertEqual(volumes(api_pod)["auth-config"]["configMap"], {
             "name": "789", "items": [{"key": "false", "path": "auth.json"}]})
         self.assertEqual(volumes(api_pod)["auth-login-keys"]["secret"], {

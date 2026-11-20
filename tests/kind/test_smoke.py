@@ -25,8 +25,34 @@ import smoke  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DIGEST = {role: "sha256:" + str(i) * 64 for i, role in enumerate(smoke.ROLES, start=1)}
-PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": "d" * 32,
+PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": "d" * 32, "issuance": "g" * 32,
              "auth_login_key": base64.b64encode(b"k" * 32).decode("ascii")}
+# `helm get hooks` for the release: the migrate ServiceAccount, NetworkPolicy and Job, abridged.
+HOOKS = f"""---
+# Source: openmettle-core/templates/migrate-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {smoke.FULLNAME}-migrate
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          env:
+            - name: OPENMETTLE_MIGRATE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: "{smoke.SECRET['migrate']}"
+                  key: "url"
+"""
+
+
+def issuance_env():
+    """The api container's issuance env as the API server returns it (optional unset)."""
+    return [{"name": smoke.ISSUANCE_URL_ENV,
+             "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["issuance"], "key": "url"}}},
+            {"name": smoke.ISSUANCE_POOL_ENV, "value": smoke.ISSUANCE_POOL}]
 CORE_DIR = os.environ.get("OPENMETTLE_CORE_DIR")
 HELM = os.environ.get("HELM", "helm")
 
@@ -381,7 +407,7 @@ class FakeCluster:
                     {"name": "auth-login-keys", "mountPath": smoke.AUTH_KEYS_DIR, "readOnly": True},
                 ]
                 container["env"] += [{"name": "OPENMETTLE_API_AUTH_CONFIG",
-                                      "value": smoke.AUTH_CONFIG_PATH}]
+                                      "value": smoke.AUTH_CONFIG_PATH}, *issuance_env()]
         return {"metadata": {"name": name, "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
                 "spec": spec,
@@ -447,7 +473,7 @@ class FakeCluster:
                 if item["metadata"]["name"] == "postgres-fixture":
                     self.passwords["admin"] = item["stringData"]["admin-password"]
                 if item["kind"] == "Secret" and "url" in item.get("stringData", {}):
-                    role = next(r for r in smoke.ROLES if smoke.SECRET[r] == item["metadata"]["name"])
+                    role = next(r for r in smoke.DB_LOGINS if smoke.SECRET[r] == item["metadata"]["name"])
                     self.passwords[role] = item["stringData"]["url"].split(":")[2].split("@")[0]
                 if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.AUTH_LOGIN_KEYS_SECRET:
                     self.passwords["auth_login_key"] = item["data"]["active.key"]
@@ -472,7 +498,7 @@ class FakeCluster:
             if args[:2] == ["rollout", "status"]:
                 return 0, "rolled out", ""
             if args[:1] == ["exec"]:
-                return 0, "20261101000000|t|aa|2026-11-19 10:01:00\n20261102000000|t|bb|2026-11-19 10:01:00\n", ""
+                return 0, "17|t|aa|2026-11-19 10:01:00\n18|t|bb|2026-11-19 10:01:00\n", ""
             if args[:2] == ["get", "events"]:
                 return ok("No events")
             if args[:2] == ["get", "pods"] and selector == f"app.kubernetes.io/name={smoke.PEER}":
@@ -529,7 +555,7 @@ class FakeCluster:
                         ["get", "endpointslices"]):
             if selector == smoke.RUN_LABEL:
                 owned = [f"Secret/{smoke.AUTH_LOGIN_KEYS_SECRET}",
-                         *(f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES)]
+                         *(f"Secret/{smoke.SECRET[r]}" for r in smoke.DB_LOGINS)]
                 if args[1] == "configmaps,secrets,networkpolicies":
                     owned.extend([f"ConfigMap/{smoke.AUTH_CONFIG_MAP}",
                                   f"NetworkPolicy/{smoke.NAMESPACE_DENY}"])
@@ -573,6 +599,8 @@ class FakeCluster:
                                  if self.installed else []), ""
         if args[:2] == ["get", "manifest"]:
             return 0, "---\n# Source: openmettle-core/templates/api-service.yaml\n", ""
+        if args[:2] == ["get", "hooks"]:
+            return 0, HOOKS, ""
         if args[:1] == ["uninstall"]:
             self.installed = False
             return 0, "", ""
@@ -673,6 +701,13 @@ class OrchestrationTest(unittest.TestCase):
         optional_check = next(c for c in report["checks"] if "no optional package present" in c["check"])
         self.assertEqual(optional_check["unmounted_http"],
                          {"/auth/session": 404, "/auth/native/session": 404, "/v1/capabilities": 404})
+        self.assertEqual(optional_check["issuance"], {"api_pods": 1, "api_issuance_env": False, "issuance_pool": None,
+                                                      "worker_isolated": True, "migrate_isolated": True})
+        self.assertEqual(profile_check["issuance"], {"api_pods": 2, "api_issuance_env": True, "issuance_pool": "2",
+                                                     "worker_isolated": True, "migrate_isolated": True})
+        install_check = next(c for c in report["checks"] if c["check"].startswith("install by digest"))
+        self.assertEqual(install_check["latest_version"], smoke.ISSUANCE_MIGRATION)
+        self.assertEqual(len(self.fake.commands("helm", "get", "hooks", smoke.RELEASE)), 2)
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
                                                 "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3,
                                                 "store_subdirectories": ["staging", "revisions"]})
@@ -774,7 +809,8 @@ class OrchestrationTest(unittest.TestCase):
         (text, values), _ = guard.call_args
         self.assertEqual(json.loads(text), report)
         self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
-        self.assertEqual(len(self.fake.passwords), 5)
+        self.assertEqual(len(self.fake.passwords), 6)
+        self.assertIn("issuance", self.fake.passwords)
 
     def test_cleanup_failure_fails_a_passing_run(self):
         self.fake.doctors.append(doctor_output(["kind", "delete"], returncode=1))
@@ -977,6 +1013,40 @@ class OrchestrationTest(unittest.TestCase):
                 pod_status(lambda p: p["spec"]["containers"][0].__setitem__(
                     "env", [{"name": "OPENMETTLE_WORKER_AUTH_CONFIG", "value": smoke.AUTH_CONFIG_PATH}])),
                 when=revision(4)), "worker container must not receive AUTH_CONFIG env"),
+            "migration history before the issuance migration": (doctor_output(
+                ["exec", "deployment/postgres", "psql"], stdout="1|t|aa|t\n17|t|bb|t\n"),
+                "before the session issuance migration 18"),
+            "default install api receives issuance env": (doctor_json(
+                ["app.kubernetes.io/component=api"],
+                pod_status(lambda p: p["spec"]["containers"][0].__setitem__("env", issuance_env())),
+                when=revision(1)), "without auth"),
+            "default install migrate hook receives issuance URL": (doctor_output(
+                ["get", "hooks"], stdout=HOOKS + f"            - name: {smoke.ISSUANCE_URL_ENV}\n"),
+                "migrate hook Job must not receive the issuance credential"),
+            "release hooks without the migrate Job": (doctor_output(["get", "hooks"], stdout="---\n"),
+                                                      "release hooks do not contain the migrate Job"),
+            "enabled-profile api lacks issuance URL": (doctor_json(
+                ["app.kubernetes.io/component=api"],
+                pod_status(lambda p: p["spec"]["containers"][0].__setitem__("env", [
+                    e for e in p["spec"]["containers"][0]["env"] if e["name"] != smoke.ISSUANCE_URL_ENV])),
+                when=revision(4)), "api container issuance env is"),
+            "enabled-profile issuance URL optional": (doctor_json(
+                ["app.kubernetes.io/component=api"],
+                pod_status(lambda p: [e["valueFrom"]["secretKeyRef"].__setitem__("optional", True)
+                                      for e in p["spec"]["containers"][0]["env"] if e["name"] == smoke.ISSUANCE_URL_ENV]),
+                when=revision(4)), "is not a required reference"),
+            "enabled-profile worker receives issuance URL": (doctor_json(
+                ["app.kubernetes.io/component=worker"],
+                pod_status(lambda p: p["spec"]["containers"][0]["env"].append(issuance_env()[0])),
+                when=revision(4)), "worker pod must not receive the issuance credential"),
+            "enabled-profile migrate hook mounts issuance Secret": (doctor_output(
+                ["get", "hooks"], stdout=HOOKS.replace(smoke.SECRET["migrate"], smoke.SECRET["issuance"])),
+                "migrate hook Job must not receive the issuance credential"),
+            "test-owned issuance Secret removed by uninstall": (doctor_json(
+                ["get configmaps,secrets,networkpolicies", smoke.RUN_LABEL],
+                lambda data: data.__setitem__("items", [i for i in data["items"]
+                                                        if i["metadata"]["name"] != smoke.SECRET["issuance"]])),
+                "test-owned objects after uninstall:"),
             "enabled-profile v1 capabilities wrong problem code": (
                 lambda args, result: (fake_ref().auth_http_overrides.__setitem__(
                     "/v1/capabilities", (401, json.dumps({"status": 401, "code": "wrong"})))
@@ -1162,7 +1232,8 @@ class ValuesTest(unittest.TestCase):
         self.assertEqual(values["images"]["pullPolicy"], "Never")
         for role in smoke.ROLES:
             self.assertEqual(values["images"][role]["digest"], DIGEST[role])
-            self.assertEqual(values["database"][role], {"existingSecret": smoke.SECRET[role]})
+        # Without auth no issuance Secret is configured (the chart refuses one).
+        self.assertEqual(values["database"], {role: {"existingSecret": smoke.SECRET[role]} for role in smoke.ROLES})
         self.assertEqual(values["worker"], {"replicas": 2})
         self.assertNotIn("api", values)
         self.assertEqual(values["networkPolicy"], {
@@ -1194,6 +1265,7 @@ class ValuesTest(unittest.TestCase):
             result = subprocess.run([HELM, "template", smoke.RELEASE, str(smoke.CHART), "--values", handle.name],
                                     capture_output=True, text=True, timeout=120, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ISSUANCE", result.stdout)
         for role in smoke.ROLES:
             self.assertIn(f'image: "{smoke.digest_reference(role, DIGEST[role])}"', result.stdout)
         # The non-hook objects the chart renders are exactly what the smoke expects in the release.
@@ -1223,6 +1295,7 @@ class ValuesTest(unittest.TestCase):
             "to": [{"ipBlock": {"cidr": smoke.AUTH_OIDC_CIDR}}],
             "port": 443,
         })
+        self.assertEqual(values["database"], {role: {"existingSecret": smoke.SECRET[role]} for role in smoke.DB_LOGINS})
 
     def test_chart_accepts_enabled_profile_smoke_values(self):
         """The enabled-profile values pass chart schema and render guards and emit PDB, PVC and LOG_* env."""
@@ -1243,6 +1316,9 @@ class ValuesTest(unittest.TestCase):
         self.assertNotIn("OPENMETTLE_MIGRATE_AUTH_CONFIG", result.stdout)
         self.assertIn(smoke.AUTH_CONFIG_DIR, result.stdout)
         self.assertIn(smoke.AUTH_KEYS_DIR, result.stdout)
+        self.assertEqual(result.stdout.count(f"name: {smoke.ISSUANCE_URL_ENV}"), 1)
+        self.assertEqual(result.stdout.count(f'name: "{smoke.SECRET["issuance"]}"'), 1)
+        self.assertIn(f'name: {smoke.ISSUANCE_POOL_ENV}\n              value: "{smoke.ISSUANCE_POOL}"', result.stdout)
         for prefix in ("OPENMETTLE_API_", "OPENMETTLE_WORKER_", "OPENMETTLE_MIGRATE_"):
             self.assertIn(f"name: {prefix}LOG_FORMAT", result.stdout)
             self.assertIn(f"name: {prefix}LOG_LEVEL", result.stdout)
@@ -1392,6 +1468,53 @@ class EnabledProfileChecksTest(unittest.TestCase):
         with self.assertRaisesRegex(smoke.SmokeFailure, "worker pod must not attach auth volumes"):
             smoke.check_auth_mounts({"api": [api_pod()], "worker": [leak_vol]})
 
+    def test_check_issuance_env_default_and_enabled(self):
+        def pod(role, env):
+            return {"spec": {"containers": [{"name": role, "env": env}]}}
+
+        base = [{"name": "OPENMETTLE_API_BIND", "value": "0.0.0.0:8080"}]
+        worker = pod("worker", [{"name": "OPENMETTLE_WORKER_BIND", "value": "0.0.0.0:8081"}])
+        self.assertEqual(smoke.check_issuance_env({"api": [pod("api", base)], "worker": [worker]}, HOOKS, enabled=False),
+                         {"api_pods": 1, "api_issuance_env": False, "issuance_pool": None,
+                          "worker_isolated": True, "migrate_isolated": True})
+        enabled = pod("api", base + issuance_env())
+        self.assertEqual(smoke.check_issuance_env({"api": [enabled, enabled], "worker": [worker]}, HOOKS, enabled=True),
+                         {"api_pods": 2, "api_issuance_env": True, "issuance_pool": "2",
+                          "worker_isolated": True, "migrate_isolated": True})
+        explicit = pod("api", base + issuance_env())
+        explicit["spec"]["containers"][0]["env"][1]["valueFrom"]["secretKeyRef"]["optional"] = False
+        smoke.check_issuance_env({"api": [explicit], "worker": [worker]}, HOOKS, enabled=True)
+
+        def api_with(mutate):
+            env = base + issuance_env()
+            mutate(env)
+            return pod("api", env)
+
+        failures = {
+            "without auth": ({"api": [enabled], "worker": [worker]}, HOOKS, False),
+            "issuance env is": ({"api": [pod("api", base)], "worker": [worker]}, HOOKS, True),
+            "required reference": ({"api": [api_with(lambda e: e[1]["valueFrom"]["secretKeyRef"].__setitem__(
+                "optional", True))], "worker": [worker]}, HOOKS, True),
+            "Secret openmettle-issuance-database key url": ({"api": [api_with(lambda e: e[1]["valueFrom"][
+                "secretKeyRef"].__setitem__("name", smoke.SECRET["api"]))], "worker": [worker]}, HOOKS, True),
+            "is not a required": ({"api": [api_with(lambda e: e.__setitem__(1, {
+                "name": smoke.ISSUANCE_URL_ENV, "value": "postgres://x"}))], "worker": [worker]}, HOOKS, True),
+            "DB_MAX_CONNECTIONS is not 2": ({"api": [api_with(lambda e: e[2].__setitem__("value", "4"))],
+                                             "worker": [worker]}, HOOKS, True),
+            "worker pod must not": ({"api": [enabled], "worker": [pod("worker", issuance_env()[:1])]}, HOOKS, True),
+            "worker pod must not receive": ({"api": [pod("api", base)], "worker": [pod("worker", [
+                {"name": "OPENMETTLE_WORKER_DATABASE_URL",
+                 "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["issuance"], "key": "url"}}}])]}, HOOKS, False),
+            "migrate hook Job must not": ({"api": [enabled], "worker": [worker]},
+                                          HOOKS + f"            - name: {smoke.ISSUANCE_URL_ENV}\n", True),
+            "do not contain the migrate Job": ({"api": [enabled], "worker": [worker]}, "", True),
+            "no container named 'api'": ({"api": [pod("sidecar", base)], "worker": [worker]}, HOOKS, False),
+            "pods are required": ({"api": [enabled], "worker": []}, HOOKS, True),
+        }
+        for message, (pods_by_role, hooks, flag) in failures.items():
+            with self.subTest(message), self.assertRaisesRegex(smoke.SmokeFailure, re.escape(message)):
+                smoke.check_issuance_env(pods_by_role, hooks, enabled=flag)
+
     def test_evaluate_mounted_auth_http(self):
         good = {
             "/auth/session": (403, "session origin refused\n"),
@@ -1433,21 +1556,25 @@ class FixtureTest(unittest.TestCase):
             self.assertEqual(item["metadata"]["labels"][smoke.RUN_LABEL], "0a1b2c3d", item["metadata"]["name"])
 
     def test_test_creates_one_url_secret_per_role(self):
-        for role in smoke.ROLES:
+        self.assertEqual(smoke.DB_LOGINS, ("api", "worker", "migrate", "issuance"))
+        for role in smoke.DB_LOGINS:
             secret = self.find("Secret", smoke.SECRET[role])
             self.assertEqual(secret["metadata"]["namespace"], smoke.APP_NAMESPACE)
             url = secret["stringData"]["url"]
             self.assertRegex(url, rf"^postgres://{smoke.DB_ROLE[role]}:{PASSWORDS[role]}@[^/]+/openmettle"
                                   r"\?sslmode=disable$")
-        owner = PASSWORDS["migrate"]
-        holders = [i["metadata"]["name"] for i in self.items if owner in json.dumps(i)]
-        self.assertEqual(sorted(holders), sorted([smoke.SECRET["migrate"], "postgres-fixture"]))
+        for login in ("migrate", "issuance"):
+            holders = [i["metadata"]["name"] for i in self.items if PASSWORDS[login] in json.dumps(i)]
+            self.assertEqual(sorted(holders), sorted([smoke.SECRET[login], "postgres-fixture"]), login)
 
     def test_provisioning_follows_core_readme(self):
         fixture = self.find("Secret", "postgres-fixture")
         self.assertEqual(fixture["metadata"]["namespace"], smoke.DB_NAMESPACE)
         sql = fixture["stringData"]["provision.sql"]
-        for role in smoke.ROLES:
+        # Four disjoint login roles before migration 1; migration 18 refuses without openmettle_issuance.
+        self.assertEqual(sorted(re.findall(r"CREATE ROLE (\w+) ", sql)),
+                         ["openmettle_api", "openmettle_issuance", "openmettle_owner", "openmettle_worker"])
+        for role in smoke.DB_LOGINS:
             self.assertIn(f"CREATE ROLE {smoke.DB_ROLE[role]} LOGIN PASSWORD '{PASSWORDS[role]}';", sql)
         self.assertIn("CREATE DATABASE openmettle OWNER openmettle_owner;", sql)
         self.assertNotRegex(sql, r"SUPERUSER|CREATEROLE|CREATEDB|GRANT")

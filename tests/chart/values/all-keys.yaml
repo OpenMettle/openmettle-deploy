@@ -12,6 +12,9 @@ database:
     key: worker-url
   migrate:
     key: owner-url
+  issuance:
+    existingSecret: openmettle-issuance-database
+    key: issuance-url
   connectionBudget: 40
   caBundle:
     enabled: true
@@ -25,7 +28,7 @@ api:
   serviceAccount:
     create: false
     name: example-api
-  settings: {dbMaxConnections: 6, dbTimeoutMs: 2500, shutdownTimeoutMs: 8000}
+  settings: {dbMaxConnections: 6, dbTimeoutMs: 2500, shutdownTimeoutMs: 8000, issuanceDbMaxConnections: 3}
   terminationGracePeriodSeconds: 20
   strategy: {maxSurge: 0, maxUnavailable: 1}
   service: {port: 80}

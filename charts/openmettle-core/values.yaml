@@ -33,8 +33,15 @@ database:
   migrate:
     existingSecret: ""
     key: url
+  # Session issuance URL (a login role of openmettle_issuance, core ADR 0030), mounted into the API
+  # container only. Required while auth.enabled is true and refused while it is false. It must not
+  # be the same Secret key as api, worker or migrate: core refuses an issuance URL whose user is the
+  # API's, and the worker and migrator refuse to start if they receive it.
+  issuance:
+    existingSecret: ""
+    key: url
   # Optional PostgreSQL connections available to this release. When set, rendering fails if
-  # (api.replicas + api.maxSurge) * api.dbMaxConnections
+  # (api.replicas + api.maxSurge) * (api.dbMaxConnections + api.issuanceDbMaxConnections if auth.enabled)
   #   + (worker.replicas + worker.maxSurge) * worker.dbMaxConnections + 1 (migrator) exceeds it.
   connectionBudget: null
   # Optional CA bundle for verifying PostgreSQL server certificates. When enabled, one key of an
@@ -63,6 +70,8 @@ api:
     dbMaxConnections: 4
     dbTimeoutMs: 2000
     shutdownTimeoutMs: 5000
+    # Session issuance pool size (1-64), rendered only while auth.enabled is true (core ADR 0030).
+    issuanceDbMaxConnections: 2
   # Must exceed settings.shutdownTimeoutMs; rendering fails otherwise.
   terminationGracePeriodSeconds: 15
   strategy:

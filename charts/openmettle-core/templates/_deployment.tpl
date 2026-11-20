@@ -102,6 +102,11 @@ spec:
             {{- if $auth }}
             - name: OPENMETTLE_API_AUTH_CONFIG
               value: {{ include "openmettle-core.authConfigPath" $root | quote }}
+            {{- /* core ADR 0030: the issuance pool, API only and only with sign-in. */}}
+            - name: OPENMETTLE_API_ISSUANCE_DATABASE_URL
+              {{- include "openmettle-core.databaseUrlEnv" (dict "name" "issuance" "ref" $root.Values.database.issuance) | nindent 14 }}
+            - name: OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS
+              value: {{ int64 $settings.issuanceDbMaxConnections | quote }}
             {{- end }}
           livenessProbe:
             httpGet:

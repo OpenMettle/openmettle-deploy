@@ -42,6 +42,9 @@ database:
     existingSecret: workstation-openmettle-worker-database
   migrate:
     existingSecret: workstation-openmettle-owner-database
+  # API-only session issuance URL (openmettle_issuance login role, core ADR 0030), required by auth.
+  issuance:
+    existingSecret: workstation-openmettle-issuance-database
   caBundle:
     enabled: true
     configMapName: workstation-openmettle-db-ca
