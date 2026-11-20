@@ -35,7 +35,10 @@ matrix=(
   "123 yaml-ambiguous.yaml"
 )
 # Standalone private-overlay examples, rendered without minimal.yaml.
-examples=("$root/examples/values-synthetic.yaml")
+examples=(
+  "$root/examples/values-synthetic.yaml"
+  "$root/examples/values-workstation-profile.yaml"
+)
 
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
