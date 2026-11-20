@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts" / "openmettle-core"
 VALUES = ROOT / "tests" / "chart" / "values"
-CONTRACT = ROOT / "tests" / "fixtures" / "core-e5ff673" / "process-contract.json"
+CONTRACT = ROOT / "tests" / "fixtures" / "core" / "process-contract.json"
 EXAMPLE = ROOT / "examples" / "values-synthetic.yaml"
 HELM = os.environ.get("HELM", "helm")
 RELEASE = "openmettle"

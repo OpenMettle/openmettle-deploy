@@ -10,6 +10,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - CORE_COMMIT
       - charts/openmettle-core/**
       - tests/kind/**
       - tests/chart/install-tools.sh
@@ -17,6 +18,7 @@ on:
   push:
     branches: [main]
     paths:
+      - CORE_COMMIT
       - charts/openmettle-core/**
       - tests/kind/**
       - tests/chart/install-tools.sh
@@ -31,19 +33,23 @@ jobs:
     name: Chart install on ephemeral kind (dev)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      # Must equal smoke.py CORE_COMMIT and checks.yml (unit-tested).
-      CORE_COMMIT: e5ff67339f1e27a270c5bd2707a7a363c44276f0
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
         with:
           persist-credentials: false
+      - name: Read pinned openmettle-core commit
+        id: pin
+        run: |
+          core_commit=$(tr -d '\n' < CORE_COMMIT)
+          [[ "$core_commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'core_commit=%s\n' "$core_commit" >> "$GITHUB_OUTPUT"
+          printf 'CORE_COMMIT=%s\n' "$core_commit" >> "$GITHUB_ENV"
       - name: Check out pinned openmettle-core
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
         with:
           repository: OpenMettle/openmettle-core
-          ref: ${{ env.CORE_COMMIT }}
+          ref: ${{ steps.pin.outputs.core_commit }}
           path: core-src
           persist-credentials: false
           # Full history, so that the next step can check the commit is on core's main.

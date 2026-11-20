@@ -1460,11 +1460,19 @@ class SummaryTest(unittest.TestCase):
 
 
 class PinsTest(unittest.TestCase):
-    def test_core_commit_matches_ci_and_fixture(self):
+    def test_core_commit_single_source_of_truth(self):
+        raw = (ROOT / "CORE_COMMIT").read_text(encoding="utf-8")
+        self.assertRegex(raw, r"^[0-9a-f]{40}\n$")
+        self.assertEqual(raw.strip(), smoke.CORE_COMMIT)
         for workflow in ("checks.yml", "kind-smoke.yml"):
-            text = (ROOT / ".github" / "workflows" / workflow).read_text()
-            self.assertEqual(re.findall(r"CORE_COMMIT: ([0-9a-f]{40})", text), [smoke.CORE_COMMIT], workflow)
-        self.assertTrue((ROOT / "tests" / "fixtures" / f"core-{smoke.CORE_COMMIT[:7]}").is_dir())
+            text = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+            self.assertEqual(re.findall(r"CORE_COMMIT: [0-9a-f]{40}", text), [], workflow)
+            self.assertIn("< CORE_COMMIT", text, workflow)
+        kind_smoke = (ROOT / ".github" / "workflows" / "kind-smoke.yml").read_text(encoding="utf-8")
+        self.assertEqual(kind_smoke.count("      - CORE_COMMIT\n"), 2)
+        self.assertTrue((ROOT / "tests" / "fixtures" / "core" / "process-contract.json").is_file())
+        self.assertIn(smoke.CORE_COMMIT, (ROOT / "tests" / "fixtures" / "core" / "README.md").read_text(encoding="utf-8"))
+        self.assertIn(smoke.CORE_COMMIT, (ROOT / "UPSTREAM.md").read_text(encoding="utf-8"))
 
     def test_helm_version_matches_installer(self):
         text = (ROOT / "tests" / "chart" / "install-tools.sh").read_text()
