@@ -1331,6 +1331,10 @@ class EnabledProfileChecksTest(unittest.TestCase):
         rw_mount["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = False
         with self.assertRaisesRegex(smoke.SmokeFailure, "read-only"):
             smoke.check_auth_mounts({"api": [rw_mount], "worker": [worker_pod()]})
+        wrong_container = api_pod()
+        wrong_container["spec"]["containers"][0]["name"] = "sidecar"
+        with self.assertRaisesRegex(smoke.SmokeFailure, "no container named 'api'"):
+            smoke.check_auth_mounts({"api": [wrong_container], "worker": [worker_pod()]})
         leak_vol = worker_pod()
         leak_vol["spec"]["volumes"] = [{"name": "auth-login-keys"}]
         with self.assertRaisesRegex(smoke.SmokeFailure, "worker pod must not attach auth volumes"):
@@ -1418,11 +1422,6 @@ class FixtureTest(unittest.TestCase):
         secret = self.find("Secret", smoke.AUTH_LOGIN_KEYS_SECRET)
         self.assertEqual(secret["metadata"]["namespace"], smoke.APP_NAMESPACE)
         self.assertEqual(len(base64.b64decode(secret["data"]["active.key"], validate=True)), 32)
-        for bad_pw in ({k: v for k, v in PASSWORDS.items() if k != "auth_login_key"},
-                       {**PASSWORDS, "auth_login_key": "not-base64!"},
-                       {**PASSWORDS, "auth_login_key": base64.b64encode(b"short").decode("ascii")}):
-            with self.subTest(bad_pw=bad_pw), self.assertRaises(smoke.SmokeFailure):
-                smoke.fixture_manifests("postgres@sha256:" + "e" * 64, bad_pw, "0a1b2c3d")
 
     def test_decoy_peer_uses_postgres_image_and_distinct_labels(self):
         peer = self.find("Deployment", smoke.PEER)

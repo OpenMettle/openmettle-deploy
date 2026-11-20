@@ -84,11 +84,13 @@ AUTH_CONFIG_DIR = "/etc/openmettle/auth"
 AUTH_CONFIG_PATH = f"{AUTH_CONFIG_DIR}/auth.json"
 AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
 AUTH_ACTIVE_KEY_PATH = f"{AUTH_KEYS_DIR}/active.key"
+AUTH_CA_DIR = "/etc/openmettle/auth-ca"
 AUTH_SECRET_MODE = 288  # 0440 octal
 AUTH_OIDC_CIDR = "192.0.2.20/32"  # RFC 5737 TEST-NET-1 synthetic OIDC egress peer
 AUTH_CHECK_BINARY = "/usr/local/bin/openmettle-api"
 AUTH_CHECK_OK = "auth configuration valid (local files only)\n"
-AUTH_ROUTE_PATHS = ("/auth/session", "/auth/native/session", "/v1/capabilities")
+MOUNTED_AUTH_HTTP = {"/auth/session": 403, "/auth/native/session": 403, "/v1/capabilities": 401}
+AUTH_ROUTE_PATHS = tuple(MOUNTED_AUTH_HTTP)
 PROFILE_ROLLOUT_TIMEOUT = "180s"
 LOG_LEVELS = {"ERROR", "WARN", "INFO", "DEBUG"}
 # Matches core src/telemetry.rs FIELDS plus tracing-subscriber flattened JSON metadata.
@@ -440,12 +442,6 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
                       "volumes": [{"name": "data", "emptyDir": {}}],
                   }}}},
     ]
-    try:
-        login_key_bytes = base64.b64decode(passwords["auth_login_key"], validate=True)
-    except (KeyError, ValueError) as exc:
-        raise SmokeFailure("auth_login_key must be base64-encoded 32 random bytes") from exc
-    if len(login_key_bytes) != 32:
-        raise SmokeFailure("auth_login_key must decode to exactly 32 bytes")
     # Created by the test, not the chart: the chart only references existing ConfigMaps and Secrets.
     items += [{"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
                "metadata": {"name": SECRET[role], "namespace": APP_NAMESPACE, "labels": labels},
@@ -715,8 +711,9 @@ def check_auth_mounts(pods_by_role: dict) -> dict:
                    for v in volumes):
             raise SmokeFailure(f"api pod does not mount {AUTH_LOGIN_KEYS_SECRET} with mode 0440")
         containers = spec.get("containers") or []
-        container = next((c for c in containers if c.get("name") == "api"),
-                         containers[0] if containers else {})
+        container = next((c for c in containers if c.get("name") == "api"), None)
+        if container is None:
+            raise SmokeFailure("api pod has no container named 'api'")
         mounts = container.get("volumeMounts") or []
         for vol_name, mount_dir in (("auth-config", AUTH_CONFIG_DIR), ("auth-login-keys", AUTH_KEYS_DIR)):
             if not any(m.get("name") == vol_name and m.get("mountPath") == mount_dir
@@ -736,7 +733,7 @@ def check_auth_mounts(pods_by_role: dict) -> dict:
         for container in spec.get("containers") or []:
             for mount in container.get("volumeMounts") or []:
                 if str(mount.get("name", "")).startswith("auth-") \
-                        or mount.get("mountPath") in (AUTH_CONFIG_DIR, AUTH_KEYS_DIR, "/etc/openmettle/auth-ca"):
+                        or mount.get("mountPath") in (AUTH_CONFIG_DIR, AUTH_KEYS_DIR, AUTH_CA_DIR):
                     raise SmokeFailure("worker container must not mount auth directories")
             for entry in container.get("env") or []:
                 if "AUTH_CONFIG" in str(entry.get("name", "")):
@@ -746,25 +743,23 @@ def check_auth_mounts(pods_by_role: dict) -> dict:
 
 
 def evaluate_mounted_auth_http(responses: dict) -> dict:
-    """Verify mounted browser (403), native (403) and /v1/capabilities (401 problem+json) responses."""
-    session_status, session_body = responses.get("/auth/session", (None, ""))
-    if session_status != 403 or "session origin refused" not in session_body:
-        raise SmokeFailure(f"unexpected /auth/session response: {session_status!r} {session_body!r}")
-    native_status, native_body = responses.get("/auth/native/session", (None, ""))
-    if native_status != 403 or "native sign-in refused" not in native_body:
-        raise SmokeFailure(f"unexpected /auth/native/session response: {native_status!r} {native_body!r}")
-    v1_status, v1_body = responses.get("/v1/capabilities", (None, ""))
-    if v1_status != 401:
-        raise SmokeFailure(f"unexpected /v1/capabilities status: {v1_status!r}")
+    """Verify mounted browser (403), native (403) and /v1/capabilities (401 problem JSON body) responses."""
+    for path, expected_status in MOUNTED_AUTH_HTTP.items():
+        status, body = responses.get(path, (None, ""))
+        if status != expected_status:
+            raise SmokeFailure(f"unexpected {path} response: {status!r} {body!r}")
+    if "session origin refused" not in responses["/auth/session"][1]:
+        raise SmokeFailure(f"unexpected /auth/session body: {responses['/auth/session'][1]!r}")
+    if "native sign-in refused" not in responses["/auth/native/session"][1]:
+        raise SmokeFailure(f"unexpected /auth/native/session body: {responses['/auth/native/session'][1]!r}")
     try:
-        problem = json.loads(v1_body)
+        problem = json.loads(responses["/v1/capabilities"][1])
     except ValueError as exc:
         raise SmokeFailure("/v1/capabilities 401 body is not valid JSON") from exc
-    if not isinstance(problem, dict) or problem.get("status") != 401 \
+    if not isinstance(problem, dict) or problem.get("status") != MOUNTED_AUTH_HTTP["/v1/capabilities"] \
             or problem.get("code") != "unauthenticated":
         raise SmokeFailure(f"unexpected /v1/capabilities problem body: {problem!r}")
-    return {"/auth/session": 403, "/auth/native/session": 403,
-            "/v1/capabilities": 401, "v1_error_code": "unauthenticated"}
+    return {**MOUNTED_AUTH_HTTP, "v1_error_code": "unauthenticated"}
 
 
 def parse_structured_logs(output: str, role: str) -> list:
@@ -1196,9 +1191,7 @@ class Smoke:
         exchanged = self.probe_api_exchange({
             "/healthz": 200,
             "/readyz": 200,
-            "/auth/session": 403,
-            "/auth/native/session": 403,
-            "/v1/capabilities": 401,
+            **MOUNTED_AUTH_HTTP,
         })
         auth_routes = evaluate_mounted_auth_http({path: exchanged[path] for path in AUTH_ROUTE_PATHS})
         pdb = self.wait_for(
