@@ -418,7 +418,7 @@ and are not counted; see the chart README.
 {{- end -}}
 {{- end -}}
 {{- /*
-Browser sign-in / OIDC (core ADR 0025). Mounted into the API pod only; never into worker or
+Sign-in / OIDC and /v1/* application routes (core ADRs 0025, 0027 and 0029). Mounted into the API pod only; never into worker or
 migrate pods. The checks repeat the schema for --skip-schema-validation and enforce cross-field
 provider CA and NetworkPolicy egress guards.
 */ -}}

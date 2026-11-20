@@ -6,6 +6,7 @@ assertion) against a recording fake cluster. They do not create a cluster and ar
 the chart installs; only a `kind-smoke` workflow run is. Set OPENMETTLE_CORE_DIR to a directory holding core's
 tests/kubernetes/qualify.py at CORE_COMMIT to also exercise the imported core guards. CI does.
 """
+import base64
 import io
 import json
 import os
@@ -24,7 +25,8 @@ import smoke  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DIGEST = {role: "sha256:" + str(i) * 64 for i, role in enumerate(smoke.ROLES, start=1)}
-PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": "d" * 32}
+PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": "d" * 32,
+             "auth_login_key": base64.b64encode(b"k" * 32).decode("ascii")}
 CORE_DIR = os.environ.get("OPENMETTLE_CORE_DIR")
 HELM = os.environ.get("HELM", "helm")
 
@@ -217,6 +219,7 @@ class FakeCluster:
         self.artifacts_pvc_created = False
         self.healthz = 200
         self.readyz = 200
+        self.auth_http_overrides = {}
         self.core = self.make_core()
 
     def make_core(self):
@@ -240,7 +243,7 @@ class FakeCluster:
         return mock.Mock(
             spec=list(smoke.CORE_IMPORTS), KIND_VERSION="v0", KUBECTL_VERSION="v0", NODE_IMAGE="node",
             POSTGRES_IMAGE="postgres@sha256:" + "e" * 64, Refusal=Refusal, QualificationFailure=QualificationFailure,
-            Runner=runner, http_get=lambda port, path: (fake.healthz if path == "/healthz" else fake.readyz, ""),
+            Runner=runner, http_get=fake.http_get,
             check_opt_in=lambda environ: "default", check_tools=lambda run: None,
             check_docker_context=lambda run, context: None, check_cluster_absent=lambda run, name: None,
             check_cluster_identity=check_cluster_identity,
@@ -327,6 +330,30 @@ class FakeCluster:
         self.unknown.append(args)
         return 1, "", "unmodelled node command"
 
+    def http_get(self, _port, path):
+        if path in self.auth_http_overrides:
+            return self.auth_http_overrides[path]
+        if path == "/healthz":
+            return self.healthz, ""
+        if path == "/readyz":
+            return self.readyz, ""
+        if not self.profile_enabled:
+            return 404, ""
+        if path == "/auth/session":
+            return 403, "session origin refused\n"
+        if path == "/auth/native/session":
+            return 403, "native sign-in refused\n"
+        if path == "/v1/capabilities":
+            return 401, json.dumps({
+                "type": "about:blank",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "A valid OpenMettle application session is required.",
+                "code": "unauthenticated",
+                "request_id": "11111111-1111-4111-8111-111111111111",
+            })
+        return 404, ""
+
     def pod(self, component, index):
         name = f"{smoke.FULLNAME}-{component}-{index}"
         container = {"name": component, "imagePullPolicy": "Never",
@@ -338,6 +365,21 @@ class FakeCluster:
             spec["volumes"] = [{"name": "artifacts",
                                 "persistentVolumeClaim": {"claimName": smoke.ARTIFACTS_CLAIM}}]
             container["volumeMounts"] = [{"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH}]
+            if component == "api":
+                spec["volumes"] += [
+                    {"name": "auth-config", "configMap": {
+                        "name": smoke.AUTH_CONFIG_MAP, "defaultMode": 420,
+                        "items": [{"key": "auth.json", "path": "auth.json"}]}},
+                    {"name": "auth-login-keys", "secret": {
+                        "secretName": smoke.AUTH_LOGIN_KEYS_SECRET,
+                        "defaultMode": smoke.AUTH_SECRET_MODE}},
+                ]
+                container["volumeMounts"] += [
+                    {"name": "auth-config", "mountPath": smoke.AUTH_CONFIG_DIR, "readOnly": True},
+                    {"name": "auth-login-keys", "mountPath": smoke.AUTH_KEYS_DIR, "readOnly": True},
+                ]
+                container["env"] = [{"name": "OPENMETTLE_API_AUTH_CONFIG",
+                                     "value": smoke.AUTH_CONFIG_PATH}]
         return {"metadata": {"name": name, "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
                 "spec": spec,
@@ -405,6 +447,8 @@ class FakeCluster:
                 if item["kind"] == "Secret" and "url" in item.get("stringData", {}):
                     role = next(r for r in smoke.ROLES if smoke.SECRET[r] == item["metadata"]["name"])
                     self.passwords[role] = item["stringData"]["url"].split(":")[2].split("@")[0]
+                if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.AUTH_LOGIN_KEYS_SECRET:
+                    self.passwords["auth_login_key"] = item["data"]["active.key"]
             return 0, "applied", ""
         if args[:2] == ["create", "--dry-run=server"]:
             return 1, "", f'pods "psa-probe" is forbidden: {smoke.PSA_DENIAL}:latest": allowPrivilegeEscalation'
@@ -417,6 +461,8 @@ class FakeCluster:
         selector = args[args.index("--selector") + 1] if "--selector" in args else ""
         if args[:1] == ["exec"] and "timeout" in args:
             return self.probe(args)
+        if namespace == smoke.APP_NAMESPACE and args[:1] == ["exec"] and smoke.AUTH_CHECK_BINARY in args:
+            return 0, smoke.AUTH_CHECK_OK, ""
         if namespace == smoke.DB_NAMESPACE:
             if args[:2] == ["rollout", "status"]:
                 return 0, "rolled out", ""
@@ -474,11 +520,14 @@ class FakeCluster:
             return listing(self.items(smoke.expected_release_objects()))
         if args[:2] == ["get", smoke.OPTIONAL_KINDS]:
             return listing([])
-        if args[:2] in (["get", "secrets"], ["get", "secrets,networkpolicies"], ["get", "endpointslices"]):
+        if args[:2] in (["get", "secrets"], ["get", "configmaps,secrets,networkpolicies"],
+                        ["get", "endpointslices"]):
             if selector == smoke.RUN_LABEL:
-                owned = [f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES]
-                if args[1] == "secrets,networkpolicies":
-                    owned.append(f"NetworkPolicy/{smoke.NAMESPACE_DENY}")
+                owned = [f"Secret/{smoke.AUTH_LOGIN_KEYS_SECRET}",
+                         *(f"Secret/{smoke.SECRET[r]}" for r in smoke.ROLES)]
+                if args[1] == "configmaps,secrets,networkpolicies":
+                    owned.extend([f"ConfigMap/{smoke.AUTH_CONFIG_MAP}",
+                                  f"NetworkPolicy/{smoke.NAMESPACE_DENY}"])
                 return listing(self.items(owned))
             return listing([])
         if args[:1] == ["logs"]:
@@ -616,8 +665,17 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual((profile_check["healthz"], profile_check["readyz"]), (200, 200))
         self.assertEqual(profile_check["pdb"], {"name": smoke.API_PDB, "max_unavailable": 1,
                                                 "current_healthy": 2, "disruptions_allowed": 1})
+        optional_check = next(c for c in report["checks"] if "no optional package present" in c["check"])
+        self.assertEqual(optional_check["unmounted_http"],
+                         {"/auth/session": 404, "/auth/native/session": 404, "/v1/capabilities": 404})
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
                                                 "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3})
+        self.assertEqual(profile_check["auth"], {
+            "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "keys_dir": smoke.AUTH_KEYS_DIR,
+            "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True, "checked_pods": 2,
+            "routes": {"/auth/session": 403, "/auth/native/session": 403,
+                       "/v1/capabilities": 401, "v1_error_code": "unauthenticated"},
+        })
         self.assertEqual(profile_check["logs"]["api"]["pods"], 2)
         self.assertGreaterEqual(profile_check["logs"]["api"]["debug_http_events"], 1)
         self.assertEqual(profile_check["logs"]["worker"]["pods"], 1)
@@ -708,7 +766,7 @@ class OrchestrationTest(unittest.TestCase):
         (text, values), _ = guard.call_args
         self.assertEqual(json.loads(text), report)
         self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
-        self.assertEqual(len(self.fake.passwords), 4)
+        self.assertEqual(len(self.fake.passwords), 5)
 
     def test_cleanup_failure_fails_a_passing_run(self):
         self.fake.doctors.append(doctor_output(["kind", "delete"], returncode=1))
@@ -891,10 +949,31 @@ class OrchestrationTest(unittest.TestCase):
                 lambda data: data["items"].append({"kind": "NetworkPolicy", "metadata": {"name": "leftover"}})),
                 "release objects to be removed"),
             "default-deny removed by uninstall": (doctor_json(
-                ["get secrets,networkpolicies", smoke.RUN_LABEL],
+                ["get configmaps,secrets,networkpolicies", smoke.RUN_LABEL],
                 lambda data: data.__setitem__("items", [i for i in data["items"]
                                                         if i["metadata"]["name"] != smoke.NAMESPACE_DENY])),
                 "test-owned objects after uninstall:"),
+            "test-owned auth ConfigMap removed by uninstall": (doctor_json(
+                ["get configmaps,secrets,networkpolicies", smoke.RUN_LABEL],
+                lambda data: data.__setitem__("items", [i for i in data["items"]
+                                                        if i["metadata"]["name"] != smoke.AUTH_CONFIG_MAP])),
+                "test-owned objects after uninstall:"),
+            "default install exposes auth route": (
+                lambda args, result: fake_ref().auth_http_overrides.__setitem__("/auth/session", (200, "ok")),
+                "API /auth/session 404"),
+            "enabled-profile auth config check fails": (doctor_output(
+                [smoke.AUTH_CHECK_BINARY], returncode=78, stderr="auth configuration error\n"),
+                "exited 78"),
+            "enabled-profile worker leaks auth env": (doctor_json(
+                ["app.kubernetes.io/component=worker"],
+                pod_status(lambda p: p["spec"]["containers"][0].__setitem__(
+                    "env", [{"name": "OPENMETTLE_WORKER_AUTH_CONFIG", "value": smoke.AUTH_CONFIG_PATH}])),
+                when=revision(4)), "worker container must not receive AUTH_CONFIG env"),
+            "enabled-profile v1 capabilities wrong problem code": (
+                lambda args, result: (fake_ref().auth_http_overrides.__setitem__(
+                    "/v1/capabilities", (401, json.dumps({"status": 401, "code": "wrong"})))
+                    if fake_ref().profile_enabled else None),
+                "unexpected /v1/capabilities problem body"),
             "scale ready replicas": (doctor_json([f"deployment {worker} --output=json"], lambda data: data["status"].__setitem__(
                 "readyReplicas", 1), when=revision(2)), "scale ready replicas"),
             "API pod replaced": (doctor_json(["app.kubernetes.io/component=api"], pod_status(
@@ -1114,6 +1193,16 @@ class ValuesTest(unittest.TestCase):
         self.assertEqual(values["telemetry"], {"logging": {"format": "json", "level": "debug"}})
         self.assertEqual(values["storage"], {"artifacts": {"enabled": True, "size": "64Mi",
                                                            "accessModes": ["ReadWriteOnce"]}})
+        self.assertEqual(values["auth"], {
+            "enabled": True,
+            "configMapName": smoke.AUTH_CONFIG_MAP,
+            "configKey": "auth.json",
+            "loginKeysSecretName": smoke.AUTH_LOGIN_KEYS_SECRET,
+        })
+        self.assertEqual(values["networkPolicy"]["api"]["oidc"], {
+            "to": [{"ipBlock": {"cidr": smoke.AUTH_OIDC_CIDR}}],
+            "port": 443,
+        })
 
     def test_chart_accepts_enabled_profile_smoke_values(self):
         """The enabled-profile values pass chart schema and render guards and emit PDB, PVC and LOG_* env."""
@@ -1129,6 +1218,11 @@ class ValuesTest(unittest.TestCase):
         self.assertIn("kind: PersistentVolumeClaim", result.stdout)
         self.assertIn("helm.sh/resource-policy: keep", result.stdout)
         self.assertIn(smoke.ARTIFACTS_MOUNT_PATH, result.stdout)
+        self.assertIn("name: OPENMETTLE_API_AUTH_CONFIG", result.stdout)
+        self.assertNotIn("OPENMETTLE_WORKER_AUTH_CONFIG", result.stdout)
+        self.assertNotIn("OPENMETTLE_MIGRATE_AUTH_CONFIG", result.stdout)
+        self.assertIn(smoke.AUTH_CONFIG_DIR, result.stdout)
+        self.assertIn(smoke.AUTH_KEYS_DIR, result.stdout)
         for prefix in ("OPENMETTLE_API_", "OPENMETTLE_WORKER_", "OPENMETTLE_MIGRATE_"):
             self.assertIn(f"name: {prefix}LOG_FORMAT", result.stdout)
             self.assertIn(f"name: {prefix}LOG_LEVEL", result.stdout)
@@ -1203,6 +1297,65 @@ class EnabledProfileChecksTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(smoke.SmokeFailure):
                 smoke.parse_structured_logs(bad, "api")
 
+    def test_check_auth_mounts_and_worker_isolation(self):
+        def api_pod():
+            return {"spec": {
+                "securityContext": {"fsGroup": 65532},
+                "volumes": [
+                    {"name": "auth-config", "configMap": {
+                        "name": smoke.AUTH_CONFIG_MAP, "defaultMode": 420,
+                        "items": [{"key": "auth.json", "path": "auth.json"}]}},
+                    {"name": "auth-login-keys", "secret": {
+                        "secretName": smoke.AUTH_LOGIN_KEYS_SECRET, "defaultMode": smoke.AUTH_SECRET_MODE}},
+                ],
+                "containers": [{"name": "api", "volumeMounts": [
+                    {"name": "auth-config", "mountPath": smoke.AUTH_CONFIG_DIR, "readOnly": True},
+                    {"name": "auth-login-keys", "mountPath": smoke.AUTH_KEYS_DIR, "readOnly": True},
+                ], "env": [{"name": "OPENMETTLE_API_AUTH_CONFIG", "value": smoke.AUTH_CONFIG_PATH}]}],
+            }}
+
+        def worker_pod():
+            return {"spec": {"securityContext": {"fsGroup": 65532}, "volumes": [],
+                             "containers": [{"name": "worker", "volumeMounts": [], "env": []}]}}
+
+        summary = smoke.check_auth_mounts({"api": [api_pod(), api_pod()], "worker": [worker_pod()]})
+        self.assertEqual(summary, {
+            "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "keys_dir": smoke.AUTH_KEYS_DIR,
+            "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True,
+        })
+        bad_mode = api_pod()
+        bad_mode["spec"]["volumes"][1]["secret"]["defaultMode"] = 420
+        with self.assertRaisesRegex(smoke.SmokeFailure, "mode 0440"):
+            smoke.check_auth_mounts({"api": [bad_mode], "worker": [worker_pod()]})
+        rw_mount = api_pod()
+        rw_mount["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = False
+        with self.assertRaisesRegex(smoke.SmokeFailure, "read-only"):
+            smoke.check_auth_mounts({"api": [rw_mount], "worker": [worker_pod()]})
+        leak_vol = worker_pod()
+        leak_vol["spec"]["volumes"] = [{"name": "auth-login-keys"}]
+        with self.assertRaisesRegex(smoke.SmokeFailure, "worker pod must not attach auth volumes"):
+            smoke.check_auth_mounts({"api": [api_pod()], "worker": [leak_vol]})
+
+    def test_evaluate_mounted_auth_http(self):
+        good = {
+            "/auth/session": (403, "session origin refused\n"),
+            "/auth/native/session": (403, "native sign-in refused\n"),
+            "/v1/capabilities": (401, json.dumps({"status": 401, "code": "unauthenticated"})),
+        }
+        self.assertEqual(smoke.evaluate_mounted_auth_http(good), {
+            "/auth/session": 403, "/auth/native/session": 403,
+            "/v1/capabilities": 401, "v1_error_code": "unauthenticated",
+        })
+        for bad in (
+            {**good, "/auth/session": (404, "")},
+            {**good, "/auth/native/session": (404, "")},
+            {**good, "/v1/capabilities": (404, "")},
+            {**good, "/v1/capabilities": (401, "not json")},
+            {**good, "/v1/capabilities": (401, json.dumps({"status": 401, "code": "other"}))},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_mounted_auth_http(bad)
+
 
 class FixtureTest(unittest.TestCase):
     def setUp(self):
@@ -1253,6 +1406,23 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(policy["metadata"]["namespace"], smoke.APP_NAMESPACE)
         self.assertNotIn("app.kubernetes.io/instance", policy["metadata"]["labels"])
         self.assertEqual(policy["spec"], {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]})
+
+    def test_creates_synthetic_auth_configmap_and_32_byte_login_key_secret(self):
+        cm = self.find("ConfigMap", smoke.AUTH_CONFIG_MAP)
+        self.assertEqual(cm["metadata"]["namespace"], smoke.APP_NAMESPACE)
+        doc = json.loads(cm["data"]["auth.json"])
+        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["login"]["keys"]["active"]["path"], smoke.AUTH_ACTIVE_KEY_PATH)
+        self.assertIn("browser", doc)
+        self.assertIn("native", doc)
+        secret = self.find("Secret", smoke.AUTH_LOGIN_KEYS_SECRET)
+        self.assertEqual(secret["metadata"]["namespace"], smoke.APP_NAMESPACE)
+        self.assertEqual(len(base64.b64decode(secret["data"]["active.key"], validate=True)), 32)
+        for bad_pw in ({k: v for k, v in PASSWORDS.items() if k != "auth_login_key"},
+                       {**PASSWORDS, "auth_login_key": "not-base64!"},
+                       {**PASSWORDS, "auth_login_key": base64.b64encode(b"short").decode("ascii")}):
+            with self.subTest(bad_pw=bad_pw), self.assertRaises(smoke.SmokeFailure):
+                smoke.fixture_manifests("postgres@sha256:" + "e" * 64, bad_pw, "0a1b2c3d")
 
     def test_decoy_peer_uses_postgres_image_and_distinct_labels(self):
         peer = self.find("Deployment", smoke.PEER)

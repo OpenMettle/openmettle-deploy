@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2/I3/I7 smoke test).
+"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2/I3/I7/I10 smoke test).
 
 Test harness only; not an installer. It builds core's api, worker and migrate images from a
 pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
 migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
-(API replicas=2, PodDisruptionBudget, artifact PVC and ADR 0024 JSON/debug structured logs),
-uninstall (with chart-owned PVC preservation), absence of optional packages on default install,
-Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
+(API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug structured logs, and
+API-only auth + /v1/* mounts), uninstall (with chart-owned PVC preservation), absence of
+optional packages and unmounted 404 routes on default install, Pod Security `restricted`
+enforcement and NetworkPolicy enforcement (I3). Every assertion reads
 live cluster, Helm or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
 
@@ -18,6 +19,7 @@ kubectl (core install-tools.sh) and the pinned Helm (tests/chart/install-tools.s
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import os
@@ -76,6 +78,17 @@ INVENTORY_KINDS = "deployments,services,serviceaccounts,jobs,configmaps,secrets,
 API_PDB = f"{FULLNAME}-api"
 ARTIFACTS_CLAIM = f"{FULLNAME}-artifacts"
 ARTIFACTS_MOUNT_PATH = "/var/lib/openmettle/artifacts"
+AUTH_CONFIG_MAP = "openmettle-smoke-auth-config"
+AUTH_LOGIN_KEYS_SECRET = "openmettle-smoke-auth-login-keys"
+AUTH_CONFIG_DIR = "/etc/openmettle/auth"
+AUTH_CONFIG_PATH = f"{AUTH_CONFIG_DIR}/auth.json"
+AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
+AUTH_ACTIVE_KEY_PATH = f"{AUTH_KEYS_DIR}/active.key"
+AUTH_SECRET_MODE = 288  # 0440 octal
+AUTH_OIDC_CIDR = "192.0.2.20/32"  # RFC 5737 TEST-NET-1 synthetic OIDC egress peer
+AUTH_CHECK_BINARY = "/usr/local/bin/openmettle-api"
+AUTH_CHECK_OK = "auth configuration valid (local files only)\n"
+AUTH_ROUTE_PATHS = ("/auth/session", "/auth/native/session", "/v1/capabilities")
 PROFILE_ROLLOUT_TIMEOUT = "180s"
 LOG_LEVELS = {"ERROR", "WARN", "INFO", "DEBUG"}
 # Matches core src/telemetry.rs FIELDS plus tracing-subscriber flattened JSON metadata.
@@ -261,7 +274,86 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
         values["storage"] = {
             "artifacts": {"enabled": True, "size": "64Mi", "accessModes": ["ReadWriteOnce"]},
         }
+        values["auth"] = {
+            "enabled": True,
+            "configMapName": AUTH_CONFIG_MAP,
+            "configKey": "auth.json",
+            "loginKeysSecretName": AUTH_LOGIN_KEYS_SECRET,
+        }
+        values["networkPolicy"]["api"]["oidc"] = {
+            "to": [{"ipBlock": {"cidr": AUTH_OIDC_CIDR}}],
+            "port": 443,
+        }
     return values
+
+
+def smoke_auth_document() -> dict:
+    """Synthetic version-2 auth document mounting browser (ADR 0025), native (ADR 0029) and /v1/* (ADR 0027)."""
+    provider_id = "0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f"
+    return {
+        "version": 2,
+        "login": {
+            "lifetime_seconds": 300,
+            "keys": {
+                "active": {"id": "smoke-active", "path": AUTH_ACTIVE_KEY_PATH},
+                "decrypt_only": [],
+            },
+        },
+        "id_token": {"max_issued_at_age_seconds": 300, "future_skew_seconds": 60},
+        "provider_refresh": {
+            "freshness_seconds": 3600,
+            "cooldown_seconds": 60,
+            "deadline_milliseconds": 5000,
+            "max_providers": 2,
+            "max_callers": 32,
+            "max_document_gets": 3,
+        },
+        "session": {
+            "lifetime_seconds": 28800,
+            "retained_per_user": 16,
+            "deadline_milliseconds": 5000,
+        },
+        "providers": [{
+            "id": provider_id,
+            "issuer": "https://issuer.example.test/realm",
+            "client_id": "smoke-client",
+            "revision": "r1",
+            "authorization_endpoint": "https://issuer.example.test/authorize",
+            "token_endpoint": "https://issuer.example.test/token",
+            "discovery_url": "https://issuer.example.test/realm/.well-known/openid-configuration",
+            "jwks_url": "https://issuer.example.test/jwks",
+            "callback": "https://app.example.test/auth/callback",
+            "destination": "web",
+            "private_cidrs": [],
+            "trust": {"roots": "native"},
+        }],
+        "browser": {
+            "provider_id": provider_id,
+            "origin": "https://app.example.test",
+            "landing_path": "/home",
+            "paths": {
+                "initiation": "/auth/login",
+                "session_check": "/auth/session",
+                "logout": "/auth/logout",
+            },
+            "rates": {
+                "initiation": {"burst": 20, "interval_milliseconds": 500},
+                "callback": {"burst": 20, "interval_milliseconds": 500},
+                "session_check": {"burst": 120, "interval_milliseconds": 100},
+                "logout": {"burst": 20, "interval_milliseconds": 500},
+            },
+            "max_in_flight": 64,
+        },
+        "native": {
+            "provider_id": provider_id,
+            "issuer": "https://app.example.test",
+            "callback": "https://app.example.test/auth/native/callback",
+            "client_id": "openmettle-desktop",
+            "redirect_uri": "https://app.example.test/native/complete",
+            "rate": {"burst": 20, "interval_milliseconds": 500},
+            "max_in_flight": 64,
+        },
+    }
 
 
 def database_namespace_peer(labels: dict) -> dict:
@@ -348,10 +440,24 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
                       "volumes": [{"name": "data", "emptyDir": {}}],
                   }}}},
     ]
-    # Created by the test, not the chart: the chart only references existing Secrets.
+    try:
+        login_key_bytes = base64.b64decode(passwords["auth_login_key"], validate=True)
+    except (KeyError, ValueError) as exc:
+        raise SmokeFailure("auth_login_key must be base64-encoded 32 random bytes") from exc
+    if len(login_key_bytes) != 32:
+        raise SmokeFailure("auth_login_key must decode to exactly 32 bytes")
+    # Created by the test, not the chart: the chart only references existing ConfigMaps and Secrets.
     items += [{"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
                "metadata": {"name": SECRET[role], "namespace": APP_NAMESPACE, "labels": labels},
                "stringData": {"url": database_url(role, passwords[role])}} for role in ROLES]
+    items += [
+        {"apiVersion": "v1", "kind": "ConfigMap",
+         "metadata": {"name": AUTH_CONFIG_MAP, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"auth.json": json.dumps(smoke_auth_document())}},
+        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+         "metadata": {"name": AUTH_LOGIN_KEYS_SECRET, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"active.key": passwords["auth_login_key"]}},
+    ]
     return {"apiVersion": "v1", "kind": "List", "items": items}
 
 
@@ -584,6 +690,81 @@ def check_artifacts_pvc(pvc: dict, pods_by_role: dict) -> dict:
                 raise SmokeFailure(f"{role} container does not mount artifacts at {ARTIFACTS_MOUNT_PATH}")
             mounted_pods += 1
     return {"claim": name, "phase": phase, "mount_path": ARTIFACTS_MOUNT_PATH, "mounted_pods": mounted_pods}
+
+
+def check_auth_mounts(pods_by_role: dict) -> dict:
+    """Verify auth ConfigMap/Secret and OPENMETTLE_API_AUTH_CONFIG mount on api only, never worker."""
+    api_pods = pods_by_role.get("api") or []
+    worker_pods = pods_by_role.get("worker") or []
+    if not api_pods or not worker_pods:
+        raise SmokeFailure("api and worker pods are required to verify auth mount isolation")
+    for pod in api_pods:
+        spec = pod.get("spec", {})
+        if spec.get("securityContext", {}).get("fsGroup") != 65532:
+            raise SmokeFailure("api pod lacks fsGroup 65532 for auth login keys")
+        volumes = spec.get("volumes") or []
+        if not any(v.get("name") == "auth-config"
+                   and v.get("configMap", {}).get("name") == AUTH_CONFIG_MAP
+                   and any(i.get("key") == "auth.json" and i.get("path") == "auth.json"
+                           for i in (v.get("configMap", {}).get("items") or []))
+                   for v in volumes):
+            raise SmokeFailure(f"api pod does not project {AUTH_CONFIG_MAP} as auth.json")
+        if not any(v.get("name") == "auth-login-keys"
+                   and v.get("secret", {}).get("secretName") == AUTH_LOGIN_KEYS_SECRET
+                   and v.get("secret", {}).get("defaultMode") == AUTH_SECRET_MODE
+                   for v in volumes):
+            raise SmokeFailure(f"api pod does not mount {AUTH_LOGIN_KEYS_SECRET} with mode 0440")
+        containers = spec.get("containers") or []
+        container = next((c for c in containers if c.get("name") == "api"),
+                         containers[0] if containers else {})
+        mounts = container.get("volumeMounts") or []
+        for vol_name, mount_dir in (("auth-config", AUTH_CONFIG_DIR), ("auth-login-keys", AUTH_KEYS_DIR)):
+            if not any(m.get("name") == vol_name and m.get("mountPath") == mount_dir
+                       and m.get("readOnly") is True for m in mounts):
+                raise SmokeFailure(f"api container does not mount {vol_name} read-only at {mount_dir}")
+        env = container.get("env") or []
+        if not any(e.get("name") == "OPENMETTLE_API_AUTH_CONFIG" and e.get("value") == AUTH_CONFIG_PATH
+                   for e in env):
+            raise SmokeFailure(f"api container lacks OPENMETTLE_API_AUTH_CONFIG={AUTH_CONFIG_PATH}")
+    for pod in worker_pods:
+        spec = pod.get("spec", {})
+        for volume in spec.get("volumes") or []:
+            if str(volume.get("name", "")).startswith("auth-") \
+                    or volume.get("configMap", {}).get("name") == AUTH_CONFIG_MAP \
+                    or volume.get("secret", {}).get("secretName") == AUTH_LOGIN_KEYS_SECRET:
+                raise SmokeFailure("worker pod must not attach auth volumes")
+        for container in spec.get("containers") or []:
+            for mount in container.get("volumeMounts") or []:
+                if str(mount.get("name", "")).startswith("auth-") \
+                        or mount.get("mountPath") in (AUTH_CONFIG_DIR, AUTH_KEYS_DIR, "/etc/openmettle/auth-ca"):
+                    raise SmokeFailure("worker container must not mount auth directories")
+            for entry in container.get("env") or []:
+                if "AUTH_CONFIG" in str(entry.get("name", "")):
+                    raise SmokeFailure("worker container must not receive AUTH_CONFIG env")
+    return {"api_pods": len(api_pods), "config_path": AUTH_CONFIG_PATH,
+            "keys_dir": AUTH_KEYS_DIR, "secret_mode": AUTH_SECRET_MODE, "worker_isolated": True}
+
+
+def evaluate_mounted_auth_http(responses: dict) -> dict:
+    """Verify mounted browser (403), native (403) and /v1/capabilities (401 problem+json) responses."""
+    session_status, session_body = responses.get("/auth/session", (None, ""))
+    if session_status != 403 or "session origin refused" not in session_body:
+        raise SmokeFailure(f"unexpected /auth/session response: {session_status!r} {session_body!r}")
+    native_status, native_body = responses.get("/auth/native/session", (None, ""))
+    if native_status != 403 or "native sign-in refused" not in native_body:
+        raise SmokeFailure(f"unexpected /auth/native/session response: {native_status!r} {native_body!r}")
+    v1_status, v1_body = responses.get("/v1/capabilities", (None, ""))
+    if v1_status != 401:
+        raise SmokeFailure(f"unexpected /v1/capabilities status: {v1_status!r}")
+    try:
+        problem = json.loads(v1_body)
+    except ValueError as exc:
+        raise SmokeFailure("/v1/capabilities 401 body is not valid JSON") from exc
+    if not isinstance(problem, dict) or problem.get("status") != 401 \
+            or problem.get("code") != "unauthenticated":
+        raise SmokeFailure(f"unexpected /v1/capabilities problem body: {problem!r}")
+    return {"/auth/session": 403, "/auth/native/session": 403,
+            "/v1/capabilities": 401, "v1_error_code": "unauthenticated"}
 
 
 def parse_structured_logs(output: str, role: str) -> list:
@@ -878,7 +1059,10 @@ class Smoke:
                     references=[self.report["images"][r]["reference"] for r in ROLES])
 
     def deploy_fixtures(self):
-        self.passwords = {k: secrets.token_hex(16) for k in ("admin", *ROLES)}
+        self.passwords = {
+            **{k: secrets.token_hex(16) for k in ("admin", *ROLES)},
+            "auth_login_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        }
         manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id)
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(manifests))
@@ -901,13 +1085,22 @@ class Smoke:
         self.helm_run(command, RELEASE, str(CHART), "--values", str(self.values),
                       "--wait=watcher", "--timeout", HELM_TIMEOUT)
 
-    def probe_api_http(self, paths=("/readyz",)) -> dict:
+    def probe_api_exchange(self, expected: dict) -> dict:
         forward = PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080)
         try:
-            return {path: self.wait_for(f"API {path} 200", lambda p=path: (
-                self.core.http_get(forward.port, p)[0] == 200 and 200), timeout=30) for path in paths}
+            out = {}
+            for path, status in expected.items():
+                def fetch(p=path, code=status):
+                    got, body = self.core.http_get(forward.port, p)
+                    return (got, body) if got == code else None
+                out[path] = self.wait_for(f"API {path} {status}", fetch, timeout=30)
+            return out
         finally:
             forward.close()
+
+    def probe_api_http(self, paths=("/readyz",), *, expected_status: int = 200) -> dict:
+        exchanged = self.probe_api_exchange({path: expected_status for path in paths})
+        return {path: status for path, (status, _) in exchanged.items()}
 
     def observe_release(self, revision: int) -> dict:
         """Common state after each install or upgrade."""
@@ -982,7 +1175,7 @@ class Smoke:
         return job_completions(self.events("involvedObject.kind=Job"), f"{FULLNAME}-migrate")
 
     def enabled_profile(self, history: list):
-        """Upgrade to an enabled profile and verify live PDB, artifact PVC and ADR 0024 JSON/debug logs."""
+        """Upgrade to an enabled profile and verify live PDB, PVC, auth + /v1/* mounts and JSON/debug logs."""
         self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True)
         for component in WORKLOADS:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
@@ -993,13 +1186,26 @@ class Smoke:
                     f"enabled-profile ready replicas: {profile['ready_replicas']}")
         self.expect(len(self.completions()) == 4, "enabled-profile upgrade did not run the migrate hook")
         self.expect(self.migrations() == history, "migration history changed on enabled-profile upgrade")
-        http_status = self.probe_api_http(("/healthz", "/readyz"))
+        pods_by_role = {c: self.pods(c) for c in WORKLOADS}
+        auth_mounts = check_auth_mounts(pods_by_role)
+        for pod_name in profile["pods"]["api"]:
+            checked = self.kube("--namespace", APP_NAMESPACE, "exec", pod_name, "--container", "api", "--",
+                                AUTH_CHECK_BINARY, "--check-auth-config", AUTH_CONFIG_PATH, timeout=60)
+            self.expect(checked.stdout == AUTH_CHECK_OK,
+                        f"{pod_name} --check-auth-config unexpected output: {checked.stdout!r}")
+        exchanged = self.probe_api_exchange({
+            "/healthz": 200,
+            "/readyz": 200,
+            "/auth/session": 403,
+            "/auth/native/session": 403,
+            "/v1/capabilities": 401,
+        })
+        auth_routes = evaluate_mounted_auth_http({path: exchanged[path] for path in AUTH_ROUTE_PATHS})
         pdb = self.wait_for(
             "API PodDisruptionBudget disruptionsAllowed >= 1",
             lambda: evaluate_pdb(self.kube_json("--namespace", APP_NAMESPACE,
                                                 "get", "poddisruptionbudget", API_PDB)),
             timeout=60)
-        pods_by_role = {c: self.pods(c) for c in WORKLOADS}
         pvc = check_artifacts_pvc(
             self.kube_json("--namespace", APP_NAMESPACE, "get", "persistentvolumeclaim", ARTIFACTS_CLAIM),
             pods_by_role)
@@ -1015,10 +1221,11 @@ class Smoke:
                      for name in ns},
                     require_debug_http=dbg),
                 timeout=30)
-        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and JSON/debug structured logs",
+        auth_summary = {**auth_mounts, "checked_pods": len(profile["pods"]["api"]), "routes": auth_routes}
+        self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC, auth + /v1/* mounts and JSON/debug logs",
                     ready_replicas=profile["ready_replicas"],
-                    healthz=http_status["/healthz"], readyz=http_status["/readyz"],
-                    pdb=pdb, pvc=pvc, logs=logs_summary)
+                    healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
+                    pdb=pdb, pvc=pvc, auth=auth_summary, logs=logs_summary)
 
     def scenario(self):
         # 1-3, 5, 8: install by digest; migrate hook; Ready; no optional package; PSA restricted.
@@ -1069,7 +1276,9 @@ class Smoke:
         self.expect(components == sorted(WORKLOADS), f"pods outside api/worker: {components}")
         extra = unexpected_resources(all_pods)
         self.expect(not extra, f"pods request optional resources: {extra}")
-        self.passed("no optional package present", release_objects=inventory, helm_releases=1)
+        unmounted_http = self.probe_api_http(AUTH_ROUTE_PATHS, expected_status=404)
+        self.passed("no optional package present", release_objects=inventory, helm_releases=1,
+                    unmounted_http=unmounted_http)
 
         namespace = self.kube_json("get", "namespace", APP_NAMESPACE)["metadata"]["labels"]
         self.expect(namespace.get("pod-security.kubernetes.io/enforce") == "restricted",
@@ -1135,10 +1344,16 @@ class Smoke:
                                                 "--selector", f"app.kubernetes.io/instance={RELEASE}")["items"])
         self.expect(kept_pvcs == [f"PersistentVolumeClaim/{ARTIFACTS_CLAIM}"],
                     f"kept artifact PVC after uninstall: {kept_pvcs}")
-        # The test, not the chart, owns the URL Secrets and namespace default-deny: uninstall leaves them alone.
-        remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "secrets,networkpolicies",
+        # The test, not the chart, owns the URL Secrets, synthetic auth fixtures and namespace default-deny.
+        remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get",
+                                                "configmaps,secrets,networkpolicies",
                                                 "--selector", RUN_LABEL)["items"])
-        expected_owned = sorted([f"NetworkPolicy/{NAMESPACE_DENY}", *(f"Secret/{SECRET[r]}" for r in ROLES)])
+        expected_owned = sorted([
+            f"ConfigMap/{AUTH_CONFIG_MAP}",
+            f"NetworkPolicy/{NAMESPACE_DENY}",
+            f"Secret/{AUTH_LOGIN_KEYS_SECRET}",
+            *(f"Secret/{SECRET[r]}" for r in ROLES),
+        ])
         self.expect(remaining == expected_owned,
                     f"test-owned objects after uninstall: {remaining}")
         self.passed("uninstall leaves no release objects", test_owned_remaining=remaining,

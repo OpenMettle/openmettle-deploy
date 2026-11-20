@@ -2,7 +2,7 @@
 #
 # A complete private overlay for charts/openmettle-core, showing every I4, I5 and I6 option:
 # database CA, artifact volume, Ingress with TLS for a Traefik controller, the matching NetworkPolicy
-# peers, an API PodDisruptionBudget, optional browser sign-in / OIDC mounts and egress (API only),
+# peers, an API PodDisruptionBudget, optional sign-in / OIDC and /v1/* mounts and egress (API only),
 # and optional telemetry / OTLP trace export (API and worker only). Copy it
 # to a private location outside this repository (for example an ignored config/<site>.local.yaml or
 # a private configuration repository), replace each placeholder and render it with:
@@ -109,7 +109,7 @@ networkPolicy:
       port: 4318
 
 auth:
-  # Optional browser sign-in / OIDC configuration (off by default in the chart, mounted into api only).
+  # Optional sign-in / OIDC and /v1/* route configuration (off by default in the chart, mounted into api only).
   # Validate the version-2 document inside the API image with `openmettle-api --check-auth-config`
   # and complete the Ingress TLS and access-log redaction gates before exposing sign-in externally.
   enabled: true
