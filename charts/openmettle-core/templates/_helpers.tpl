@@ -477,26 +477,21 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- fail (printf "networkPolicy.telemetry.otlp.port (%v) must be an integer between 1 and 65535" $otlpPort) -}}
 {{- end -}}
 {{- $otlp := .Values.telemetry.otlp -}}
+{{- if not (kindIs "string" $otlp.tracesEndpoint) -}}
+{{- fail "telemetry.otlp.tracesEndpoint must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" $otlp.metricsEndpoint) -}}
+{{- fail "telemetry.otlp.metricsEndpoint must be a string" -}}
+{{- end -}}
 {{- if $otlp.enabled -}}
-{{- if or (not (kindIs "string" $otlp.tracesEndpoint)) (not $otlp.tracesEndpoint) -}}
-{{- fail "telemetry.otlp.tracesEndpoint is required when telemetry.otlp.enabled is true (a canonical https:// URL with a DNS host)" -}}
+{{- if and (not $otlp.tracesEndpoint) (not $otlp.metricsEndpoint) -}}
+{{- fail "at least one of telemetry.otlp.tracesEndpoint or telemetry.otlp.metricsEndpoint is required when telemetry.otlp.enabled is true (a canonical https:// URL with a DNS host)" -}}
 {{- end -}}
-{{- $endpoint := $otlp.tracesEndpoint -}}
-{{- $endpointPattern := "^https://([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(:[1-9][0-9]{0,4})?/[-A-Za-z0-9._~!$&'()*+,;=:/]*$" -}}
-{{- if or (gt (len $endpoint) 2048) (not (regexMatch $endpointPattern $endpoint)) (regexMatch "^https://[0-9.]+(:|/)" $endpoint) (regexMatch "^https://[^/:]+\\.([0-9]+|0[xX][0-9a-fA-F]*)(:|/)" $endpoint) (regexMatch "/\\.\\.?(/|$)" $endpoint) -}}
-{{- fail "telemetry.otlp.tracesEndpoint must be a canonical https:// URL with a lowercase DNS host (no http://, IP literal, numeric/hex final host label, credentials, query, fragment, percent-encoding or dot-segments)" -}}
+{{- if $otlp.tracesEndpoint -}}
+{{- include "openmettle-core.validate.otlpEndpoint" (dict "field" "telemetry.otlp.tracesEndpoint" "endpoint" $otlp.tracesEndpoint) -}}
 {{- end -}}
-{{- $authority := index (splitList "/" (trimPrefix "https://" $endpoint)) 0 -}}
-{{- $authorityParts := splitList ":" $authority -}}
-{{- $endpointHost := index $authorityParts 0 -}}
-{{- if gt (len $endpointHost) 253 -}}
-{{- fail "telemetry.otlp.tracesEndpoint hostname must be at most 253 characters" -}}
-{{- end -}}
-{{- if gt (len $authorityParts) 1 -}}
-{{- $endpointPort := int64 (atoi (index $authorityParts 1)) -}}
-{{- if or (lt $endpointPort 1) (gt $endpointPort 65535) (eq $endpointPort 443) -}}
-{{- fail (printf "telemetry.otlp.tracesEndpoint port (%d) must be 1-65535 and omit the default port 443" $endpointPort) -}}
-{{- end -}}
+{{- if $otlp.metricsEndpoint -}}
+{{- include "openmettle-core.validate.otlpEndpoint" (dict "field" "telemetry.otlp.metricsEndpoint" "endpoint" $otlp.metricsEndpoint) -}}
 {{- end -}}
 {{- if $otlp.privateRanges -}}
 {{- if not (kindIs "slice" $otlp.privateRanges) -}}
@@ -526,11 +521,14 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- end -}}
 {{- end -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.telemetry.otlp.to) -}}
-{{- fail "networkPolicy.telemetry.otlp.to must list at least one OTLP collector peer when telemetry.otlp.enabled and networkPolicy.enabled are true (an empty list would block trace export or allow egress to every destination)" -}}
+{{- fail "networkPolicy.telemetry.otlp.to must list at least one OTLP collector peer when telemetry.otlp.enabled and networkPolicy.enabled are true (an empty list would block OTLP export or allow egress to every destination)" -}}
 {{- end -}}
 {{- else -}}
 {{- if $otlp.tracesEndpoint -}}
 {{- fail "telemetry.otlp.tracesEndpoint must be empty when telemetry.otlp.enabled is false; clear tracesEndpoint or enable telemetry.otlp" -}}
+{{- end -}}
+{{- if $otlp.metricsEndpoint -}}
+{{- fail "telemetry.otlp.metricsEndpoint must be empty when telemetry.otlp.enabled is false; clear metricsEndpoint or enable telemetry.otlp" -}}
 {{- end -}}
 {{- if $otlp.privateRanges -}}
 {{- fail "telemetry.otlp.privateRanges must be empty when telemetry.otlp.enabled is false; clear privateRanges or enable telemetry.otlp" -}}
@@ -540,6 +538,31 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- end -}}
 {{- if .Values.networkPolicy.telemetry.otlp.to -}}
 {{- fail "networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false; remove OTLP egress peers or enable telemetry.otlp" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate one non-empty OTLP collector HTTPS endpoint URL (core ADRs 0010, 0026 and 0028).
+Arguments: dict "field" "telemetry.otlp.<name>" "endpoint" <string>
+*/}}
+{{- define "openmettle-core.validate.otlpEndpoint" -}}
+{{- $field := .field -}}
+{{- $endpoint := .endpoint -}}
+{{- $endpointPattern := "^https://([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(:[1-9][0-9]{0,4})?/[-A-Za-z0-9._~!$&'()*+,;=:/]*$" -}}
+{{- if or (gt (len $endpoint) 2048) (not (regexMatch $endpointPattern $endpoint)) (regexMatch "^https://[0-9.]+(:|/)" $endpoint) (regexMatch "^https://[^/:]+\\.([0-9]+|0[xX][0-9a-fA-F]*)(:|/)" $endpoint) (regexMatch "/\\.\\.?(/|$)" $endpoint) -}}
+{{- fail (printf "%s must be a canonical https:// URL with a lowercase DNS host (no http://, IP literal, numeric/hex final host label, credentials, query, fragment, percent-encoding or dot-segments)" $field) -}}
+{{- end -}}
+{{- $authority := index (splitList "/" (trimPrefix "https://" $endpoint)) 0 -}}
+{{- $authorityParts := splitList ":" $authority -}}
+{{- $endpointHost := index $authorityParts 0 -}}
+{{- if gt (len $endpointHost) 253 -}}
+{{- fail (printf "%s hostname must be at most 253 characters" $field) -}}
+{{- end -}}
+{{- if gt (len $authorityParts) 1 -}}
+{{- $endpointPort := int64 (atoi (index $authorityParts 1)) -}}
+{{- if or (lt $endpointPort 1) (gt $endpointPort 65535) (eq $endpointPort 443) -}}
+{{- fail (printf "%s port (%d) must be 1-65535 and omit the default port 443" $field $endpointPort) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

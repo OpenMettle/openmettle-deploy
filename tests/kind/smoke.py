@@ -83,6 +83,7 @@ ALLOWED_LOG_FIELDS = {
     "timestamp", "level", "event", "role", "signal", "request_id",
     "http.route", "http.request.method", "http.response.status_code",
     "duration_us", "error.type", "schema_version", "dropped_lines", "dropped_spans",
+    "dropped_metric_exports",
 }
 # NetworkPolicy fixtures. The app namespace denies all traffic by default, as the owner's application
 # namespaces do; the release must work under it. PEER is a second PostgreSQL server in the database

@@ -78,8 +78,14 @@ spec:
               value: {{ $logging.level | quote }}
             {{- end }}
             {{- if $otlp.enabled }}
+            {{- if $otlp.tracesEndpoint }}
             - name: {{ $prefix }}OTLP_TRACES_ENDPOINT
               value: {{ $otlp.tracesEndpoint | quote }}
+            {{- end }}
+            {{- if $otlp.metricsEndpoint }}
+            - name: {{ $prefix }}OTLP_METRICS_ENDPOINT
+              value: {{ $otlp.metricsEndpoint | quote }}
+            {{- end }}
             {{- if $otlp.caBundle.enabled }}
             - name: {{ $prefix }}OTLP_CA_FILE
               value: {{ include "openmettle-core.otlpCaPath" $root | quote }}

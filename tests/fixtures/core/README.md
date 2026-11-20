@@ -1,5 +1,5 @@
 # Core contract fixture
 
-`process-contract.json` is an unmodified copy of `runtime/process-contract.json` from [openmettle-core](https://github.com/OpenMettle/openmettle-core) (MIT) at commit `a93a2773948ec602fec29c387b463e71efa49343`.
+`process-contract.json` is an unmodified copy of `runtime/process-contract.json` from [openmettle-core](https://github.com/OpenMettle/openmettle-core) (MIT) at commit `b5ee68d4528e9c1057e7699460f2b5950ccf9580`.
 
 `tests/chart/test_chart.py` checks the chart defaults against it. Hosted CI fetches the file at that commit and compares it byte for byte. Change the pin only in an explicit PR that updates the root `CORE_COMMIT` file, refreshes `process-contract.json` (and this note / `UPSTREAM.md`), and reviews any contract change.

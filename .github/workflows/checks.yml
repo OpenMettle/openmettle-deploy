@@ -63,8 +63,11 @@ jobs:
       - name: Kind smoke harness tests (no cluster), with core guards from the pinned commit
         # The cluster run itself is kind-smoke.yml (path-filtered pull requests and main, and dispatch).
         run: |
-          mkdir -p "$RUNNER_TEMP/core/tests/kubernetes"
+          mkdir -p "$RUNNER_TEMP/core/tests/kubernetes" "$RUNNER_TEMP/core/contracts/telemetry"
           curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
             --output "$RUNNER_TEMP/core/tests/kubernetes/qualify.py" \
             "https://raw.githubusercontent.com/OpenMettle/openmettle-core/$CORE_COMMIT/tests/kubernetes/qualify.py"
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
+            --output "$RUNNER_TEMP/core/contracts/telemetry/v1.json" \
+            "https://raw.githubusercontent.com/OpenMettle/openmettle-core/$CORE_COMMIT/contracts/telemetry/v1.json"
           OPENMETTLE_CORE_DIR="$RUNNER_TEMP/core" python3 -m unittest discover -s tests/kind -v
