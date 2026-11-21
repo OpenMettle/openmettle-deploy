@@ -9,7 +9,8 @@ migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-pro
 API-only auth + /v1/* mounts and session issuance credential, and a live /v1/artifacts upload,
 idempotent retry, revision and byte-range download round trip across both API replicas on the
 PVC), uninstall (with chart-owned PVC preservation), absence of optional packages, issuance
-settings and unmounted 404 routes on default install, migration 19 run-admission role grants,
+settings and unmounted 404 routes on default install, migrations 19/20 role grants,
+queued-run SSE replay, API pod replacement and worker expiry through HTTPS ingress,
 Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
 live cluster, Helm, HTTP or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
@@ -32,11 +33,14 @@ import re
 import secrets
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,9 +82,7 @@ DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "o
 # Every PostgreSQL login the fixture provisions: one per image role, plus the API-only session
 # issuance login (core ADR 0030), which core migration 18 requires before it runs.
 DB_LOGINS = (*ROLES, "issuance")
-# The newest core migration this pin must have applied: migrations/0019_run_admission_and_queue.sql
-# (V1-10, core ADR 0032), after 0018_session_issuance_role.sql (ADR 0030).
-REQUIRED_MIGRATION = 19
+REQUIRED_MIGRATION = 20
 RUN_DISPATCH_LOCK = "openmettle.run_dispatch_lock"
 # Migration 19 role boundaries, read live as the fixture superuser: each expression and its expected
 # value. The worker locks the singleton dispatch row through an inert column and records claims; the
@@ -97,6 +99,11 @@ RUN_ADMISSION_CHECKS = (
     ("has_column_privilege('openmettle_api', 'openmettle.runs', 'round_limit', 'INSERT')", True),
     ("has_column_privilege('openmettle_api', 'openmettle.runs', 'queue_expires_at', 'INSERT')", True),
     ("has_column_privilege('openmettle_api', 'openmettle.runs', 'claim_token', 'UPDATE')", False),
+    # Migration 20 adds the worker lease and execution deadlines. The API may request cancellation.
+    *((f"has_column_privilege('{role}', 'openmettle.runs', '{column}', 'UPDATE')",
+       role == "openmettle_worker" or column == "cancel_reason")
+      for role in ("openmettle_api", "openmettle_worker")
+      for column in ("lease_expires_at", "execution_expires_at", "cancel_reason")),
     (f"has_any_column_privilege('openmettle_api', '{RUN_DISPATCH_LOCK}', 'SELECT')", False),
     (f"has_any_column_privilege('openmettle_api', '{RUN_DISPATCH_LOCK}', 'UPDATE')", False),
 )
@@ -106,7 +113,7 @@ ISSUANCE_POOL = "2"  # chart default api.settings.issuanceDbMaxConnections
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
 MIGRATION_DEADLINE_SECONDS = 120
 OPTIONAL_KINDS = "ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
-RELEASE_KINDS = "deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies,poddisruptionbudgets"
+RELEASE_KINDS = "ingresses,deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies,poddisruptionbudgets"
 INVENTORY_KINDS = "deployments,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies"
 API_PDB = f"{FULLNAME}-api"
 ARTIFACTS_CLAIM = f"{FULLNAME}-artifacts"
@@ -126,7 +133,8 @@ AUTH_CHECK_BINARY = "/usr/local/bin/openmettle-api"
 AUTH_CHECK_OK = "auth configuration valid (local files only)\n"
 MOUNTED_AUTH_HTTP = {"/auth/session": 403, "/auth/native/session": 403, "/v1/capabilities": 401}
 AUTH_ROUTE_PATHS = tuple(MOUNTED_AUTH_HTTP)
-AUTH_ORIGIN = "https://app.example.test"  # the synthetic browser origin; /v1 cookie requests send it
+INGRESS_HOST = "app.example.test"
+AUTH_ORIGIN = f"https://{INGRESS_HOST}"  # the synthetic browser origin; /v1 cookie requests send it
 # A synthetic browser session seeded in the fixture database as core's issuance stores it (core
 # sessions.rs and tests/schema/authz_runs.rs seeded_session), so /v1 runs without an OIDC provider.
 # The login provider is distinct from the auth document's: session validation reads only the database.
@@ -147,7 +155,12 @@ ARTIFACT_BOUNDARIES = ("openmettle-smoke-boundary-a", "openmettle-smoke-boundary
 ARTIFACT_RANGE = (0, 9)
 UNSATISFIABLE_RANGE = "bytes=999999-"
 V1_API_VERSION = "1.0"  # every /v1 response's OpenMettle-API-Version (core ADR 0007)
+INGRESS_CLASS = "smoke-traefik"
+TLS_SECRET = "smoke-ingress-tls"
+RUN_KEY = "kind-ingress-replay"
+QUEUE_TIMEOUT_SECONDS = 120
 HTTP_TIMEOUT = 30
+INGRESS_READY_TIMEOUT = 4  # Let Traefik return its 3s upstream dial timeout.
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 B64_ID = re.compile(r"[A-Za-z0-9_-]{43}")
 PROFILE_ROLLOUT_TIMEOUT = "180s"
@@ -331,6 +344,10 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
             "replicas": 2,
             "podDisruptionBudget": {"enabled": True, "maxUnavailable": 1},
         }
+        values["worker"]["sweepMs"] = 1000
+        values["ingress"] = {"enabled": True, "className": INGRESS_CLASS, "hosts": [INGRESS_HOST],
+                             "tls": [{"secretName": TLS_SECRET, "hosts": [INGRESS_HOST]}]}
+        values["networkPolicy"]["api"]["ingressFrom"] = [database_namespace_peer({"app": INGRESS_CLASS})]
         values["telemetry"] = {"logging": {"format": "json", "level": "debug"}}
         values["storage"] = {
             "artifacts": {"enabled": True, "size": "64Mi", "accessModes": ["ReadWriteOnce"]},
@@ -361,6 +378,8 @@ def smoke_auth_document() -> dict:
                 "decrypt_only": [],
             },
         },
+        "cursor_keys": {"active": {"id": "smoke-cursor", "path": f"{AUTH_KEYS_DIR}/cursor.key"},
+                        "verify_only": []},
         "id_token": {"max_issued_at_age_seconds": 300, "future_skew_seconds": 60},
         "provider_refresh": {
             "freshness_seconds": 3600,
@@ -513,7 +532,7 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
          "data": {"auth.json": json.dumps(smoke_auth_document())}},
         {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
          "metadata": {"name": AUTH_LOGIN_KEYS_SECRET, "namespace": APP_NAMESPACE, "labels": labels},
-         "data": {"active.key": passwords["auth_login_key"]}},
+         "data": {"active.key": passwords["auth_login_key"], "cursor.key": passwords["auth_cursor_key"]}},
     ]
     return {"apiVersion": "v1", "kind": "List", "items": items}
 
@@ -896,11 +915,11 @@ def evaluate_run_admission(output: str) -> dict:
     observed = output.strip().split("|")
     expected = ["t" if value else "f" for _, value in RUN_ADMISSION_CHECKS]
     if len(observed) != len(expected):
-        raise SmokeFailure(f"migration 19 privilege query returned {output.strip()!r}")
+        raise SmokeFailure(f"migrations 19/20 privilege query returned {output.strip()!r}")
     wrong = [f"{expression} is {got!r}, expected {want!r}"
              for (expression, _), got, want in zip(RUN_ADMISSION_CHECKS, observed, expected) if got != want]
     if wrong:
-        raise SmokeFailure("migration 19 role boundary: " + "; ".join(wrong))
+        raise SmokeFailure("migrations 19/20 role boundary: " + "; ".join(wrong))
     return {"dispatch_lock_singleton": True, "privileges_checked": len(RUN_ADMISSION_CHECKS) - 1}
 
 
@@ -998,6 +1017,110 @@ def expect_v1(name: str, response: tuple, status: int) -> tuple:
     if headers.get("openmettle-api-version") != V1_API_VERSION or headers.get("cache-control") != "no-store":
         raise SmokeFailure(f"{name}: missing OpenMettle-API-Version {V1_API_VERSION} or Cache-Control no-store")
     return headers, body
+
+
+def ingress_certificate_command(cert, key):
+    return ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", f"/CN={INGRESS_HOST}", "-addext", f"subjectAltName=DNS:{INGRESS_HOST}",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,digitalSignature,keyCertSign",
+            "-keyout", str(key), "-out", str(cert)]
+
+
+@contextmanager
+def ingress_get(port, context, path, headers, *, timeout=HTTP_TIMEOUT):
+    """Dial only the controller's loopback tunnel. SNI, host validation and Host use the chart host."""
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as tcp:
+        with context.wrap_socket(tcp, server_hostname=INGRESS_HOST) as tls:
+            with closing(http.client.HTTPConnection(INGRESS_HOST, timeout=timeout)) as conn:
+                conn.sock = tls
+                conn.request("GET", path, headers={"Host": INGRESS_HOST, **headers})
+                with conn.getresponse() as response:
+                    yield response
+
+
+def sse_frame(response):
+    """Read one ADR 0034 block across HTTP chunks, including its terminating blank line."""
+    first = response.readline(518)
+    if not first:
+        return None
+    if first == b": heartbeat\n" and response.readline(2) == b"\n":
+        return "heartbeat"
+    if not re.fullmatch(rb"id: [A-Za-z0-9_-]{1,512}\n", first):
+        raise SmokeFailure("missing SSE cursor or unexpected comment")
+    data = response.readline(131080)
+    if not data.startswith(b"data: ") or not data.endswith(b"\n") or response.readline(2) != b"\n":
+        raise SmokeFailure("invalid or incomplete SSE data frame")
+    try:
+        item = json.loads(data[6:])
+    except ValueError as exc:
+        raise SmokeFailure("malformed SSE JSON") from exc
+    if not isinstance(item, dict):
+        raise SmokeFailure("expected a run event object")
+    return first[4:-1].decode("ascii"), item
+
+
+def expect_event(response, run_id, sequence, kind, data, *, deadline):
+    while time.monotonic() < deadline:
+        frame = sse_frame(response)
+        if frame == "heartbeat":
+            continue
+        if frame is None:
+            raise SmokeFailure("SSE ended before the expected event")
+        _, event = frame
+        if type(event.get("type_version")) is not int or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", str(event.get("occurred_at"))):
+            raise SmokeFailure("invalid event version or occurrence timestamp")
+        if (event.get("run_id"), event.get("sequence"), event.get("type"), event.get("type_version"),
+                event.get("data")) != (run_id, str(sequence), kind, 1, data):
+            raise SmokeFailure(f"expected {kind} at sequence {sequence} on the admitted run")
+        if time.monotonic() >= deadline:
+            break
+        return frame
+    raise SmokeFailure(f"timed out waiting for {kind}")
+
+
+def ingress_headers(operation, response, status):
+    # Check status before reading: an unexpected 200 can have an unbounded stream body.
+    received = {k.lower(): v for k, v in response.getheaders()}
+    expect_v1(operation, (response.status, received, b""), status)
+    return received
+
+
+@contextmanager
+def event_stream(port, context, path, headers):
+    with ingress_get(port, context, path, headers) as response:
+        received = ingress_headers("streamRunEvents", response, 200)
+        if (received.get("content-type") != "text/event-stream" or received.get("x-accel-buffering") != "no"
+                or "content-length" in received or sse_frame(response) != "heartbeat"):
+            raise SmokeFailure("stream missing SSE headers or opening heartbeat")
+        yield response
+
+
+def quiet_heartbeats(response):
+    """Two periodic comments after the opening comment. A buffered burst cannot satisfy the intervals."""
+    started = previous = time.monotonic()
+    for _ in range(2):
+        if sse_frame(response) != "heartbeat":
+            raise SmokeFailure("resumed stream replayed data or ended during the quiet interval")
+        now = time.monotonic()
+        if not 8 <= now - previous <= 25:
+            raise SmokeFailure("periodic SSE heartbeat arrived in a burst or too late")
+        previous = now
+    return round(previous - started, 2)
+
+
+def check_snapshot(body, run_id, cursor, terminal):
+    try:
+        snapshot = json.loads(body)
+    except ValueError as exc:
+        raise SmokeFailure("getRun snapshot body is not JSON") from exc
+    if not isinstance(snapshot, dict):
+        raise SmokeFailure("getRun snapshot body is not a JSON object")
+    if (snapshot.get("run_id"), snapshot.get("state"), snapshot.get("last_sequence"),
+        snapshot.get("resume_cursor"), snapshot.get("terminal")) != (
+            run_id, "failed" if terminal else "queued", "2" if terminal else "1", cursor, terminal):
+        raise SmokeFailure("getRun snapshot disagrees with the stream")
 
 
 def evaluate_artifact_revision(body: bytes, payload: bytes, revision: int) -> dict:
@@ -1146,9 +1269,9 @@ def _log(message: str) -> None:
 class PortForward:
     """kubectl port-forward to a loopback port; adapted from core qualify.py for a namespace."""
 
-    def __init__(self, kubectl: list, env: dict, target: str, port: int):
+    def __init__(self, kubectl: list, env: dict, target: str, port: int, namespace: str = APP_NAMESPACE):
         self.proc = subprocess.Popen(
-            [*kubectl, "--namespace", APP_NAMESPACE, "port-forward", "--address", "127.0.0.1",
+            [*kubectl, "--namespace", namespace, "port-forward", "--address", "127.0.0.1",
              target, f":{port}"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         lines: queue.Queue = queue.Queue()
         threading.Thread(target=lambda: [lines.put(line) for line in self.proc.stdout],
@@ -1344,6 +1467,7 @@ class Smoke:
     def deploy_fixtures(self):
         self.passwords = {
             **{k: secrets.token_hex(16) for k in ("admin", *DB_LOGINS)},
+            "auth_cursor_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
             "auth_login_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
         }
         manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id)
@@ -1468,10 +1592,9 @@ class Smoke:
         self.psql(session_seed_sql(session_id, secret_hash, b64url(secrets.token_bytes(32))))
         return cookie
 
-    def artifact_round_trip(self, api_pods: list) -> dict:
+    def artifact_round_trip(self, api_pods: list, cookie: str) -> dict:
         """Core ADR 0031 /v1/artifacts on the live PVC. Writes alternate between the two API replicas
         and every read goes to the replica that did not write that revision, so the bytes cross pods."""
-        cookie = self.seed_session()
         forwards = []
         try:
             for name in api_pods:
@@ -1517,9 +1640,141 @@ class Smoke:
                 "revisions": 2, "idempotent_retry": "same revision from the other replica",
                 "downloads": downloads}
 
+    def prepare_ingress(self):
+        cert, key = self.kubeconfig.parent / "ingress.crt", self.kubeconfig.parent / "ingress.key"
+        self.run(ingress_certificate_command(cert, key))
+        self.verify_identity()
+        self.kube("--namespace", APP_NAMESPACE, "create", "secret", "tls", TLS_SECRET,
+                  f"--cert={cert}", f"--key={key}")
+        self.verify_identity()
+        self.kube("apply", "-f", str(ROOT / "tests/kind/ingress.yaml"))
+        self.kube("--namespace", DB_NAMESPACE, "rollout", "status", f"deployment/{INGRESS_CLASS}",
+                  "--timeout=180s")
+        return cert
+
+    def admit_queued_run(self):
+        # Build one test executable against the exact core lockfile using its cached build stage.
+        # Only this executable is exported. The chart images and core checkout are unmodified.
+        export = self.kubeconfig.parent / "admission"
+        recipe = (self.core_dir / "Dockerfile").read_text() + """
+FROM build AS admission-build
+COPY --from=fixture /admit.rs /source/src/bin/kind-admit.rs
+RUN cargo build --release --locked --offline --bin kind-admit
+FROM scratch AS admission-export
+COPY --from=admission-build /source/target/release/kind-admit /kind-admit
+"""
+        self.run(["docker", "build", "--builder", "default", "--file", "-", "--target", "admission-export",
+                  "--build-context", f"fixture={ROOT / 'tests/kind'}", "--output", f"type=local,dest={export}",
+                  str(self.core_dir)], input=recipe, timeout=600)
+        pods = self.kube_json("--namespace", DB_NAMESPACE, "get", "pods", "--selector",
+                              "app.kubernetes.io/name=postgres")["items"]
+        (postgres,) = [pod["metadata"]["name"] for pod in pods if not pod["metadata"].get("deletionTimestamp")]
+        self.verify_identity()
+        self.kube("--namespace", DB_NAMESPACE, "cp", str(export / "kind-admit"), f"{postgres}:/tmp/kind-admit")
+        self.verify_identity()
+        result = self.kube("--namespace", DB_NAMESPACE, "exec", "--stdin", postgres, "--", "/tmp/kind-admit",
+                           SESSION_IDS["user"], SESSION_IDS["approval"], RUN_KEY, str(QUEUE_TIMEOUT_SECONDS),
+                           input=f"postgres://openmettle_api:{self.passwords['api']}@127.0.0.1/openmettle?sslmode=disable\n")
+        run_id = result.stdout.strip()
+        self.expect(UUID.fullmatch(run_id), "core admission and idempotent replay did not return a run ID")
+        return run_id
+
+    def run_row(self, run_id, state):
+        # ADR 0032: the keyed row *is* the slot reservation. Two matching rows produce two lines.
+        # Read the deadline on the database clock and count the terminal append by its durable key.
+        sql = f"""SELECT id::text, state, xmin::text, extract(epoch FROM queue_expires_at),
+            claim_token IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL AND execution_expires_at IS NULL,
+            (SELECT count(*) FROM openmettle.run_events e WHERE e.run_id = r.id AND e.append_key = 'run-terminal'
+                 AND e.format = 'openmettle.run-expired' AND clock_timestamp() >= r.queue_expires_at)
+            FROM openmettle.runs r WHERE actor_user_id = '{SESSION_IDS["user"]}' AND idempotency_key = '{RUN_KEY}'"""
+        rows = self.psql(sql).splitlines()
+        self.expect(len(rows) == 1, "expected exactly one reservation for the admission key")
+        fields = rows[0].split("|")
+        self.expect(len(fields) == 6 and fields[:2] == [run_id, state] and fields[2].isdigit() and fields[3]
+                    and fields[4:] == ["t", "1" if state == "failed" else "0"],
+                    "unexpected run state, lease, queue deadline or expiry event")
+        return fields[2], fields[3]
+
+    def replace_apis(self, ready):
+        old = {p["metadata"]["uid"] for p in self.pods("api", include_terminating=True)}
+        self.expect(len(old) == 2 and self.ready_replicas()["api"] == 2, "expected two Ready API replicas")
+        self.verify_identity()
+        self.kube("--namespace", APP_NAMESPACE, "rollout", "restart", f"deployment/{FULLNAME}-api")
+
+        def ready_during_restart():
+            # Traefik's EndpointSlice watch and kindnet's policy rules converge independently.
+            deadline = time.monotonic() + 5
+            while (remaining := deadline - time.monotonic()) > 0:
+                if ready(timeout=min(INGRESS_READY_TIMEOUT, remaining)):
+                    return time.monotonic() <= deadline
+                time.sleep(0.25)
+            return False
+
+        def replaced():
+            self.expect(ready_during_restart(), "HTTPS ingress lost the API during its rolling restart")
+            pods = self.pods("api", include_terminating=True)
+            return (len(pods) == 2 and old.isdisjoint(p["metadata"]["uid"] for p in pods)
+                    and self.ready_replicas()["api"] == 2)
+        self.wait_for("two Ready replacement APIs and both original pods gone", replaced, timeout=180)
+
+    def ingress_replay(self, cookie, cert):
+        context = ssl.create_default_context(cafile=str(cert))
+        headers = v1_headers(cookie)
+        with closing(PortForward(self.kubectl, self.env, f"deployment/{INGRESS_CLASS}", 8443,
+                                 namespace=DB_NAMESPACE)) as forward:
+            port = forward.port
+
+            def ready(timeout=INGRESS_READY_TIMEOUT):
+                try:
+                    with ingress_get(port, context, "/readyz", {}, timeout=timeout) as response:
+                        return response.status == 200
+                except (OSError, http.client.HTTPException):
+                    return False
+            self.wait_for("chart host with verified TLS and ready API backend", ready)
+            run_id = self.admit_queued_run()
+            deadline = time.monotonic() + QUEUE_TIMEOUT_SECONDS + 20
+            path = f"/v1/runs/{run_id}"
+            events = path + "/events"
+
+            def snapshot(cursor, terminal=None):
+                with ingress_get(port, context, path, headers) as response:
+                    received = ingress_headers("getRun", response, 200)
+                    self.expect(received.get("content-type") == "application/json", "getRun returned non-JSON")
+                    check_snapshot(response.read(65536), run_id, cursor, terminal)
+
+            row = self.run_row(run_id, "queued")
+            with event_stream(port, context, events, headers) as stream:
+                created = expect_event(stream, run_id, 1, "run.created", {}, deadline=deadline)
+            snapshot(created[0])
+            resume = {**headers, "Last-Event-ID": created[0]}
+            with event_stream(port, context, events, resume) as stream:
+                seconds = quiet_heartbeats(stream)
+                self.expect(self.run_row(run_id, "queued") == row, "SSE traffic changed the queued run")
+            self.replace_apis(ready)
+            self.wait_for("HTTPS ingress ready on replacement APIs", ready)
+            with event_stream(port, context, events, resume) as stream:
+                self.expect(self.run_row(run_id, "queued") == row, "pod replacement changed the queued run")
+                expired = expect_event(stream, run_id, 2, "run.failed", {"reason": "queue_expired"}, deadline=deadline)
+                self.expect(sse_frame(stream) is None, "stream continued after the terminal event")
+            self.expect(expired[0] != created[0], "terminal event reused the creation cursor")
+            snapshot(*expired)
+            self.expect(self.run_row(run_id, "failed")[1] == row[1], "queue deadline changed during replay")
+            with event_stream(port, context, events, headers) as stream:
+                for expected in (created, expired):
+                    item = expected[1]
+                    actual = expect_event(stream, run_id, item["sequence"], item["type"], item["data"], deadline=deadline)
+                    self.expect(actual == expected, "replay changed an event or its cursor")
+                self.expect(sse_frame(stream) is None, "duplicate event after terminal replay")
+            with ingress_get(port, context, events, {**headers, "Last-Event-ID": expired[0]}) as response:
+                ingress_headers("resume past terminal", response, 204)
+                self.expect(not response.read(1), "resume past terminal returned a body")
+        return {"api_replicas_replaced": 2, "quiet_seconds": seconds, "periodic_heartbeats": 2,
+                "reservations": 1, "sequences": [1, 2], "terminal": "queue_expired", "past_terminal_http": 204}
+
     def enabled_profile(self, history: list):
         """Upgrade to an enabled profile and verify live PDB, PVC and ARTIFACTS_DIR store, auth + /v1/* mounts,
         a /v1/artifacts round trip across both API replicas and JSON/debug logs."""
+        cert = self.prepare_ingress()
         self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True)
         for component in WORKLOADS:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
@@ -1558,7 +1813,8 @@ class Smoke:
                                    *artifact_dirs_command(), timeout=60)
                 evaluate_artifact_dirs(pod_name, listed.stdout)
         pvc["store_subdirectories"] = list(ARTIFACT_SUBDIRS)
-        artifacts = self.artifact_round_trip(profile["pods"]["api"])
+        cookie = self.seed_session()
+        artifacts = self.artifact_round_trip(profile["pods"]["api"], cookie)
         logs_summary = {}
         for role, require_debug in (("api", True), ("worker", False)):
             names = profile["pods"][role]
@@ -1579,6 +1835,8 @@ class Smoke:
                     healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
                     pdb=pdb, pvc=pvc, auth=auth_summary, issuance=issuance, artifacts=artifacts,
                     logs=logs_summary)
+        self.passed("HTTPS ingress queued run replay and worker expiry",
+                    **self.ingress_replay(cookie, cert))
 
     def scenario(self):
         # 1-3, 5, 8: install by digest; migrate hook; Ready; no optional package; PSA restricted.
@@ -1592,7 +1850,7 @@ class Smoke:
         self.expect(history and all(row[1] == "t" for row in history),
                     "migration history is empty or has a failed entry")
         self.expect(int(history[-1][0]) >= REQUIRED_MIGRATION,
-                    f"migration history ends at version {history[-1][0]}, before the run admission "
+                    f"migration history ends at version {history[-1][0]}, before the worker lease "
                     f"migration {REQUIRED_MIGRATION}")
         run_admission = evaluate_run_admission(self.psql(run_admission_sql()))
         created = {c: parse_time(self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
@@ -1606,7 +1864,7 @@ class Smoke:
         self.expect(present == sorted(references),
                     f"kubelet did not report every digest reference as present: {present}")
         self.passed("install by digest: migrate hook completed before Deployments; API and worker Ready; "
-                    "migration 19 role boundaries",
+                    "migrations 19/20 role boundaries",
                     migrations_applied=len(history), latest_version=int(history[-1][0]),
                     run_admission=run_admission,
                     ready_replicas=installed["ready_replicas"], readyz=installed["readyz"],
@@ -1732,6 +1990,7 @@ class Smoke:
                      ["--namespace", DB_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"],
                      ["--namespace", APP_NAMESPACE, "get", "networkpolicies", "--output=wide"],
                      ["--namespace", APP_NAMESPACE, "get", "pvc,pdb", "--output=wide"],
+                     ["--namespace", DB_NAMESPACE, "logs", "--selector", f"app={INGRESS_CLASS}", "--tail=50"],
                      # kindnet enforces NetworkPolicy; its log shows whether the policy controller started.
                      ["--namespace", "kube-system", "logs", "--selector", "app=kindnet", "--tail=50"]):
             try:

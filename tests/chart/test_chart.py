@@ -51,7 +51,7 @@ DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 DEFAULT_DNS_PEERS = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                       "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]
 # Expected rendered env for minimal.yaml with chart defaults. These literals were copied by hand
-# from core src/lib.rs and src/migrate.rs at 3613a51 (unchanged since 2c62e8a); this test does not read core.
+# from core src/lib.rs and src/migrate.rs at 2d3bc21; this test does not read core.
 ISSUANCE_URL = "OPENMETTLE_API_ISSUANCE_DATABASE_URL"
 ISSUANCE_POOL = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
 ISSUANCE_SECRET = "openmettle-issuance-database"
@@ -2024,6 +2024,7 @@ class BoundsTest(unittest.TestCase):
         )],
         ("api.settings.issuanceDbMaxConnections", 1, 64, []),
         ("api.service.port", 1, 65535, []),
+        ("worker.sweepMs", 1000, 3600000, []),
         ("networkPolicy.database.port", 1, 65535, []),
         ("networkPolicy.api.oidc.port", 1, 65535, []),
         ("networkPolicy.telemetry.otlp.port", 1, 65535, []),
@@ -2033,6 +2034,31 @@ class BoundsTest(unittest.TestCase):
         ("migration.activeDeadlineSeconds", 1, None, [f"migration.settings.{key}=1" for key in
                                                      ("connectTimeoutMs", "lockTimeoutMs", "statementTimeoutMs")]),
     ]
+
+    def test_sweep_interval_rejects_strings_and_fractional_values(self):
+        for extra in (["--set-string", "worker.sweepMs=2000"], ["--set-json", "worker.sweepMs=2000.5"]):
+            with self.subTest(extra=extra):
+                result = helm_template(extra=extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("/worker/sweepMs", result.stderr)
+
+    def test_sweep_interval_rejects_invalid_values_without_schema(self):
+        for value in (False, True, 2000.5, "2000", {}, [], 999, 3600001):
+            with self.subTest(value=value):
+                result = helm_template(extra=["--skip-schema-validation", "--set-json",
+                                              f"worker.sweepMs={json.dumps(value)}"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, r"worker\.sweepMs.*must be an integer between 1000 and 3600000")
+
+    def test_sweep_interval_reaches_only_worker_and_null_uses_core_default(self):
+        for value in ("null", "1000", "3600000"):
+            docs = render(set_values=[f"worker.sweepMs={value}"])
+            for role, pod in pods(docs):
+                with self.subTest(value=value, role=role):
+                    entries = [entry for c in containers(pod) for entry in c["env"]
+                               if entry["name"].endswith("_SWEEP_MS")]
+                    expected = [{"name": "OPENMETTLE_WORKER_SWEEP_MS", "value": value}]
+                    self.assertEqual(entries, expected if role == "worker" and value != "null" else [])
 
     def test_limits_render_and_values_beyond_fail_schema(self):
         """Fails if a schema minimum or maximum is removed, loosened or tightened."""

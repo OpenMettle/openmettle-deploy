@@ -94,6 +94,8 @@ api:
 
 worker:
   replicas: 1
+  # Optional maintenance sweep interval in milliseconds (core ADR 0033), 1000–3600000.
+  sweepMs: null
   resources:
     requests:
       cpu: 100m
@@ -220,6 +222,8 @@ auth:
   configKey: auth.json
   # Existing Secret holding raw 32-byte login key files referenced by the auth document. Mounted
   # read-only at /etc/openmettle/auth-keys (mode 0440, pod fsGroup 65532) in the API pod only.
+  # cursor_keys in auth.json can reference 32-byte raw files in the same Secret. Use
+  # separate IDs and key material for cursor_keys and login.keys (core ADRs 0015 and 0034).
   loginKeysSecretName: ""
   # Optional CA bundle for verifying private/cluster-CA OIDC providers (for example in-cluster
   # Keycloak). When enabled, one key of an existing ConfigMap is mounted read-only at

@@ -54,6 +54,10 @@ api:
     enabled: true
     maxUnavailable: 1
 
+worker:
+  # Optional maintenance sweep interval in milliseconds.
+  sweepMs: 30000
+
 storage:
   artifacts:
     enabled: true
