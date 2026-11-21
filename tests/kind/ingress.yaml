@@ -101,6 +101,7 @@ spec:
             - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=60s
             - --entrypoints.websecure.transport.respondingtimeouts.writetimeout=0s
             - --entrypoints.websecure.transport.respondingtimeouts.idletimeout=60s
+            - --serverstransport.forwardingtimeouts.dialtimeout=3s
             - --serverstransport.forwardingtimeouts.responseheadertimeout=30s
             - --accesslog=false
             - --log.level=ERROR

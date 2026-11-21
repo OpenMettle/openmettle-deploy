@@ -217,6 +217,9 @@ securityContext:
 
 {{/* Render-time guards that do not depend on schema validation. */}}
 {{- define "openmettle-core.validate" -}}
+{{- if not (kindIs "invalid" .Values.worker.sweepMs) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.sweepMs" "value" .Values.worker.sweepMs "min" 1000 "max" 3600000) -}}
+{{- end -}}
 {{- range $component := list "api" "worker" -}}
 {{- $values := index $.Values $component -}}
 {{- $grace := int64 $values.terminationGracePeriodSeconds -}}

@@ -160,6 +160,7 @@ TLS_SECRET = "smoke-ingress-tls"
 RUN_KEY = "kind-ingress-replay"
 QUEUE_TIMEOUT_SECONDS = 120
 HTTP_TIMEOUT = 30
+INGRESS_READY_TIMEOUT = 4  # Let Traefik return its 3s upstream dial timeout.
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 B64_ID = re.compile(r"[A-Za-z0-9_-]{43}")
 PROFILE_ROLLOUT_TIMEOUT = "180s"
@@ -1027,11 +1028,11 @@ def ingress_certificate_command(cert, key):
 
 
 @contextmanager
-def ingress_get(port, context, path, headers):
+def ingress_get(port, context, path, headers, *, timeout=HTTP_TIMEOUT):
     """Dial only the controller's loopback tunnel. SNI, host validation and Host use the chart host."""
-    with socket.create_connection(("127.0.0.1", port), timeout=HTTP_TIMEOUT) as tcp:
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as tcp:
         with context.wrap_socket(tcp, server_hostname=INGRESS_HOST) as tls:
-            with closing(http.client.HTTPConnection(INGRESS_HOST, timeout=HTTP_TIMEOUT)) as conn:
+            with closing(http.client.HTTPConnection(INGRESS_HOST, timeout=timeout)) as conn:
                 conn.sock = tls
                 conn.request("GET", path, headers={"Host": INGRESS_HOST, **headers})
                 with conn.getresponse() as response:
@@ -1110,7 +1111,12 @@ def quiet_heartbeats(response):
 
 
 def check_snapshot(body, run_id, cursor, terminal):
-    snapshot = json.loads(body)
+    try:
+        snapshot = json.loads(body)
+    except ValueError as exc:
+        raise SmokeFailure("getRun snapshot body is not JSON") from exc
+    if not isinstance(snapshot, dict):
+        raise SmokeFailure("getRun snapshot body is not a JSON object")
     if (snapshot.get("run_id"), snapshot.get("state"), snapshot.get("last_sequence"),
         snapshot.get("resume_cursor"), snapshot.get("terminal")) != (
             run_id, "failed" if terminal else "queued", "2" if terminal else "1", cursor, terminal):
@@ -1695,8 +1701,17 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         self.verify_identity()
         self.kube("--namespace", APP_NAMESPACE, "rollout", "restart", f"deployment/{FULLNAME}-api")
 
+        def ready_during_restart():
+            # Traefik's EndpointSlice watch and kindnet's policy rules converge independently.
+            deadline = time.monotonic() + 5
+            while (remaining := deadline - time.monotonic()) > 0:
+                if ready(timeout=min(INGRESS_READY_TIMEOUT, remaining)):
+                    return time.monotonic() <= deadline
+                time.sleep(0.25)
+            return False
+
         def replaced():
-            self.expect(ready(), "HTTPS ingress lost the API during its rolling restart")
+            self.expect(ready_during_restart(), "HTTPS ingress lost the API during its rolling restart")
             pods = self.pods("api", include_terminating=True)
             return (len(pods) == 2 and old.isdisjoint(p["metadata"]["uid"] for p in pods)
                     and self.ready_replicas()["api"] == 2)
@@ -1709,9 +1724,9 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                                  namespace=DB_NAMESPACE)) as forward:
             port = forward.port
 
-            def ready():
+            def ready(timeout=INGRESS_READY_TIMEOUT):
                 try:
-                    with ingress_get(port, context, "/readyz", {}) as response:
+                    with ingress_get(port, context, "/readyz", {}, timeout=timeout) as response:
                         return response.status == 200
                 except (OSError, http.client.HTTPException):
                     return False
@@ -1736,6 +1751,7 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                 seconds = quiet_heartbeats(stream)
                 self.expect(self.run_row(run_id, "queued") == row, "SSE traffic changed the queued run")
             self.replace_apis(ready)
+            self.wait_for("HTTPS ingress ready on replacement APIs", ready)
             with event_stream(port, context, events, resume) as stream:
                 self.expect(self.run_row(run_id, "queued") == row, "pod replacement changed the queued run")
                 expired = expect_event(stream, run_id, 2, "run.failed", {"reason": "queue_expired"}, deadline=deadline)
@@ -1974,6 +1990,7 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                      ["--namespace", DB_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"],
                      ["--namespace", APP_NAMESPACE, "get", "networkpolicies", "--output=wide"],
                      ["--namespace", APP_NAMESPACE, "get", "pvc,pdb", "--output=wide"],
+                     ["--namespace", DB_NAMESPACE, "logs", "--selector", f"app={INGRESS_CLASS}", "--tail=50"],
                      # kindnet enforces NetworkPolicy; its log shows whether the policy controller started.
                      ["--namespace", "kube-system", "logs", "--selector", "app=kindnet", "--tail=50"]):
             try:

@@ -516,7 +516,7 @@ class FakeCluster:
             })
         return 404, ""
 
-    def ingress_get(self, port, context, path, headers):
+    def ingress_get(self, port, context, path, headers, *, timeout=smoke.HTTP_TIMEOUT):
         assert port == 8443
         if path == "/readyz":
             return IngressResponse(200)
@@ -997,6 +997,51 @@ class OrchestrationTest(unittest.TestCase):
                                                       "cri_image_id": IMAGE_ID[role],
                                                       "resolved_before_alias": False})
 
+    def test_ingress_retries_during_rollout_and_checks_replacements_before_resuming(self):
+        get = self.fake.ingress_get
+        statuses = iter([504, 502, 200, 503, 200])
+        observed = []
+
+        def record_pods(args, result):
+            if self.fake.replaced and "pods" in args and "--selector" in args:
+                observed.append("pods")
+
+        def ingress(port, context, path, headers, **kwargs):
+            if self.fake.replaced:
+                observed.append(path)
+                if path == "/readyz":
+                    status = next(statuses)
+                    if status == 504:
+                        smoke.time.sleep(3)  # Traefik's upstream dial timeout
+                    return IngressResponse(status)
+            return get(port, context, path, headers, **kwargs)
+
+        self.fake.doctors.append(record_pods)
+        self.fake.ingress_get = ingress
+        status, report, _ = self.run_main()
+        self.assertEqual(status, 0, report.get("error"))
+        self.assertEqual(observed[:7], ["/readyz"] * 3 + ["pods", "/readyz", "/readyz", f"/v1/runs/{RUN_ID}/events"])
+
+    def test_persistent_ingress_timeout_fails_within_rollout_probe_budget(self):
+        get = self.fake.ingress_get
+        attempts = []
+
+        def ingress(port, context, path, headers, *, timeout=smoke.HTTP_TIMEOUT):
+            if self.fake.replaced and path == "/readyz":
+                attempts.append((smoke.time.monotonic(), timeout))
+                smoke.time.sleep(timeout)
+                raise TimeoutError
+            return get(port, context, path, headers, timeout=timeout)
+
+        self.fake.ingress_get = ingress
+        status, report, _ = self.run_main()
+        self.assertEqual(status, 1)
+        self.assertEqual(report["error"], "HTTPS ingress lost the API during its rolling restart")
+        self.assertGreater(len(attempts), 1)
+        last_start, last_timeout = attempts[-1]
+        self.assertLessEqual(last_start + last_timeout - attempts[0][0], 5)
+        self.assertFalse(any(replaced for replaced, _ in self.fake.resumes))
+
     def test_identity_is_verified_immediately_before_every_mutation(self):
         """Only verify_identity's own namespace-ownership reads may separate it from the change."""
         self.run_main()
@@ -1061,6 +1106,8 @@ class OrchestrationTest(unittest.TestCase):
         status, _, stderr = self.run_main()
         self.assertEqual(status, 1)
         password = self.fake.passwords["worker"]
+        self.assertTrue(self.fake.commands("kubectl", "--namespace", smoke.DB_NAMESPACE, "logs", "--selector",
+                                           "app=smoke-traefik", "--tail=50"))
         self.assertIn("B" * 100, stderr)
         self.assertNotIn(password[16:], stderr)
 
@@ -1976,6 +2023,11 @@ class IngressReplayTest(unittest.TestCase):
                              ("resume_cursor", "start"), ("terminal", None)):
             with self.subTest(field=field), self.assertRaises(smoke.SmokeFailure):
                 smoke.check_snapshot(json.dumps({**doc, field: value}), RUN_ID, "end", terminal)
+
+    def test_snapshot_rejects_malformed_json_and_non_objects(self):
+        for body in (b"{", b"\xff", b"[]", b"null", b"false", b"1", b'"text"'):
+            with self.subTest(body=body), self.assertRaisesRegex(smoke.SmokeFailure, "getRun snapshot body"):
+                smoke.check_snapshot(body, RUN_ID, "start", None)
 
     def test_reservation_lease_and_expiry_must_match_the_one_admitted_row(self):
         harness = object.__new__(smoke.Smoke)

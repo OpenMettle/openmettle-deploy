@@ -69,7 +69,7 @@ spec:
               value: {{ int64 $settings.dbTimeoutMs | quote }}
             - name: {{ $prefix }}SHUTDOWN_TIMEOUT_MS
               value: {{ int64 $settings.shutdownTimeoutMs | quote }}
-            {{- if ne .sweepMs nil }}
+            {{- if not (kindIs "invalid" .sweepMs) }}
             - name: OPENMETTLE_WORKER_SWEEP_MS
               value: {{ int64 .sweepMs | quote }}
             {{- end }}

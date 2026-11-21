@@ -2042,6 +2042,14 @@ class BoundsTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("/worker/sweepMs", result.stderr)
 
+    def test_sweep_interval_rejects_invalid_values_without_schema(self):
+        for value in (False, True, 2000.5, "2000", {}, [], 999, 3600001):
+            with self.subTest(value=value):
+                result = helm_template(extra=["--skip-schema-validation", "--set-json",
+                                              f"worker.sweepMs={json.dumps(value)}"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, r"worker\.sweepMs.*must be an integer between 1000 and 3600000")
+
     def test_sweep_interval_reaches_only_worker_and_null_uses_core_default(self):
         for value in ("null", "1000", "3600000"):
             docs = render(set_values=[f"worker.sweepMs={value}"])
