@@ -1,0 +1,116 @@
+# Dev fixture for the chart's networking.k8s.io/v1 Ingress. Only the HTTPS
+# entry point is open. There is no buffering middleware, dashboard or access log.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: smoke-traefik
+spec:
+  controller: traefik.io/ingress-controller
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smoke-traefik
+  namespace: openmettle-smoke-db
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: smoke-traefik
+  namespace: openmettle-smoke
+rules:
+  - apiGroups: [""]
+    resources: ["services", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: smoke-traefik
+  namespace: openmettle-smoke
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: smoke-traefik
+subjects:
+  - kind: ServiceAccount
+    name: smoke-traefik
+    namespace: openmettle-smoke-db
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: smoke-traefik
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: smoke-traefik
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: smoke-traefik
+subjects:
+  - kind: ServiceAccount
+    name: smoke-traefik
+    namespace: openmettle-smoke-db
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smoke-traefik
+  namespace: openmettle-smoke-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: smoke-traefik}
+  template:
+    metadata:
+      labels: {app: smoke-traefik}
+    spec:
+      serviceAccountName: smoke-traefik
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: traefik
+          image: docker.io/library/traefik:v3.7.19@sha256:a6c0194dda77bcb804824580f36fa7edc56e315b1acfe933366c8b52844a78a4
+          args:
+            - --providers.kubernetesingress.namespaces=openmettle-smoke
+            - --providers.kubernetesingress.ingressclass=smoke-traefik
+            - --providers.kubernetesingress.ingressendpoint.ip=127.0.0.1
+            - --entrypoints.websecure.address=:8443
+            - --entrypoints.websecure.http.tls=true
+            - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=60s
+            - --entrypoints.websecure.transport.respondingtimeouts.writetimeout=0s
+            - --entrypoints.websecure.transport.respondingtimeouts.idletimeout=60s
+            - --serverstransport.forwardingtimeouts.responseheadertimeout=30s
+            - --accesslog=false
+            - --log.level=ERROR
+            - --global.sendanonymoususage=false
+            - --global.checknewversion=false
+          ports:
+            - {name: https, containerPort: 8443}
+          readinessProbe:
+            tcpSocket: {port: https}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}

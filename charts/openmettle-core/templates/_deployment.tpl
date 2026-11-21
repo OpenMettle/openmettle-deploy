@@ -69,6 +69,10 @@ spec:
               value: {{ int64 $settings.dbTimeoutMs | quote }}
             - name: {{ $prefix }}SHUTDOWN_TIMEOUT_MS
               value: {{ int64 $settings.shutdownTimeoutMs | quote }}
+            {{- if ne .sweepMs nil }}
+            - name: OPENMETTLE_WORKER_SWEEP_MS
+              value: {{ int64 .sweepMs | quote }}
+            {{- end }}
             {{- if not (kindIs "invalid" $logging.format) }}
             - name: {{ $prefix }}LOG_FORMAT
               value: {{ $logging.format | quote }}

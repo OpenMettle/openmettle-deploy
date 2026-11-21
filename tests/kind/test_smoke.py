@@ -30,6 +30,7 @@ import smoke  # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 DIGEST = {role: "sha256:" + str(i) * 64 for i, role in enumerate(smoke.ROLES, start=1)}
 PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": "d" * 32, "issuance": "g" * 32,
+             "auth_cursor_key": base64.b64encode(b"c" * 32).decode("ascii"),
              "auth_login_key": base64.b64encode(b"k" * 32).decode("ascii")}
 # `helm get hooks` for the release: the migrate ServiceAccount, NetworkPolicy and Job, abridged.
 HOOKS = f"""---
@@ -327,6 +328,27 @@ class FakeArtifacts:
         return self.problem(404, "not_found")
 
 
+RUN_ID = "00000000-0000-4000-8000-000000000001"
+
+
+class IngressResponse(io.BytesIO):
+    def __init__(self, status, body=b"", *, stream=False, delays=None):
+        super().__init__(body)
+        self.status = status
+        self.stream = stream
+        self.delays = delays or {}
+
+    def getheaders(self):
+        headers = {"Cache-Control": "no-store", "OpenMettle-API-Version": "1.0", "Content-Type": "application/json"}
+        if self.stream:
+            headers.update({"Content-Type": "text/event-stream", "X-Accel-Buffering": "no"})
+        return headers.items()
+
+    def readline(self, size=-1):
+        smoke.time.sleep(self.delays.get(self.tell(), 0))
+        return super().readline(size)
+
+
 class FakeCluster:
     """Answers every command smoke.py runs as a healthy kind cluster would, and records them.
 
@@ -354,6 +376,9 @@ class FakeCluster:
         self.auth_http_overrides = {}
         self.run_admission = ["t" if expected else "f" for _, expected in smoke.RUN_ADMISSION_CHECKS]
         self.session = None  # (session id, secret hash hex) as seeded
+        self.replaced = False
+        self.admitted_at = None
+        self.resumes = []
         self.artifacts = FakeArtifacts(self)
         self.core = self.make_core()
 
@@ -416,6 +441,8 @@ class FakeCluster:
     def respond(self, args, input):
         if args[:2] == ["helm", "version"]:
             return 0, "v4.3.0\n", ""
+        if args[:1] == ["openssl"] or args[:2] == ["docker", "build"] and "admission-export" in args:
+            return 0, "", ""
         if args[:2] == ["docker", "build"]:
             self.built.add(args[args.index("--tag") + 1])
             return 0, "", ""
@@ -489,10 +516,48 @@ class FakeCluster:
             })
         return 404, ""
 
+    def ingress_get(self, port, context, path, headers):
+        assert port == 8443
+        if path == "/readyz":
+            return IngressResponse(200)
+        assert headers["Cookie"] == f"{smoke.SESSION_COOKIE}={self.passwords['session']}"
+        assert headers["Origin"] == smoke.AUTH_ORIGIN
+        created = {"run_id": RUN_ID, "sequence": "1", "type_version": 1, "type": "run.created",
+                   "data": {}, "occurred_at": "2026-11-21T12:00:00Z"}
+        expired = {**created, "sequence": "2", "type": "run.failed", "data": {"reason": "queue_expired"}}
+        if path == f"/v1/runs/{RUN_ID}":
+            cursor = "end" if self.expired else "start"
+            return IngressResponse(200, json.dumps({"run_id": RUN_ID, "state": "failed" if self.expired else "queued",
+                                                   "terminal": expired if self.expired else None,
+                                                   "resume_cursor": cursor, "last_sequence": "2" if self.expired else "1"}).encode())
+        assert path == f"/v1/runs/{RUN_ID}/events"
+        after = headers.get("Last-Event-ID")
+        self.resumes.append((self.replaced, after))
+        beat = b": heartbeat\n\n"
+        def frame(cursor, event):
+            return f"id: {cursor}\ndata: {json.dumps(event)}\n\n".encode()
+        if after == "end" and self.expired:
+            return IngressResponse(204)
+        if after == "start":
+            if self.replaced:
+                return IngressResponse(200, beat + frame("end", expired), stream=True,
+                                       delays={len(beat): smoke.QUEUE_TIMEOUT_SECONDS - 30})
+            return IngressResponse(200, beat * 3, stream=True, delays={len(beat): 15, 2 * len(beat): 15})
+        assert after is None
+        return IngressResponse(200, beat + frame("start", created) + (frame("end", expired) if self.expired else b""),
+                               stream=True)
+
+    @property
+    def expired(self):
+        return self.admitted_at is not None and smoke.time.monotonic() >= self.admitted_at + smoke.QUEUE_TIMEOUT_SECONDS
+
     def database(self, sql):
         """`psql` on stdin in the fixture database: migration history, migration 19 grants, session seed."""
         if "openmettle._sqlx_migrations" in sql:
-            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in (17, 18, 19)), ""
+            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in (17, 18, 19, 20)), ""
+        if "xmin::text" in sql:
+            state, terminals = ("failed", 1) if self.expired else ("queued", 0)
+            return 0, f"{RUN_ID}|{state}|12|1234|t|{terminals}\n", ""
         if sql == smoke.run_admission_sql():
             return 0, "|".join(self.run_admission) + "\n", ""
         seeded = re.search(r"SELECT '([A-Za-z0-9_-]{43})', decode\('([0-9a-f]{64})', 'hex'\)", sql)
@@ -530,7 +595,7 @@ class FakeCluster:
                 ]
                 container["env"] += [{"name": "OPENMETTLE_API_AUTH_CONFIG",
                                       "value": smoke.AUTH_CONFIG_PATH}, *issuance_env()]
-        return {"metadata": {"name": name, "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
+        return {"metadata": {"name": name, "uid": f"{name}-{self.replaced}", "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
                 "spec": spec,
                 "status": {"conditions": [{"type": "Ready", "status": "True"}],
@@ -588,6 +653,8 @@ class FakeCluster:
             if args[2] not in self.namespaces:
                 return 1, "", f'namespaces "{args[2]}" not found'
             return ok({"metadata": {"name": args[2], "labels": self.namespaces[args[2]]}})
+        if args[:2] == ["apply", "-f"] and args[-1].endswith("/ingress.yaml"):
+            return ok("configured")
         if args[:3] == ["apply", "--filename", "-"]:
             for item in json.loads(input)["items"]:
                 if item["kind"] == "Namespace":
@@ -598,6 +665,7 @@ class FakeCluster:
                     role = next(r for r in smoke.DB_LOGINS if smoke.SECRET[r] == item["metadata"]["name"])
                     self.passwords[role] = item["stringData"]["url"].split(":")[2].split("@")[0]
                 if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.AUTH_LOGIN_KEYS_SECRET:
+                    self.passwords["auth_cursor_key"] = item["data"]["cursor.key"]
                     self.passwords["auth_login_key"] = item["data"]["active.key"]
             return 0, "applied", ""
         if args[:2] == ["create", "--dry-run=server"]:
@@ -616,7 +684,21 @@ class FakeCluster:
         if namespace == smoke.APP_NAMESPACE and args[:1] == ["exec"] and "stat" in args:
             return 0, "".join(f"{smoke.ARTIFACTS_MOUNT_PATH}/{d}|directory|2700|65532\n"
                               for d in smoke.ARTIFACT_SUBDIRS), ""
+        if namespace == smoke.APP_NAMESPACE:
+            if args[:3] == ["create", "secret", "tls"]:
+                return ok("created")
+            if args[:3] == ["rollout", "restart", f"deployment/{smoke.FULLNAME}-api"]:
+                self.replaced = True
+                return ok("restarted")
         if namespace == smoke.DB_NAMESPACE:
+            if args[:2] == ["get", "pods"] and selector == "app.kubernetes.io/name=postgres":
+                return listing([self.running_pod("postgres-0", "10.0.0.1")])
+            if args[:1] == ["cp"] and args[-1] == "postgres-0:/tmp/kind-admit":
+                return ok("copied")
+            if args[:1] == ["exec"] and "/tmp/kind-admit" in args:
+                assert input.startswith("postgres://openmettle_api:") and args[-2] == smoke.RUN_KEY
+                self.admitted_at = smoke.time.monotonic()
+                return ok(RUN_ID)
             if args[:2] == ["rollout", "status"]:
                 return 0, "rolled out", ""
             if args[:1] == ["exec"]:
@@ -744,7 +826,11 @@ class FakeClock:
 class FakePortForward:
     """A Service keeps its port; pod `<name>-<index>` gets 9000 + index, so callers can tell pods apart."""
 
-    def __init__(self, kubectl, env, target, port):
+    def __init__(self, kubectl, env, target, port, namespace=smoke.APP_NAMESPACE):
+        if namespace == smoke.DB_NAMESPACE:
+            assert target == f"deployment/{smoke.INGRESS_CLASS}" and port == 8443
+            self.port = port
+            return
         self.port = port if target.startswith("service/") else 9000 + int(target.rsplit("-", 1)[1])
 
     def close(self):
@@ -812,12 +898,15 @@ class OrchestrationTest(unittest.TestCase):
 
     def run_main(self):
         """Run main() against the fake; return (exit status, report, stderr)."""
+        (self.tmp / "Dockerfile").write_text("FROM synthetic AS build\n")
         report = self.tmp / "report.json"
         report.unlink(missing_ok=True)
         stderr = io.StringIO()
         with mock.patch.object(smoke, "core_checkout_state", return_value=(smoke.CORE_COMMIT, "")), \
                 mock.patch.object(smoke, "load_core", return_value=self.fake.core), \
                 mock.patch.object(smoke, "PortForward", FakePortForward), \
+                mock.patch.object(smoke, "ingress_get", self.fake.ingress_get), \
+                mock.patch.object(smoke.ssl, "create_default_context"), \
                 mock.patch.object(smoke, "http_exchange", self.fake.artifacts), \
                 mock.patch.object(smoke, "time", FakeClock()), \
                 mock.patch.object(smoke.subprocess, "run", side_effect=AssertionError("real subprocess")), \
@@ -837,7 +926,10 @@ class OrchestrationTest(unittest.TestCase):
         status, report, _ = self.run_main()
         self.assertEqual(self.fake.unknown, [])
         self.assertEqual((status, report["result"]), (0, "passed"), report.get("error"))
-        self.assertEqual(len(report["checks"]), 10)
+        self.assertEqual(len(report["checks"]), 11)
+        self.assertEqual(self.fake.resumes, [(False, None), (False, "start"), (True, "start"),
+                                             (True, None), (True, "end")])
+        self.assertEqual(next(c["quiet_seconds"] for c in report["checks"] if "quiet_seconds" in c), 30)
         netpol_check = next(c for c in report["checks"] if "NetworkPolicy enforced" in c["check"])
         self.assertEqual(netpol_check["namespace_policies"],
                          sorted([f"NetworkPolicy/{smoke.NAMESPACE_DENY}", *smoke.release_network_policies()]))
@@ -911,12 +1003,15 @@ class OrchestrationTest(unittest.TestCase):
         mutations = 0
         previous = None
         for call in map(FakeCluster.strip, self.fake.calls):
-            if tuple(call[:2]) in MUTATING:
+            ingress_mutation = (call[:2] == ["kubectl", "--namespace"]
+                                and (call[3:6] in (["create", "secret", "tls"], ["rollout", "restart", f"deployment/{smoke.FULLNAME}-api"])
+                                     or call[3:4] == ["cp"] or "/tmp/kind-admit" in call))
+            if tuple(call[:2]) in MUTATING or ingress_mutation:
                 self.assertEqual(previous, ["IDENTITY"], f"{call[:2]} ran without an identity check just before")
                 mutations += 1
             if call[:3] != ["kubectl", "get", "namespace"]:
                 previous = call
-        self.assertEqual(mutations, 6)  # apply, install, upgrade, upgrade, upgrade, uninstall
+        self.assertEqual(mutations, 11)  # also TLS, controller, fixture copy/admission and API restart
 
     def test_namespace_from_another_run_is_refused_before_any_change(self):
         self.fake.namespaces[smoke.APP_NAMESPACE] = {smoke.RUN_LABEL: "ffffffff"}
@@ -976,7 +1071,7 @@ class OrchestrationTest(unittest.TestCase):
         (text, values), _ = guard.call_args
         self.assertEqual(json.loads(text), report)
         self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
-        self.assertEqual(len(self.fake.passwords), 7)
+        self.assertEqual(len(self.fake.passwords), 8)
         self.assertIn("issuance", self.fake.passwords)
         self.assertEqual(len(self.fake.passwords["session"]), 87)
 
@@ -1194,7 +1289,7 @@ class OrchestrationTest(unittest.TestCase):
                 when=revision(4)), "worker container must not receive AUTH_CONFIG env"),
             "migration history before the run admission migration": (doctor_output(
                 ["exec", "--stdin", "deployment/postgres", "psql"], stdout="1|t|aa|t\n18|t|bb|t\n"),
-                "before the run admission migration 19"),
+                "before the worker lease migration 20"),
             "run_dispatch_lock singleton row missing": (
                 lambda args, result: fake_ref().run_admission.__setitem__(0, "f"),
                 f"(SELECT count(*) = 1 AND bool_and(id AND NOT lock_guard) FROM {smoke.RUN_DISPATCH_LOCK}) "
@@ -1204,10 +1299,10 @@ class OrchestrationTest(unittest.TestCase):
                 f"has_any_column_privilege('openmettle_api', '{smoke.RUN_DISPATCH_LOCK}', 'SELECT') is 't'"),
             "worker lacks the lock_guard column grant": (
                 lambda args, result: fake_ref().run_admission.__setitem__(2, "f"),
-                "migration 19 role boundary"),
+                "migrations 19/20 role boundary"),
             "migration 19 privilege query truncated": (
                 lambda args, result: fake_ref().run_admission.__delitem__(slice(3, None)),
-                "migration 19 privilege query returned"),
+                "migrations 19/20 privilege query returned"),
             "v1 session rejected": (
                 lambda args, result: setattr(fake_ref(), "session", None) if fake_ref().session else None,
                 "POST /v1/artifacts: HTTP 401, expected 201"),
@@ -1520,6 +1615,9 @@ class ValuesTest(unittest.TestCase):
     def test_values_enabled_profile(self):
         values = smoke.smoke_values(DIGEST, worker_replicas=1, enabled_profile=True)
         self.assertEqual(values["api"], {"replicas": 2, "podDisruptionBudget": {"enabled": True, "maxUnavailable": 1}})
+        self.assertEqual(values["worker"], {"replicas": 1, "sweepMs": 1000})
+        self.assertEqual(values["ingress"]["tls"], [{"secretName": smoke.TLS_SECRET, "hosts": [smoke.INGRESS_HOST]}])
+        self.assertEqual(values["networkPolicy"]["api"]["ingressFrom"], [smoke.database_namespace_peer({"app": smoke.INGRESS_CLASS})])
         self.assertEqual(values["telemetry"], {"logging": {"format": "json", "level": "debug"}})
         self.assertEqual(values["storage"], {"artifacts": {"enabled": True, "size": "64Mi",
                                                            "accessModes": ["ReadWriteOnce"]}})
@@ -1801,6 +1899,14 @@ class RunAdmissionTest(unittest.TestCase):
         for privilege in ("SELECT", "UPDATE"):
             self.assertIs(checks[f"has_any_column_privilege('openmettle_api', '{lock}', '{privilege}')"], False)
 
+    def test_migration_20_column_grants(self):
+        checks = dict(smoke.RUN_ADMISSION_CHECKS)
+        for role, writable in (("openmettle_worker", {"lease_expires_at", "execution_expires_at", "cancel_reason"}),
+                               ("openmettle_api", {"cancel_reason"})):
+            for column in ("lease_expires_at", "execution_expires_at", "cancel_reason"):
+                self.assertIs(checks[f"has_column_privilege('{role}', 'openmettle.runs', '{column}', 'UPDATE')"],
+                              column in writable)
+
     def test_evaluate(self):
         good = "|".join("t" if value else "f" for _, value in smoke.RUN_ADMISSION_CHECKS)
         self.assertEqual(smoke.evaluate_run_admission(good + "\n"),
@@ -1815,6 +1921,105 @@ class RunAdmissionTest(unittest.TestCase):
         # psql prints NULL (an empty dispatch-lock table under bool_and) as an empty field.
         with self.assertRaisesRegex(smoke.SmokeFailure, "is '', expected 't'"):
             smoke.evaluate_run_admission("|" + good.split("|", 1)[1])
+
+
+class IngressReplayTest(unittest.TestCase):
+    def test_sse_frames_require_the_complete_wire_contract(self):
+        source = io.BytesIO(b': heartbeat\n\nid: c_1\ndata: {"sequence":"1"}\n\n')
+        self.assertEqual(smoke.sse_frame(source), "heartbeat")
+        self.assertEqual(smoke.sse_frame(source), ("c_1", {"sequence": "1"}))
+        self.assertIsNone(smoke.sse_frame(source))
+        for body in (b": hi\n\n", b": heartbeat\n", b"id: \n", b"id: c=\n", b"id: " + b"x"*513 + b"\n",
+                     b"id: c\ndata: {}\n", b"id: c\nevent: run.failed\n\n", b"id: c\ndata: []\n\n",
+                     b"id: c\ndata: {\n\n", b"id: c\ndata: " + b"x"*131080 + b"\n\n"):
+            with self.subTest(length=len(body), prefix=body[:20]), self.assertRaises(smoke.SmokeFailure):
+                smoke.sse_frame(io.BytesIO(body))
+
+    def test_only_ordered_events_of_this_run_are_accepted_before_the_deadline(self):
+        event = {"run_id": RUN_ID, "sequence": "2", "type": "run.failed", "type_version": 1,
+                 "occurred_at": "2026-11-21T00:00:00Z", "data": {"reason": "queue_expired"}}
+        def next_item(item, deadline=5):
+            frame = io.BytesIO(f"id: end\ndata: {json.dumps(item)}\n\n".encode())
+            return smoke.expect_event(frame, RUN_ID, 2, "run.failed", event["data"], deadline=deadline)
+        with mock.patch.object(smoke, "time", FakeClock()):
+            self.assertEqual(next_item(event), ("end", event))
+            for change in ({"run_id": ""}, {"sequence": "1"}, {"sequence": "3"}, {"type": "run.cancelled"},
+                           {"data": {}}, {"type_version": True}, {"occurred_at": None}):
+                with self.subTest(change=change), self.assertRaises(smoke.SmokeFailure):
+                    next_item({**event, **change})
+            with self.assertRaisesRegex(smoke.SmokeFailure, "timed out"):
+                next_item(event, deadline=0)
+
+    def test_quiet_window_rejects_buffered_or_missing_heartbeats_and_duplicate_events(self):
+        beat = b": heartbeat\n\n"
+        for body, delay in ((beat * 2, {0: 30}), (beat * 2, {0: 15}), (beat, {0: 15}),
+                            (b"id: start\ndata: {}\n\n", {})):
+            with self.subTest(body=body, delay=delay), mock.patch.object(smoke, "time", FakeClock()):
+                with self.assertRaises(smoke.SmokeFailure):
+                    smoke.quiet_heartbeats(IngressResponse(200, body, delays=delay))
+
+    def test_nonstreaming_headers_and_missing_opening_flush_fail(self):
+        for status, streaming, body, extra in ((204, True, b"", []), (200, False, b"", []),
+                (200, True, b"", []), (200, True, b": heartbeat\n\n", [("X-Accel-Buffering", "yes")]),
+                (200, True, b": heartbeat\n\n", [("Content-Length", "13")])):
+            response = IngressResponse(status, body, stream=streaming)
+            response.getheaders = mock.Mock(return_value=[*response.getheaders(), *extra])
+            with self.subTest(status=status, extra=extra), mock.patch.object(smoke, "ingress_get", return_value=response):
+                with self.assertRaises(smoke.SmokeFailure), smoke.event_stream(8443, None, "/events", {}):
+                    pass
+
+    def test_snapshot_requires_the_same_terminal_event_state_sequence_and_cursor(self):
+        terminal = {"sequence": "2", "type": "run.failed", "data": {"reason": "queue_expired"}}
+        doc = {"run_id": RUN_ID, "state": "failed", "last_sequence": "2", "resume_cursor": "end", "terminal": terminal}
+        smoke.check_snapshot(json.dumps(doc), RUN_ID, "end", terminal)
+        for field, value in (("run_id", "another"), ("state", "queued"), ("last_sequence", "1"),
+                             ("resume_cursor", "start"), ("terminal", None)):
+            with self.subTest(field=field), self.assertRaises(smoke.SmokeFailure):
+                smoke.check_snapshot(json.dumps({**doc, field: value}), RUN_ID, "end", terminal)
+
+    def test_reservation_lease_and_expiry_must_match_the_one_admitted_row(self):
+        harness = object.__new__(smoke.Smoke)
+        good = f"{RUN_ID}|failed|12|1234|t|1"
+        harness.psql = mock.Mock(return_value=good)
+        self.assertEqual(harness.run_row(RUN_ID, "failed"), ("12", "1234"))
+        for output in ("", good + "\n" + good, good.replace("|t|", "|f|"), good[:-1] + "0",
+                       good.replace("|failed|", "|running|"), good.replace("|1234|", "||")):
+            with self.subTest(output=output), self.assertRaises(smoke.SmokeFailure):
+                harness.psql.return_value = output
+                harness.run_row(RUN_ID, "failed")
+
+    def test_verified_https_sni_host_and_cursor_over_chunked_transport(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def do_GET(self):
+                seen.append((self.headers["Host"], self.headers["Last-Event-ID"]))
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for chunk in (b": heart", b"beat\n\nid:", b" next\ndata: {", b"}\n\n"):
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            def log_message(self, *_args):
+                pass
+
+        seen = []
+        with tempfile.TemporaryDirectory() as directory:
+            cert, key = (Path(directory) / name for name in ("cert.pem", "key.pem"))
+            subprocess.run(smoke.ingress_certificate_command(cert, key), check=True, capture_output=True)
+            tls = smoke.ssl.SSLContext(smoke.ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(cert, key)
+            tls.set_servername_callback(lambda sock, name, ctx: seen.append(name))
+            with http.server.HTTPServer(("127.0.0.1", 0), Handler) as server:
+                server.socket = tls.wrap_socket(server.socket, server_side=True)
+                thread = threading.Thread(target=server.handle_request, daemon=True)
+                thread.start()
+                with smoke.ingress_get(server.server_port, smoke.ssl.create_default_context(cafile=str(cert)),
+                                       "/events", {"Last-Event-ID": "start"}) as response:
+                    self.assertEqual(smoke.sse_frame(response), "heartbeat")
+                    self.assertEqual(smoke.sse_frame(response), ("next", {}))
+                    self.assertIsNone(smoke.sse_frame(response))
+                thread.join(5)
+        self.assertEqual(seen, [smoke.INGRESS_HOST, (smoke.INGRESS_HOST, "start")])
 
 
 class SessionSeedTest(unittest.TestCase):
@@ -2034,11 +2239,16 @@ class FixtureTest(unittest.TestCase):
         doc = json.loads(cm["data"]["auth.json"])
         self.assertEqual(doc["version"], 2)
         self.assertEqual(doc["login"]["keys"]["active"]["path"], smoke.AUTH_ACTIVE_KEY_PATH)
+        cursor = doc["cursor_keys"]["active"]
+        self.assertEqual(cursor["path"], f"{smoke.AUTH_KEYS_DIR}/cursor.key")
+        self.assertNotEqual(cursor["id"], doc["login"]["keys"]["active"]["id"])
         self.assertIn("browser", doc)
         self.assertIn("native", doc)
         secret = self.find("Secret", smoke.AUTH_LOGIN_KEYS_SECRET)
         self.assertEqual(secret["metadata"]["namespace"], smoke.APP_NAMESPACE)
-        self.assertEqual(len(base64.b64decode(secret["data"]["active.key"], validate=True)), 32)
+        login, cursor = (base64.b64decode(secret["data"][key], validate=True) for key in ("active.key", "cursor.key"))
+        self.assertEqual((len(login), len(cursor)), (32, 32))
+        self.assertNotEqual(login, cursor)
 
     def test_decoy_peer_uses_postgres_image_and_distinct_labels(self):
         peer = self.find("Deployment", smoke.PEER)
