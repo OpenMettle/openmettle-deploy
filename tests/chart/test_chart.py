@@ -659,8 +659,9 @@ AUTH_CONFIG_PATH = "/etc/openmettle/auth/auth.json"
 AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
 AUTH_CA_DIR = "/etc/openmettle/auth-ca"
 AUTH_VOLUMES = {"auth-config", "auth-login-keys", "auth-provider-ca"}
-# The examples project auth.json and the model catalog from one ConfigMap (auth.catalogKey).
-CATALOG_ITEMS = [{"key": "auth.json", "path": "auth.json"}, {"key": "catalog.json", "path": "catalog.json"}]
+# Reusable examples leave auth.catalogKey empty: an existing auth ConfigMap without a catalog key would
+# otherwise fail the API volume mount after an upgrade. A site overlay sets it (docs/first-install.md).
+EXAMPLE_AUTH_ITEMS = [{"key": "auth.json", "path": "auth.json"}]
 OTLP_CA_DIR = "/etc/openmettle/otlp-ca"
 OTLP_CA_PATH = "/etc/openmettle/otlp-ca/ca.crt"
 I4_KINDS = {"PersistentVolumeClaim", "Ingress", "PodDisruptionBudget"}
@@ -979,6 +980,15 @@ class AuthTest(Rendered):
         non_api = yaml.safe_dump_all(d for d in docs if not (d["kind"] == "Deployment" and component(d) == "api"))
         self.assertNotIn("catalog", non_api)
 
+    def test_auth_without_catalog_key_renders_as_before(self):
+        """Fails if the schema requires auth.catalogKey. `helm upgrade --reuse-values` reuses the previous
+        release's computed values, which have no catalogKey; `--set auth.catalogKey=null` removes it the same way."""
+        base = render(("auth-enabled.yaml",))
+        docs = render(("auth-enabled.yaml",), ["auth.catalogKey=null"])
+        self.assertEqual(docs, base)
+        api = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(api)["auth-config"]["configMap"]["items"], [{"key": "auth.json", "path": "auth.json"}])
+
     def test_auth_without_network_policy_renders_no_policies(self):
         """Fails if enabling auth while networkPolicy.enabled=false still renders a NetworkPolicy."""
         docs = self.renders["auth-network-policy-disabled"]
@@ -1231,7 +1241,7 @@ class ExampleOverlayTest(unittest.TestCase):
                 self.assertEqual(env[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["name"],
                                  "example-openmettle-issuance-database")
                 self.assertLessEqual(AUTH_VOLUMES, set(volumes(pod)))
-                self.assertEqual(volumes(pod)["auth-config"]["configMap"]["items"], CATALOG_ITEMS)
+                self.assertEqual(volumes(pod)["auth-config"]["configMap"]["items"], EXAMPLE_AUTH_ITEMS)
             else:
                 self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
                 self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
@@ -1303,7 +1313,7 @@ class WorkstationProfileTest(unittest.TestCase):
                 self.assertEqual(env[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["name"],
                                  "workstation-openmettle-issuance-database")
                 self.assertLessEqual(AUTH_VOLUMES, vols)
-                self.assertEqual(volumes(pod)["auth-config"]["configMap"]["items"], CATALOG_ITEMS)
+                self.assertEqual(volumes(pod)["auth-config"]["configMap"]["items"], EXAMPLE_AUTH_ITEMS)
             else:
                 self.assertFalse(AUTH_VOLUMES & vols, role)
                 self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
@@ -1599,6 +1609,14 @@ class NegativeCaseTest(unittest.TestCase):
          ["auth.catalogKey must be a ConfigMap key"]),
         ("catalog key equals config key", [*AUTH, ISSUANCE, "auth.catalogKey=auth.json"], OIDC_PEER,
          ["auth.catalogKey must differ from auth.configKey"]),
+        # Kubernetes refuses ConfigMap keys that start with "..", not only "." and "..".
+        ("catalog key with .. prefix", [*AUTH, ISSUANCE, "auth.catalogKey=..catalog"], OIDC_PEER,
+         [SCHEMA, "/auth/catalogKey"]),
+        ("catalog key with .. prefix without schema", [*AUTH, ISSUANCE, "auth.catalogKey=..catalog"], [*OIDC_PEER, SKIP],
+         ["auth.catalogKey must be a ConfigMap key"]),
+        ("config key with .. prefix", ["auth.configKey=..auth.json"], [], [SCHEMA, "/auth/configKey"]),
+        ("config key with .. prefix without schema", [*AUTH, ISSUANCE, "auth.configKey=..auth.json"], [*OIDC_PEER, SKIP],
+         ["auth.configKey must be a ConfigMap key"]),
         # Session issuance (AUTHSEC-01, core ADR 0030).
         ("auth without issuance Secret", AUTH, OIDC_PEER, [SCHEMA, "/database/issuance/existingSecret"]),
         ("auth without issuance Secret without schema", AUTH, [*OIDC_PEER, SKIP],

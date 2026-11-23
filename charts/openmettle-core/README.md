@@ -85,7 +85,7 @@ The chart refuses to render until you supply:
 | `auth.enabled` | `false` | Enable browser and optional native sign-in / OIDC plus authenticated `/v1/*` routes for the API only; see [Browser sign-in / OIDC](#browser-sign-in--oidc) |
 | `auth.configMapName` | `""` | Required while enabled: existing ConfigMap holding a version-2 auth settings document |
 | `auth.configKey` | `auth.json` | ConfigMap key projected read-only at `/etc/openmettle/auth/auth.json` |
-| `auth.catalogKey` | `""` | Optional key of the same ConfigMap holding the model catalog, projected read-only beside it at `/etc/openmettle/auth/catalog.json`; name that path as `catalog_file` in `auth.json`. Must differ from `configKey` and stay empty while `auth.enabled` is false. See [Model catalog](#model-catalog) |
+| `auth.catalogKey` | `""` | Optional key of the same ConfigMap holding the model catalog, projected read-only beside it at `/etc/openmettle/auth/catalog.json`; name that path as `catalog_file` in `auth.json`. Must differ from `configKey` and stay empty while `auth.enabled` is false. Optional in the schema, so `helm upgrade --reuse-values` from a release without it still renders. The examples leave it empty, because an existing auth ConfigMap may lack the key. See [Model catalog](#model-catalog) |
 | `auth.loginKeysSecretName` | `""` | Required while enabled: existing Secret holding raw 32-byte login and optional cursor key files, mounted read-only at `/etc/openmettle/auth-keys` |
 | `auth.providerCaBundle.{enabled,configMapName,key}` | `false`, `""`, `ca.crt` | Optional existing ConfigMap key mounted read-only at `/etc/openmettle/auth-ca/ca.crt` in the API pod only |
 | `telemetry.logging.{format,level}` | `null`, `null` | Optional `OPENMETTLE_<ROLE>_LOG_FORMAT` (`json` or `text`) and `OPENMETTLE_<ROLE>_LOG_LEVEL` (`error`, `warn`, `info` or `debug`; `trace` refused) across `api`, `worker` and `migrate`; `null` emits no `LOG_*` env vars |
@@ -184,7 +184,7 @@ The overlay references objects the chart never creates: the three database URL S
 kubectl --namespace openmettle create configmap openmettle-db-ca --from-file=ca.crt=<path to PEM bundle>
 ```
 
-- **Mount.** When enabled, the api, worker and migrate pods each mount the key read-only at the fixed path `/etc/openmettle/db-ca/ca.crt` (volume `db-ca`, directory `/etc/openmettle/db-ca`). The key is projected under the fixed file name `ca.crt`, so it never becomes a path. The schema and a render guard also reject keys containing `/`, and the keys `.` and `..`.
+- **Mount.** When enabled, the api, worker and migrate pods each mount the key read-only at the fixed path `/etc/openmettle/db-ca/ca.crt` (volume `db-ca`, directory `/etc/openmettle/db-ca`). The key is projected under the fixed file name `ca.crt`, so it never becomes a path. The schema and a render guard also reject keys containing `/`, the key `.` and keys starting with `..`, which Kubernetes refuses. The same rule applies to every ConfigMap key value.
 - **No environment variable.** The chart sets no `PGSSLROOTCERT` or other `PG*` variable. Core ADR 0002 requires each process's environment to carry only its own `OPENMETTLE_<ROLE>_` prefix and forbids shared database defaults. SQLx reads TLS options from each URL instead. Reference the file in **every** URL Secret (api, worker and owner):
 
   `postgres://<role>:<password>@<host>:5432/openmettle?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt`
@@ -252,7 +252,7 @@ On K3s's bundled Traefik, pass them through a `HelmChartConfig` named `traefik` 
   metadata: {name: openmettle-request-limits, namespace: openmettle}
   spec:
     buffering:
-      maxRequestBodyBytes: 65536   # synthetic value; size to the routes you mount
+      maxRequestBodyBytes: 131072   # synthetic: POST /v1/runs bodies reach 128 KiB; raise it for uploads
   ```
 
   Attach it with the annotation `traefik.ingress.kubernetes.io/router.middlewares: <namespace>-openmettle-request-limits@kubernetescrd`. Never attach `StripPrefix`, `ReplacePath` or `ReplacePathRegex`: the callback path must arrive exactly as the browser sent it (ADRs 0017 and 0018).

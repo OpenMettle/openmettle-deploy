@@ -270,7 +270,7 @@
       "description": "Optional sign-in / OIDC and /v1/* application route configuration mounted into the API pod only (core ADRs 0025, 0027 and 0029). Never mounted into worker or migrate pods.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "configMapName", "configKey", "catalogKey", "loginKeysSecretName", "providerCaBundle"],
+      "required": ["enabled", "configMapName", "configKey", "loginKeysSecretName", "providerCaBundle"],
       "properties": {
         "enabled": {"type": "boolean"},
         "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
@@ -391,12 +391,12 @@
       "not": {"pattern": "^[0-9.]+$"}
     },
     "configMapKey": {
-      "description": "A ConfigMap data key: no path separator, and not . or ..",
+      "description": "A ConfigMap data key: no path separator, not ., and not starting with .. (Kubernetes refuses both)",
       "type": "string",
       "minLength": 1,
       "maxLength": 253,
       "pattern": "^[-._a-zA-Z0-9]+$",
-      "not": {"enum": [".", ".."]}
+      "not": {"anyOf": [{"const": "."}, {"pattern": "^\\.\\."}]}
     },
     "caBundle": {
       "type": "object",

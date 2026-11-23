@@ -123,8 +123,9 @@ auth:
   configMapName: workstation-openmettle-auth-config
   configKey: auth.json
   # Model catalog key of the same ConfigMap, mounted at /etc/openmettle/auth/catalog.json and named by
-  # catalog_file in auth.json. POST /v1/runs answers 503 provisioning without it (core ADR 0036).
-  catalogKey: catalog.json
+  # catalog_file in auth.json. Left empty here: a reusable profile must not require a key that an
+  # existing auth ConfigMap may lack. Set it in the site overlay once the ConfigMap holds the catalog.
+  catalogKey: ""
   loginKeysSecretName: workstation-openmettle-auth-login-keys
   providerCaBundle:
     enabled: true

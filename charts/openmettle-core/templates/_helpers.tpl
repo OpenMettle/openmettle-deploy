@@ -551,8 +551,8 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 
 {{/* Arguments: dict "field" <path> "key" <value> */}}
 {{- define "openmettle-core.validate.configMapKey" -}}
-{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString .key))) (has (toString .key) (list "." "..")) -}}
-{{- fail (printf "%s must be a ConfigMap key: letters, digits, '-', '_' or '.', and not '.' or '..'" .field) -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString .key))) (eq (toString .key) ".") (hasPrefix ".." (toString .key)) -}}
+{{- fail (printf "%s must be a ConfigMap key: letters, digits, '-', '_' or '.', not '.' and not starting with '..'" .field) -}}
 {{- end -}}
 {{- end -}}
 
