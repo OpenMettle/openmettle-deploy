@@ -220,6 +220,11 @@ auth:
   # read-only at /etc/openmettle/auth/auth.json and passed via OPENMETTLE_API_AUTH_CONFIG.
   configMapName: ""
   configKey: auth.json
+  # Optional second key of the same ConfigMap holding the model catalog (core ADRs 0032 and 0036).
+  # When set, it is projected read-only beside auth.json at /etc/openmettle/auth/catalog.json; name
+  # that path as catalog_file in auth.json. Empty: no catalog file is mounted. Must differ from
+  # configKey and must stay empty while auth.enabled is false.
+  catalogKey: ""
   # Existing Secret holding raw 32-byte login key files referenced by the auth document. Mounted
   # read-only at /etc/openmettle/auth-keys (mode 0440, pod fsGroup 65532) in the API pod only.
   # cursor_keys in auth.json can reference 32-byte raw files in the same Secret. Use

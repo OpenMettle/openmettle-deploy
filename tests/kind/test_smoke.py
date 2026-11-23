@@ -33,6 +33,10 @@ PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": 
              "auth_cursor_key": base64.b64encode(b"c" * 32).decode("ascii"),
              "auth_login_key": base64.b64encode(b"k" * 32).decode("ascii")}
 # `helm get hooks` for the release: the migrate ServiceAccount, NetworkPolicy and Job, abridged.
+# The shape smoke_catalog() relies on in core's tests/fixtures/conversation-catalog-v1.json; the real
+# fixture is read from the pinned core checkout at run time.
+CATALOG_FIXTURE = {"version": 1, "revision": "catalog/1", "models": {"a": {"output_limit": 4096}, "b": {}},
+                   "presets": {"study": {"model": "a", "revision": "study/1"}}}
 HOOKS = f"""---
 # Source: openmettle-core/templates/migrate-job.yaml
 apiVersion: batch/v1
@@ -262,7 +266,15 @@ class FakeArtifacts:
         self.calls = []
         self.uploads = {}
         self.revisions = {}  # revision id -> (document, payload)
+        self.runs = {}  # idempotency key -> (request body, run document)
         self.doctor = None
+
+    @property
+    def runs_state(self):
+        states = {}
+        for _, run in self.runs.values():
+            states[run["state"]] = states.get(run["state"], 0) + 1
+        return states
 
     @staticmethod
     def reply(status, document, content_type="application/json", extra=None):
@@ -328,6 +340,29 @@ class FakeArtifacts:
                 return self.problem(416, "range_not_satisfiable", {"content-range": f"bytes */{total}"})
             return 206, {**content, "content-length": str(last - first + 1),
                          "content-range": f"bytes {first}-{last}/{total}"}, payload[first:last + 1]
+        if (method, route) == ("GET", "/v1/models"):
+            return self.reply(200, {"items": [{"model_id": m} for m in ("a", "b")], "page_info": {}})
+        if (method, route) == ("POST", "/v1/conversations") and json.loads(body) == {}:
+            return self.reply(201, {"conversation_id": "00000000-0000-4000-b000-000000000001",
+                                    "branch_id": "00000000-0000-4000-b000-000000000002",
+                                    "scope_id": "00000000-0000-4000-a000-000000000001"})
+        if (method, route) == ("POST", "/v1/runs") and headers.get("Content-Type") == "application/json":
+            request = json.loads(body)
+            key = headers["Idempotency-Key"]
+            if key in self.runs:
+                previous, run = self.runs[key]
+                return self.reply(200, run) if previous == request else self.problem(409, "idempotency_conflict")
+            if request["proposal"]["selection"] != {"preset": smoke.CATALOG_PRESET}:
+                return self.problem(400, "validation")
+            run = {"run_id": f"00000000-0000-4000-c000-{len(self.runs) + 1:012x}",
+                   "conversation_id": request["conversation_id"], "state": "queued"}
+            self.runs[key] = (request, run)
+            return self.reply(201, run)
+        if method == "POST" and segments[:2] == ["v1", "runs"] and segments[3:] == ["cancel"]:
+            for _, run in self.runs.values():
+                if run["run_id"] == segments[2]:
+                    run["state"] = "cancelled"
+                    return self.reply(200, run)
         return self.problem(404, "not_found")
 
 
@@ -592,7 +627,8 @@ class FakeCluster:
                 spec["volumes"] += [
                     {"name": "auth-config", "configMap": {
                         "name": smoke.AUTH_CONFIG_MAP, "defaultMode": 420,
-                        "items": [{"key": "auth.json", "path": "auth.json"}]}},
+                        "items": [{"key": "auth.json", "path": "auth.json"},
+                                  {"key": smoke.AUTH_CATALOG_KEY, "path": smoke.AUTH_CATALOG_KEY}]}},
                     {"name": "auth-login-keys", "secret": {
                         "secretName": smoke.AUTH_LOGIN_KEYS_SECRET,
                         "defaultMode": smoke.AUTH_SECRET_MODE}},
@@ -907,6 +943,9 @@ class OrchestrationTest(unittest.TestCase):
     def run_main(self):
         """Run main() against the fake; return (exit status, report, stderr)."""
         (self.tmp / "Dockerfile").write_text("FROM synthetic AS build\n")
+        fixture = self.tmp / smoke.CORE_CATALOG_FIXTURE
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text(json.dumps(CATALOG_FIXTURE))
         report = self.tmp / "report.json"
         report.unlink(missing_ok=True)
         stderr = io.StringIO()
@@ -954,7 +993,7 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(optional_check["unmounted_quota_routes"], dict.fromkeys(quota_names, 404))
         self.assertEqual(profile_check["quota_routes"], dict.fromkeys(quota_names, 401))
         # Both profiles send every quota route through the API Service with no session, Origin or key.
-        quota_calls = [c for c in self.fake.artifacts.calls if not c[2].startswith("/v1/artifacts")]
+        quota_calls = [c for c in self.fake.artifacts.calls if c[2].startswith(("/v1/quotas", "/v1/projects", "/v1/admin"))]
         self.assertEqual([(port, method, path, headers) for port, method, path, headers in quota_calls],
                          [(8080, m, p, {}) for m, p in smoke.QUOTA_ROUTES] * 2)
         self.assertEqual(optional_check["issuance"], {"api_pods": 1, "api_issuance_env": False, "issuance_pool": None,
@@ -984,6 +1023,18 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual([k for k, _ in keys], ["kind-smoke-create", "kind-smoke-create", "kind-smoke-revision"])
         self.assertNotEqual(keys[0][1], keys[1][1])
         self.assertEqual(len(self.fake.artifacts.revisions), 2)
+        self.assertEqual(profile_check["run_admission_http"], {
+            "models": ["a", "b"], "admitted": "queued", "replay": "same run", "cancelled": "cancelled"})
+        run_calls = [c for c in self.fake.artifacts.calls if c[2].startswith(("/v1/models", "/v1/conversations",
+                                                                             "/v1/runs"))]
+        self.assertEqual([(port, method, path.rsplit("/", 1)[-1], headers.get("Idempotency-Key"))
+                          for port, method, path, headers in run_calls],
+                         [(9000, "GET", "models", None),
+                          (9000, "POST", "conversations", smoke.HTTP_RUN_KEYS["conversation"]),
+                          (9000, "POST", "runs", smoke.HTTP_RUN_KEYS["run"]),
+                          (9000, "POST", "runs", smoke.HTTP_RUN_KEYS["run"]),
+                          (9000, "POST", "cancel", smoke.HTTP_RUN_KEYS["cancel"])])
+        self.assertEqual(self.fake.artifacts.runs_state, {"cancelled": 1})
         self.assertEqual(len(self.fake.commands("helm", "get", "hooks", smoke.RELEASE)), 2)
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
                                                 "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3,
@@ -991,8 +1042,9 @@ class OrchestrationTest(unittest.TestCase):
         stats = [c for c in self.fake.commands("kubectl") if "exec" in c and "stat" in c]
         self.assertEqual(sorted(c[c.index("--container") + 1] for c in stats), ["api", "api", "worker"])
         self.assertEqual(profile_check["auth"], {
-            "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "keys_dir": smoke.AUTH_KEYS_DIR,
-            "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True, "checked_pods": 2,
+            "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "catalog_path": smoke.AUTH_CATALOG_PATH,
+            "keys_dir": smoke.AUTH_KEYS_DIR, "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True,
+            "checked_pods": 2,
             "routes": {"/auth/session": 403, "/auth/native/session": 403,
                        "/v1/capabilities": 401, "v1_error_code": "unauthenticated"},
         })
@@ -1384,6 +1436,18 @@ class OrchestrationTest(unittest.TestCase):
             "migration 19 privilege query truncated": (
                 lambda args, result: fake_ref().run_admission.__delitem__(slice(3, None)),
                 "migrations 19/20 privilege query returned"),
+            "run admission without a catalog": (HttpDoctor(
+                lambda m, p, h, r: (m, p) == ("POST", "/v1/runs"),
+                replace=lambda r: fake_ref().artifacts.problem(503, "provisioning")),
+                "POST /v1/runs: HTTP 503, expected 201"),
+            "models page omits the catalog model": (HttpDoctor(
+                lambda m, p, h, r: p == "/v1/models",
+                lambda doc, body: doc.__setitem__("items", [])),
+                "GET /v1/models does not list catalog model 'a'"),
+            "run retry admits another run": (HttpDoctor(
+                lambda m, p, h, r: p == "/v1/runs" and r[0] == 200,
+                lambda doc, body: doc.__setitem__("run_id", "00000000-0000-4000-8000-0000000000ff")),
+                "the exact retry did not replay the same queued run"),
             "v1 session rejected": (
                 lambda args, result: setattr(fake_ref(), "session", None) if fake_ref().session else None,
                 "POST /v1/artifacts: HTTP 401, expected 201"),
@@ -1708,6 +1772,7 @@ class ValuesTest(unittest.TestCase):
             "enabled": True,
             "configMapName": smoke.AUTH_CONFIG_MAP,
             "configKey": "auth.json",
+            "catalogKey": smoke.AUTH_CATALOG_KEY,
             "loginKeysSecretName": smoke.AUTH_LOGIN_KEYS_SECRET,
         })
         self.assertEqual(values["networkPolicy"]["api"]["oidc"], {
@@ -1731,6 +1796,7 @@ class ValuesTest(unittest.TestCase):
         self.assertIn("helm.sh/resource-policy: keep", result.stdout)
         self.assertIn(smoke.ARTIFACTS_MOUNT_PATH, result.stdout)
         self.assertIn("name: OPENMETTLE_API_AUTH_CONFIG", result.stdout)
+        self.assertIn(f"path: {smoke.AUTH_CATALOG_KEY}", result.stdout)
         self.assertNotIn("OPENMETTLE_WORKER_AUTH_CONFIG", result.stdout)
         self.assertNotIn("OPENMETTLE_MIGRATE_AUTH_CONFIG", result.stdout)
         self.assertIn(smoke.AUTH_CONFIG_DIR, result.stdout)
@@ -1851,7 +1917,8 @@ class EnabledProfileChecksTest(unittest.TestCase):
                 "volumes": [
                     {"name": "auth-config", "configMap": {
                         "name": smoke.AUTH_CONFIG_MAP, "defaultMode": 420,
-                        "items": [{"key": "auth.json", "path": "auth.json"}]}},
+                        "items": [{"key": "auth.json", "path": "auth.json"},
+                                  {"key": smoke.AUTH_CATALOG_KEY, "path": smoke.AUTH_CATALOG_KEY}]}},
                     {"name": "auth-login-keys", "secret": {
                         "secretName": smoke.AUTH_LOGIN_KEYS_SECRET, "defaultMode": smoke.AUTH_SECRET_MODE}},
                 ],
@@ -1867,9 +1934,13 @@ class EnabledProfileChecksTest(unittest.TestCase):
 
         summary = smoke.check_auth_mounts({"api": [api_pod(), api_pod()], "worker": [worker_pod()]})
         self.assertEqual(summary, {
-            "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "keys_dir": smoke.AUTH_KEYS_DIR,
-            "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True,
+            "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "catalog_path": smoke.AUTH_CATALOG_PATH,
+            "keys_dir": smoke.AUTH_KEYS_DIR, "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True,
         })
+        no_catalog = api_pod()
+        no_catalog["spec"]["volumes"][0]["configMap"]["items"].pop()
+        with self.assertRaisesRegex(smoke.SmokeFailure, "does not project the model catalog"):
+            smoke.check_auth_mounts({"api": [no_catalog], "worker": [worker_pod()]})
         bad_mode = api_pod()
         bad_mode["spec"]["volumes"][1]["secret"]["defaultMode"] = 420
         with self.assertRaisesRegex(smoke.SmokeFailure, "mode 0440"):
@@ -2175,6 +2246,55 @@ class QuotaRoutesTest(unittest.TestCase):
                 smoke.evaluate_quota_routes(self.responses(status), mounted=False)
 
 
+class HttpAdmissionTest(unittest.TestCase):
+    ROOT = {"conversation_id": "00000000-0000-4000-b000-000000000001",
+            "branch_id": "00000000-0000-4000-b000-000000000002"}
+    RUN = {"run_id": "00000000-0000-4000-c000-000000000001", "state": "queued"}
+
+    def test_smoke_catalog_adds_prompt_bound_to_the_preset_model_only(self):
+        catalog = smoke.smoke_catalog(CATALOG_FIXTURE)
+        self.assertEqual(catalog["models"]["a"], {"output_limit": 4096, "prompt_bound": smoke.PROMPT_BOUND})
+        self.assertEqual(catalog["models"]["b"], {})
+        self.assertNotIn("prompt_bound", CATALOG_FIXTURE["models"]["a"])  # the fixture is not modified
+        for broken in ({**CATALOG_FIXTURE, "presets": {}},
+                       {**CATALOG_FIXTURE, "presets": {"study": {"model": "b"}}},
+                       {**CATALOG_FIXTURE, "models": {}}):
+            with self.subTest(broken=broken), self.assertRaises(smoke.SmokeFailure):
+                smoke.smoke_catalog(broken)
+
+    def test_run_request_appends_one_text_turn_with_the_preset(self):
+        message = "00000000-0000-4000-d000-000000000001"
+        self.assertEqual(smoke.run_request(self.ROOT, message), {
+            **self.ROOT, "proposal": {"expected_head_message_id": None,
+                                      "turn": {"mode": "append", "input_message_id": message,
+                                               "parts": [{"text": "kind smoke admission"}]},
+                                      "selection": {"preset": smoke.CATALOG_PRESET}}})
+        with self.assertRaisesRegex(smoke.SmokeFailure, "branch_id is not a canonical UUID"):
+            smoke.run_request({**self.ROOT, "branch_id": "x"}, message)
+
+    def test_evaluate_http_admission(self):
+        models = {"items": [{"model_id": "b"}, {"model_id": "a"}]}
+        cancelled = {**self.RUN, "state": "cancelled"}
+        self.assertEqual(smoke.evaluate_http_admission(models, self.RUN, self.RUN, cancelled),
+                         {"models": ["a", "b"], "admitted": "queued", "replay": "same run", "cancelled": "cancelled"})
+        other = {**self.RUN, "run_id": "00000000-0000-4000-c000-000000000002"}
+        for args, message in (
+            (({"items": [{"model_id": "b"}]}, self.RUN, self.RUN, cancelled), "does not list catalog model"),
+            ((models, {**self.RUN, "state": "running"}, self.RUN, cancelled), "expected a queued run"),
+            ((models, self.RUN, other, cancelled), "did not replay the same queued run"),
+            ((models, self.RUN, self.RUN, self.RUN), "expected 'cancelled'"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(smoke.SmokeFailure, message):
+                smoke.evaluate_http_admission(*args)
+
+    def test_v1_json(self):
+        headers = {"openmettle-api-version": "1.0", "cache-control": "no-store"}
+        self.assertEqual(smoke.v1_json("x", (200, headers, b'{"a": 1}'), 200), {"a": 1})
+        for body in (b"[]", b"not json"):
+            with self.subTest(body=body), self.assertRaises(smoke.SmokeFailure):
+                smoke.v1_json("x", (200, headers, body), 200)
+
+
 class SessionSeedTest(unittest.TestCase):
     RAW = bytes(range(64))
 
@@ -2338,7 +2458,8 @@ class ArtifactHttpTest(unittest.TestCase):
 
 class FixtureTest(unittest.TestCase):
     def setUp(self):
-        self.items = smoke.fixture_manifests("postgres@sha256:" + "e" * 64, PASSWORDS, "0a1b2c3d")["items"]
+        self.items = smoke.fixture_manifests("postgres@sha256:" + "e" * 64, PASSWORDS, "0a1b2c3d",
+                                             smoke.smoke_catalog(CATALOG_FIXTURE))["items"]
 
     def find(self, kind, name):
         matches = [i for i in self.items if i["kind"] == kind and i["metadata"]["name"] == name]
@@ -2405,6 +2526,11 @@ class FixtureTest(unittest.TestCase):
         self.assertNotEqual(cursor["id"], doc["login"]["keys"]["active"]["id"])
         self.assertIn("browser", doc)
         self.assertIn("native", doc)
+        # Fresh POST /v1/runs needs catalog_file, admission_limits and cursor_keys together.
+        self.assertEqual(doc["catalog_file"], smoke.AUTH_CATALOG_PATH)
+        self.assertEqual(doc["admission_limits"], smoke.ADMISSION_LIMITS)
+        self.assertEqual(json.loads(cm["data"][smoke.AUTH_CATALOG_KEY]), smoke.smoke_catalog(CATALOG_FIXTURE))
+        self.assertEqual(sorted(cm["data"]), sorted(["auth.json", smoke.AUTH_CATALOG_KEY]))
         secret = self.find("Secret", smoke.AUTH_LOGIN_KEYS_SECRET)
         self.assertEqual(secret["metadata"]["namespace"], smoke.APP_NAMESPACE)
         login, cursor = (base64.b64decode(secret["data"][key], validate=True) for key in ("active.key", "cursor.key"))

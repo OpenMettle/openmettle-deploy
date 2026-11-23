@@ -41,6 +41,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -144,6 +145,23 @@ AUTH_CONFIG_MAP = "openmettle-smoke-auth-config"
 AUTH_LOGIN_KEYS_SECRET = "openmettle-smoke-auth-login-keys"
 AUTH_CONFIG_DIR = "/etc/openmettle/auth"
 AUTH_CONFIG_PATH = f"{AUTH_CONFIG_DIR}/auth.json"
+# The model catalog, a second key of the auth ConfigMap projected beside auth.json (auth.catalogKey).
+AUTH_CATALOG_KEY = "catalog.json"
+AUTH_CATALOG_PATH = f"{AUTH_CONFIG_DIR}/{AUTH_CATALOG_KEY}"
+# Core's synthetic catalog fixture, read from the pinned checkout. Admission estimates the prompt from the
+# selected model's prompt_bound, which the fixture omits; the bound below is the one core's own HTTP tests
+# add (tests/schema/branches_http.rs and authz_http.rs). The preset `study` selects model `a`.
+CORE_CATALOG_FIXTURE = "tests/fixtures/conversation-catalog-v1.json"
+CATALOG_PRESET = "study"
+CATALOG_MODEL = "a"
+PROMPT_BOUND = {"fixed_tokens": 4, "tokens_per_turn": 4, "tokens_per_part": 2, "tokens_per_byte": 1,
+                "tokens_per_attachment": 10}
+# auth.json admission_limits (core README "Model catalog and run admission limits"). Check 11's fixture
+# caller passes its own limits to core's store and is unaffected.
+ADMISSION_LIMITS = {"live_per_actor": 4, "live_per_scope": 8, "queued_in_instance": 32,
+                    "queue_timeout_seconds": 300, "round_cap": 10}
+HTTP_RUN_KEYS = {"conversation": "kind-smoke-conversation", "run": "kind-smoke-http-run",
+                 "cancel": "kind-smoke-http-cancel"}
 AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
 AUTH_ACTIVE_KEY_PATH = f"{AUTH_KEYS_DIR}/active.key"
 AUTH_CA_DIR = "/etc/openmettle/auth-ca"
@@ -379,6 +397,7 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
             "enabled": True,
             "configMapName": AUTH_CONFIG_MAP,
             "configKey": "auth.json",
+            "catalogKey": AUTH_CATALOG_KEY,
             "loginKeysSecretName": AUTH_LOGIN_KEYS_SECRET,
         }
         values["networkPolicy"]["api"]["oidc"] = {
@@ -403,6 +422,9 @@ def smoke_auth_document() -> dict:
         },
         "cursor_keys": {"active": {"id": "smoke-cursor", "path": f"{AUTH_KEYS_DIR}/cursor.key"},
                         "verify_only": []},
+        # With cursor_keys, the two members fresh POST /v1/runs admission needs (else 503 provisioning).
+        "catalog_file": AUTH_CATALOG_PATH,
+        "admission_limits": dict(ADMISSION_LIMITS),
         "id_token": {"max_issued_at_age_seconds": 300, "future_skew_seconds": 60},
         "provider_refresh": {
             "freshness_seconds": 3600,
@@ -460,6 +482,19 @@ def smoke_auth_document() -> dict:
     }
 
 
+def smoke_catalog(fixture: dict) -> dict:
+    """Core's catalog fixture with PROMPT_BOUND on the model that CATALOG_PRESET selects."""
+    catalog = json.loads(json.dumps(fixture))
+    try:
+        model = catalog["models"][catalog["presets"][CATALOG_PRESET]["model"]]
+    except (KeyError, TypeError) as exc:
+        raise SmokeFailure(f"core catalog fixture lacks preset {CATALOG_PRESET!r} or its model") from exc
+    if catalog["presets"][CATALOG_PRESET]["model"] != CATALOG_MODEL:
+        raise SmokeFailure(f"core catalog preset {CATALOG_PRESET!r} no longer selects model {CATALOG_MODEL!r}")
+    model["prompt_bound"] = dict(PROMPT_BOUND)
+    return catalog
+
+
 def database_namespace_peer(labels: dict) -> dict:
     """A NetworkPolicyPeer for pods with `labels` in the database namespace."""
     return {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": DB_NAMESPACE}},
@@ -471,8 +506,9 @@ def database_url(role: str, password: str) -> str:
     return f"postgres://{DB_ROLE[role]}:{password}@{host}:5432/openmettle?sslmode=disable"
 
 
-def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict:
-    """Namespaces, a synthetic PostgreSQL fixture and the four URL Secrets the chart reads.
+def fixture_manifests(postgres_image: str, passwords: dict, run_id: str, catalog: dict) -> dict:
+    """Namespaces, a synthetic PostgreSQL fixture, the four URL Secrets the chart reads and the auth
+    ConfigMap (auth document and `catalog`) and key Secret.
 
     passwords holds per-run random values for admin and each login in DB_LOGINS. Provisioning follows
     core README "Schema migrations": four login roles (owner, api, issuance, worker), created before
@@ -553,7 +589,7 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
     items += [
         {"apiVersion": "v1", "kind": "ConfigMap",
          "metadata": {"name": AUTH_CONFIG_MAP, "namespace": APP_NAMESPACE, "labels": labels},
-         "data": {"auth.json": json.dumps(smoke_auth_document())}},
+         "data": {"auth.json": json.dumps(smoke_auth_document()), AUTH_CATALOG_KEY: json.dumps(catalog)}},
         {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
          "metadata": {"name": AUTH_LOGIN_KEYS_SECRET, "namespace": APP_NAMESPACE, "labels": labels},
          "data": {"active.key": passwords["auth_login_key"], "cursor.key": passwords["auth_cursor_key"]}},
@@ -832,6 +868,10 @@ def check_auth_mounts(pods_by_role: dict) -> dict:
                            for i in (v.get("configMap", {}).get("items") or []))
                    for v in volumes):
             raise SmokeFailure(f"api pod does not project {AUTH_CONFIG_MAP} as auth.json")
+        if not any(v.get("name") == "auth-config"
+                   and {"key": AUTH_CATALOG_KEY, "path": AUTH_CATALOG_KEY} in (v.get("configMap", {}).get("items") or [])
+                   for v in volumes):
+            raise SmokeFailure(f"api pod does not project the model catalog as {AUTH_CATALOG_KEY}")
         if not any(v.get("name") == "auth-login-keys"
                    and v.get("secret", {}).get("secretName") == AUTH_LOGIN_KEYS_SECRET
                    and v.get("secret", {}).get("defaultMode") == AUTH_SECRET_MODE
@@ -865,7 +905,7 @@ def check_auth_mounts(pods_by_role: dict) -> dict:
             for entry in container.get("env") or []:
                 if "AUTH_CONFIG" in str(entry.get("name", "")):
                     raise SmokeFailure("worker container must not receive AUTH_CONFIG env")
-    return {"api_pods": len(api_pods), "config_path": AUTH_CONFIG_PATH,
+    return {"api_pods": len(api_pods), "config_path": AUTH_CONFIG_PATH, "catalog_path": AUTH_CATALOG_PATH,
             "keys_dir": AUTH_KEYS_DIR, "secret_mode": AUTH_SECRET_MODE, "worker_isolated": True}
 
 
@@ -979,6 +1019,47 @@ def evaluate_quota_routes(responses: dict, *, mounted: bool) -> dict:
                 raise SmokeFailure(f"{name}: unexpected 401 problem {problem!r}")
         statuses[name] = status
     return statuses
+
+
+def v1_json(name: str, response: tuple, status: int) -> dict:
+    """The JSON object of a versioned /v1 response with `status`."""
+    _, body = expect_v1(name, response, status)
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        raise SmokeFailure(f"{name}: body is not JSON") from exc
+    if not isinstance(document, dict):
+        raise SmokeFailure(f"{name}: body is not a JSON object")
+    return document
+
+
+def run_request(root: dict, input_message_id: str) -> dict:
+    """POST /v1/runs body: one text turn appended to the new root branch, selecting CATALOG_PRESET
+    (core contract RunCreateRequest with the AppendProposal example's shape)."""
+    for field in ("conversation_id", "branch_id"):
+        if not UUID.fullmatch(str(root.get(field, ""))):
+            raise SmokeFailure(f"POST /v1/conversations: {field} is not a canonical UUID")
+    return {"conversation_id": root["conversation_id"], "branch_id": root["branch_id"],
+            "proposal": {"expected_head_message_id": None,
+                         "turn": {"mode": "append", "input_message_id": input_message_id,
+                                  "parts": [{"text": "kind smoke admission"}]},
+                         "selection": {"preset": CATALOG_PRESET}}}
+
+
+def evaluate_http_admission(models: dict, created: dict, replay: dict, cancelled: dict) -> dict:
+    """GET /v1/models lists the mounted catalog; POST /v1/runs admits a queued run, an exact retry replays
+    it and cancel makes it terminal (core ADRs 0032 and 0036)."""
+    listed = sorted(str(item.get("model_id")) for item in models.get("items") or [] if isinstance(item, dict))
+    if CATALOG_MODEL not in listed:
+        raise SmokeFailure(f"GET /v1/models does not list catalog model {CATALOG_MODEL!r}: {listed}")
+    run_id = created.get("run_id")
+    if not UUID.fullmatch(str(run_id)) or created.get("state") != "queued":
+        raise SmokeFailure(f"POST /v1/runs: expected a queued run, got state {created.get('state')!r}")
+    if replay.get("run_id") != run_id or replay.get("state") != "queued":
+        raise SmokeFailure("POST /v1/runs: the exact retry did not replay the same queued run")
+    if cancelled.get("run_id") != run_id or cancelled.get("state") != "cancelled":
+        raise SmokeFailure(f"POST /v1/runs/{{run_id}}/cancel: state {cancelled.get('state')!r}, expected 'cancelled'")
+    return {"models": listed, "admitted": "queued", "replay": "same run", "cancelled": "cancelled"}
 
 
 def b64url(raw: bytes) -> str:
@@ -1531,7 +1612,8 @@ class Smoke:
             "auth_cursor_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
             "auth_login_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
         }
-        manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id)
+        catalog = smoke_catalog(json.loads((self.core_dir / CORE_CATALOG_FIXTURE).read_text(encoding="utf-8")))
+        manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id, catalog)
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(manifests))
         for deployment in ("postgres", PEER):
@@ -1710,6 +1792,27 @@ class Smoke:
                 "revisions": 2, "idempotent_retry": "same revision from the other replica",
                 "downloads": downloads}
 
+    def http_run_admission(self, api_pod: str, cookie: str) -> dict:
+        """Admit, replay and cancel one run through POST /v1/runs with the mounted catalog."""
+        forward = PortForward(self.kubectl, self.env, f"pod/{api_pod}", 8080)
+        try:
+            def send(method, path, status, *, key=None, document=None):
+                headers = v1_headers(cookie, key=key)
+                body = b""
+                if document is not None:
+                    headers["Content-Type"] = "application/json"
+                    body = json.dumps(document).encode()
+                return v1_json(f"{method} {path}", http_exchange(forward.port, method, path, headers, body), status)
+            models = send("GET", "/v1/models", 200)
+            root = send("POST", "/v1/conversations", 201, key=HTTP_RUN_KEYS["conversation"], document={})
+            request = run_request(root, str(uuid.uuid4()))
+            created = send("POST", "/v1/runs", 201, key=HTTP_RUN_KEYS["run"], document=request)
+            replay = send("POST", "/v1/runs", 200, key=HTTP_RUN_KEYS["run"], document=request)
+            cancelled = send("POST", f"/v1/runs/{created.get('run_id')}/cancel", 200, key=HTTP_RUN_KEYS["cancel"])
+        finally:
+            forward.close()
+        return evaluate_http_admission(models, created, replay, cancelled)
+
     def prepare_ingress(self):
         cert, key = self.kubeconfig.parent / "ingress.crt", self.kubeconfig.parent / "ingress.key"
         self.run(ingress_certificate_command(cert, key))
@@ -1886,6 +1989,8 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         pvc["store_subdirectories"] = list(ARTIFACT_SUBDIRS)
         cookie = self.seed_session()
         artifacts = self.artifact_round_trip(profile["pods"]["api"], cookie)
+        # Cancelled before check 11, so its fixture admission still finds no live run for the actor.
+        http_admission = self.http_run_admission(profile["pods"]["api"][0], cookie)
         logs_summary = {}
         for role, require_debug in (("api", True), ("worker", False)):
             names = profile["pods"][role]
@@ -1901,11 +2006,12 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         auth_summary = {**auth_mounts, "checked_pods": len(profile["pods"]["api"]), "routes": auth_routes}
         self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and ARTIFACTS_DIR store, auth + /v1/* mounts, "
                     "unauthenticated /v1 quota routes 401, API-only issuance credential, /v1/artifacts upload, "
-                    "retry, revision and byte ranges on the PVC, and JSON/debug logs",
+                    "retry, revision and byte ranges on the PVC, catalog-backed POST /v1/runs admission, "
+                    "and JSON/debug logs",
                     ready_replicas=profile["ready_replicas"],
                     healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
                     pdb=pdb, pvc=pvc, auth=auth_summary, quota_routes=quota_routes, issuance=issuance,
-                    artifacts=artifacts,
+                    artifacts=artifacts, run_admission_http=http_admission,
                     logs=logs_summary)
         self.passed("HTTPS ingress queued run replay and worker expiry",
                     **self.ingress_replay(cookie, cert))
