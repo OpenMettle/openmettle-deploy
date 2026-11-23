@@ -123,6 +123,9 @@ auth:
   enabled: true
   configMapName: example-openmettle-auth-config
   configKey: auth.json
+  # Optional model catalog in the same ConfigMap, mounted at /etc/openmettle/auth/catalog.json (name it
+  # as catalog_file in auth.json).
+  catalogKey: catalog.json
   loginKeysSecretName: example-openmettle-auth-login-keys
   # Optional CA bundle for a private/cluster-CA OIDC provider (reference /etc/openmettle/auth-ca/ca.crt
   # in providers[].trust.bundle_path).

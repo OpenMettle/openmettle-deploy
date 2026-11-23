@@ -48,6 +48,7 @@ auth:
   enabled: true
   configMapName: "789"
   configKey: "false"
+  catalogKey: "1"
   loginKeysSecretName: "null"
   providerCaBundle:
     enabled: true

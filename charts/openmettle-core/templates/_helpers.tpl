@@ -142,6 +142,11 @@ volumes:
       items:
         - key: {{ $auth.configKey | quote }}
           path: auth.json
+        {{- if $auth.catalogKey }}
+        {{- /* Named by catalog_file in auth.json (core ADR 0036); read once at API startup. */}}
+        - key: {{ $auth.catalogKey | quote }}
+          path: catalog.json
+        {{- end }}
   - name: auth-login-keys
     secret:
       secretName: {{ required "auth.loginKeysSecretName is required when auth.enabled is true" $auth.loginKeysSecretName | quote }}
@@ -421,6 +426,12 @@ provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030
 {{- fail "auth.configMapName is required when auth.enabled is true (an existing ConfigMap holding the version-2 auth settings document)" -}}
 {{- end -}}
 {{- include "openmettle-core.validate.configMapKey" (dict "field" "auth.configKey" "key" $auth.configKey) -}}
+{{- if $auth.catalogKey -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" "auth.catalogKey" "key" $auth.catalogKey) -}}
+{{- if eq (toString $auth.catalogKey) (toString $auth.configKey) -}}
+{{- fail "auth.catalogKey must differ from auth.configKey; the model catalog is a separate file named by catalog_file in auth.json" -}}
+{{- end -}}
+{{- end -}}
 {{- if not $auth.loginKeysSecretName -}}
 {{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
 {{- end -}}
@@ -450,6 +461,9 @@ same login role twice (core exits 78) or mount a role's credential where it does
 {{- else -}}
 {{- if .Values.database.issuance.existingSecret -}}
 {{- fail "database.issuance.existingSecret must be empty when auth.enabled is false; the issuance URL is mounted only with sign-in (core ADR 0030)" -}}
+{{- end -}}
+{{- if $auth.catalogKey -}}
+{{- fail "auth.catalogKey must be empty when auth.enabled is false; the model catalog is mounted only with sign-in" -}}
 {{- end -}}
 {{- if $auth.providerCaBundle.enabled -}}
 {{- fail "auth.providerCaBundle.enabled cannot be true when auth.enabled is false" -}}

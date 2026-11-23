@@ -659,6 +659,8 @@ AUTH_CONFIG_PATH = "/etc/openmettle/auth/auth.json"
 AUTH_KEYS_DIR = "/etc/openmettle/auth-keys"
 AUTH_CA_DIR = "/etc/openmettle/auth-ca"
 AUTH_VOLUMES = {"auth-config", "auth-login-keys", "auth-provider-ca"}
+# The examples project auth.json and the model catalog from one ConfigMap (auth.catalogKey).
+CATALOG_ITEMS = [{"key": "auth.json", "path": "auth.json"}, {"key": "catalog.json", "path": "catalog.json"}]
 OTLP_CA_DIR = "/etc/openmettle/otlp-ca"
 OTLP_CA_PATH = "/etc/openmettle/otlp-ca/ca.crt"
 I4_KINDS = {"PersistentVolumeClaim", "Ingress", "PodDisruptionBudget"}
@@ -689,7 +691,7 @@ class OptionalDefaultsTest(Rendered):
             "storageClassName": None, "annotations": {}}})
         self.assertEqual(defaults["ingress"], {"enabled": False, "className": "", "annotations": {}, "hosts": [], "tls": []})
         self.assertEqual(defaults["auth"], {
-            "enabled": False, "configMapName": "", "configKey": "auth.json", "loginKeysSecretName": "",
+            "enabled": False, "configMapName": "", "configKey": "auth.json", "catalogKey": "", "loginKeysSecretName": "",
             "providerCaBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
         })
         self.assertEqual(defaults["telemetry"], {
@@ -888,13 +890,15 @@ class AuthTest(Rendered):
 
     def test_api_mounts_config_login_keys_optional_ca_and_env(self):
         """Fails if api lacks OPENMETTLE_API_AUTH_CONFIG, read-only directory mounts, 0440 Secret mode or fsGroup 65532."""
+        auth_item = {"key": "auth.json", "path": "auth.json"}
         cases = {
-            "auth-enabled": ("example-auth-config", "auth.json", "example-auth-login-keys", None),
-            "auth-network-policy-disabled": ("example-auth-config", "auth.json", "example-auth-login-keys", None),
-            "all-keys": ("example-auth-config", "browser-auth.json", "example-auth-login-keys",
-                         ("example-oidc-ca", "idp-ca.pem")),
+            "auth-enabled": ("example-auth-config", [auth_item], "example-auth-login-keys", None),
+            "auth-network-policy-disabled": ("example-auth-config", [auth_item], "example-auth-login-keys", None),
+            "all-keys": ("example-auth-config", [{"key": "browser-auth.json", "path": "auth.json"},
+                                                 {"key": "model-catalog.json", "path": "catalog.json"}],
+                         "example-auth-login-keys", ("example-oidc-ca", "idp-ca.pem")),
         }
-        for name, (cm, cm_key, secret, ca) in cases.items():
+        for name, (cm, items, secret, ca) in cases.items():
             with self.subTest(values=name):
                 api = find(self.renders[name], "Deployment", "-api")["spec"]["template"]["spec"]
                 container = api["containers"][0]
@@ -903,7 +907,7 @@ class AuthTest(Rendered):
                                  {"name": "OPENMETTLE_API_AUTH_CONFIG", "value": AUTH_CONFIG_PATH})
                 self.assertEqual(api["securityContext"]["fsGroup"], 65532)
                 self.assertEqual(volumes(api)["auth-config"], {"name": "auth-config", "configMap": {
-                    "name": cm, "items": [{"key": cm_key, "path": "auth.json"}]}})
+                    "name": cm, "items": items}})
                 self.assertEqual(mounts(api)["auth-config"],
                                  {"name": "auth-config", "mountPath": AUTH_CONFIG_DIR, "readOnly": True})
                 self.assertEqual(volumes(api)["auth-login-keys"], {"name": "auth-login-keys", "secret": {
@@ -959,6 +963,21 @@ class AuthTest(Rendered):
         for role, pod in pods(docs):
             if role != "api":
                 self.assertNotIn("auth-provider-ca", volumes(pod), role)
+
+    def test_catalog_key_projects_catalog_beside_auth_json_in_api_only(self):
+        """Fails if auth.catalogKey is not projected as catalog.json in the auth-config volume, adds a volume,
+        mount or env var, or reaches worker or migrate."""
+        base = render(("auth-enabled.yaml",))
+        docs = render(("auth-enabled.yaml",), ["auth.catalogKey=catalog.json"])
+        api = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(api)["auth-config"]["configMap"]["items"], [
+            {"key": "auth.json", "path": "auth.json"}, {"key": "catalog.json", "path": "catalog.json"}])
+        before = find(base, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(set(volumes(api)), set(volumes(before)))
+        self.assertEqual(mounts(api), mounts(before))
+        self.assertEqual(env_map(api["containers"][0]), env_map(before["containers"][0]))
+        non_api = yaml.safe_dump_all(d for d in docs if not (d["kind"] == "Deployment" and component(d) == "api"))
+        self.assertNotIn("catalog", non_api)
 
     def test_auth_without_network_policy_renders_no_policies(self):
         """Fails if enabling auth while networkPolicy.enabled=false still renders a NetworkPolicy."""
@@ -1212,6 +1231,7 @@ class ExampleOverlayTest(unittest.TestCase):
                 self.assertEqual(env[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["name"],
                                  "example-openmettle-issuance-database")
                 self.assertLessEqual(AUTH_VOLUMES, set(volumes(pod)))
+                self.assertEqual(volumes(pod)["auth-config"]["configMap"]["items"], CATALOG_ITEMS)
             else:
                 self.assertFalse(AUTH_VOLUMES & set(volumes(pod)), role)
                 self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
@@ -1283,6 +1303,7 @@ class WorkstationProfileTest(unittest.TestCase):
                 self.assertEqual(env[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["name"],
                                  "workstation-openmettle-issuance-database")
                 self.assertLessEqual(AUTH_VOLUMES, vols)
+                self.assertEqual(volumes(pod)["auth-config"]["configMap"]["items"], CATALOG_ITEMS)
             else:
                 self.assertFalse(AUTH_VOLUMES & vols, role)
                 self.assertNotIn("OPENMETTLE_API_AUTH_CONFIG", env)
@@ -1567,6 +1588,17 @@ class NegativeCaseTest(unittest.TestCase):
          ["--set-json", "networkPolicy.api.oidc.to=[{}]", "--skip-schema-validation"],
          ["networkPolicy.api.oidc.to[0] must be a non-empty NetworkPolicyPeer object"]),
         ("unknown auth key", ["auth.mountPath=/tmp"], [], [SCHEMA, "additional properties 'mountPath' not allowed"]),
+        # Model catalog key (core ADR 0036).
+        ("catalog key while auth disabled", ["auth.catalogKey=catalog.json"], [], [SCHEMA, "/auth/catalogKey"]),
+        ("catalog key while auth disabled without schema", ["auth.catalogKey=catalog.json"], [SKIP],
+         ["auth.catalogKey must be empty when auth.enabled is false"]),
+        ("catalog key with path", [*AUTH, ISSUANCE, "auth.catalogKey=../catalog.json"], OIDC_PEER,
+         [SCHEMA, "/auth/catalogKey"]),
+        ("catalog key dot-dot", [*AUTH, ISSUANCE, "auth.catalogKey=.."], OIDC_PEER, [SCHEMA, "/auth/catalogKey"]),
+        ("catalog key slash without schema", [*AUTH, ISSUANCE, "auth.catalogKey=a/b"], [*OIDC_PEER, SKIP],
+         ["auth.catalogKey must be a ConfigMap key"]),
+        ("catalog key equals config key", [*AUTH, ISSUANCE, "auth.catalogKey=auth.json"], OIDC_PEER,
+         ["auth.catalogKey must differ from auth.configKey"]),
         # Session issuance (AUTHSEC-01, core ADR 0030).
         ("auth without issuance Secret", AUTH, OIDC_PEER, [SCHEMA, "/database/issuance/existingSecret"]),
         ("auth without issuance Secret without schema", AUTH, [*OIDC_PEER, SKIP],
@@ -2116,7 +2148,7 @@ class YamlScalarTest(unittest.TestCase):
         self.assertEqual(env_map(api_pod["containers"][0])[ISSUANCE_URL]["valueFrom"]["secretKeyRef"],
                          {"name": "true", "key": "0x1"})
         self.assertEqual(volumes(api_pod)["auth-config"]["configMap"], {
-            "name": "789", "items": [{"key": "false", "path": "auth.json"}]})
+            "name": "789", "items": [{"key": "false", "path": "auth.json"}, {"key": "1", "path": "catalog.json"}]})
         self.assertEqual(volumes(api_pod)["auth-login-keys"]["secret"], {
             "secretName": "null", "defaultMode": 0o440})
         self.assertEqual(volumes(api_pod)["auth-provider-ca"]["configMap"], {

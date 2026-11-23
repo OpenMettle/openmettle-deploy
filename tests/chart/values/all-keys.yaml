@@ -149,6 +149,7 @@ auth:
   enabled: true
   configMapName: example-auth-config
   configKey: browser-auth.json
+  catalogKey: model-catalog.json
   loginKeysSecretName: example-auth-login-keys
   providerCaBundle:
     enabled: true

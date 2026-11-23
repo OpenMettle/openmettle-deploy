@@ -270,11 +270,15 @@
       "description": "Optional sign-in / OIDC and /v1/* application route configuration mounted into the API pod only (core ADRs 0025, 0027 and 0029). Never mounted into worker or migrate pods.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "configMapName", "configKey", "loginKeysSecretName", "providerCaBundle"],
+      "required": ["enabled", "configMapName", "configKey", "catalogKey", "loginKeysSecretName", "providerCaBundle"],
       "properties": {
         "enabled": {"type": "boolean"},
         "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
         "configKey": {"$ref": "#/$defs/configMapKey"},
+        "catalogKey": {
+          "description": "Optional key of the same ConfigMap projected read-only at /etc/openmettle/auth/catalog.json in the API pod only. Empty: no catalog file is mounted.",
+          "anyOf": [{"const": ""}, {"$ref": "#/$defs/configMapKey"}]
+        },
         "loginKeysSecretName": {"$ref": "#/$defs/optionalDnsSubdomain"},
         "providerCaBundle": {
           "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/auth-ca/ca.crt in the API pod only.",
@@ -290,6 +294,7 @@
       },
       "else": {
         "properties": {
+          "catalogKey": {"const": ""},
           "providerCaBundle": {
             "properties": {
               "enabled": {"const": false}
