@@ -8,6 +8,10 @@ Wave 18a pins core to `2d3bc21` (migration 20). Set `worker.sweepMs` to an integ
 
 The current pin is core `24808cb` (migrations 21–27), with no template changes. Provision a restricted `openmettle_gateway` role before migration 23. On an existing database, follow core's storage-adoption and quota upgrade runbook; see [Quotas from migrations 24–27](charts/openmettle-core/README.md#quotas-from-migrations-2427). `kind-smoke` also checks that migration reaches 27 from an empty database with quota enforcement active, and that the `/v1` quota routes answer `404` unmounted and `401` without a session.
 
+## First install
+
+[`docs/first-install.md`](docs/first-install.md) is the ordered path from an empty single-node cluster and an empty PostgreSQL 18 database to a signed-in user, authenticated `/v1` calls and an admitted run, at the pinned core commit. It covers prerequisites, image builds, the auth document and model catalog (`auth.catalogKey`), install, core's operator scripts on a fresh database, a one-off `openmettle-admin` Job, and what is not yet possible. It has not yet been run on a real cluster.
+
 ## Package boundaries
 
 - `charts/openmettle-core`: CPU-only API/worker core and its configured PostgreSQL/storage integrations. It must render without a GPU, DRA API or vendor operator.
