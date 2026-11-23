@@ -13,8 +13,11 @@ Synthetic names used throughout:
 | Namespace and Helm release | `openmettle` (resources are named `openmettle-openmettle-core-*`) |
 | Application hostname | `openmettle.example.test` |
 | OIDC issuer (Keycloak realm) | `https://idp.example.test/realms/openmettle` |
-| Private overlay | `config/site.local.yaml` (ignored by Git) |
+| This repository's checkout | `$DEPLOY` |
 | Core checkout at the pin | `$CORE` |
+| Private staging directory | `$STAGE`, outside both checkouts |
+| Private overlay | `$DEPLOY/config/site.local.yaml` (ignored by Git) |
+| `psql` connection as `openmettle_owner` | libpq service `openmettle-owner` |
 
 ## Steps
 
@@ -44,14 +47,43 @@ The chart creates no Namespace, Secret, ConfigMap, IngressClass, Traefik Middlew
 - An ingress controller. The chart documentation and kind smoke test use Traefik v3.
 - A default StorageClass, or a named one, for the artifact PersistentVolumeClaim.
 - A container registry that the node can pull from, and Docker with Buildx to build the core images.
-- `psql` 18 on an operator workstation that can reach the PostgreSQL primary, plus a checkout of core at the pinned commit:
+- `psql` 18, `jq` and `openssl` on an operator workstation that can reach the PostgreSQL primary.
 
-  ```sh
-  git clone https://github.com/OpenMettle/openmettle-core.git "$CORE"
-  git -C "$CORE" checkout --detach "$(cat CORE_COMMIT)"
-  ```
+On that workstation, set the three paths every later step uses, check out core at the pinned commit, and create the private staging directory:
 
-Run core's operator scripts from that workstation, from the root of `$CORE`. You can connect directly or through `kubectl port-forward` to the database Service. Do not run the scripts in a pod: the kubelet keeps container output in node logs, and `home-invitation-create.psql` prints a one-time secret.
+```sh
+export DEPLOY="$HOME/src/openmettle-deploy"   # a checkout of this repository at this guide's commit
+export CORE="$HOME/src/openmettle-core"       # core at the pinned commit (cloned below)
+export STAGE="$HOME/openmettle-stage"         # private staging directory, outside both checkouts
+git clone https://github.com/OpenMettle/openmettle-core.git "$CORE"
+git -C "$CORE" checkout --detach "$(cat "$DEPLOY/CORE_COMMIT")"
+(umask 077; mkdir -p "$STAGE/db" "$STAGE/keys" "$STAGE/auth" "$STAGE/auth-ca" "$STAGE/images")
+```
+
+Every file this guide creates goes in `$STAGE`: database passwords and URLs, the CA bundles, the login and cursor keys, `auth.json`, the catalog and the image build metadata. Keep it outside both checkouts, so nothing in it can be committed, and remove what you no longer need once the install is done.
+
+**Database connection.** The `psql` commands connect through libpq service entries in `~/.pg_service.conf`, with passwords in `~/.pgpass` (mode `0600`), so no host, user or password appears on a command line:
+
+```ini
+# ~/.pg_service.conf (synthetic)
+[openmettle-superuser]
+host=db.example.test
+port=5432
+dbname=postgres
+user=postgres
+sslmode=verify-full
+sslrootcert=/home/operator/openmettle-stage/db/db-ca.pem
+
+[openmettle-owner]
+host=db.example.test
+port=5432
+dbname=openmettle
+user=openmettle_owner
+sslmode=verify-full
+sslrootcert=/home/operator/openmettle-stage/db/db-ca.pem
+```
+
+`sslrootcert` here is the CA file on your workstation, not the in-pod path that the URL Secrets name. Use `openmettle-superuser` only in step 3. After step 3, `export PGSERVICE=openmettle-owner` for every later `psql` command. To reach an in-cluster database, point `host` and `port` at a `kubectl port-forward` to its Service. Do not run the scripts in a pod: the kubelet keeps container output in node logs, and `home-invitation-create.psql` prints a one-time secret.
 
 ## 2. Namespace and Pod Security
 
@@ -67,29 +99,40 @@ Every chart pod satisfies `restricted` (kind smoke check 8). A namespace-wide de
 
 ## 3. PostgreSQL roles, database and URL Secrets
 
-As a PostgreSQL superuser, create one dedicated database and five roles before the first migration. Core's README ("Schema migrations") defines the four login roles. Its rules apply: no role is a superuser or has `CREATEROLE`, `CREATEDB`, `REPLICATION` or `BYPASSRLS`, no role belongs to another role, and you grant nothing yourself. Migration 23 refuses to run without a restricted `openmettle_gateway` role (core ADR 0037). No chart process logs in as that role, so create it without a login (this is what the kind smoke fixture does):
+As a PostgreSQL superuser, create one dedicated database and five roles before the first migration. Core's README ("Schema migrations") defines the four login roles. Its rules apply: no role is a superuser or has `CREATEROLE`, `CREATEDB`, `REPLICATION` or `BYPASSRLS`, no role belongs to another role, and you grant nothing yourself. Migration 23 refuses to run without a restricted `openmettle_gateway` role (core ADR 0037). No chart process logs in as that role, so create it without a login (this is what the kind smoke fixture does). Generate the passwords as hex, so they need no URL encoding, and pass them to `psql` from the files:
 
-```sql
+```sh
+for role in owner api issuance worker; do (umask 077; set -C; openssl rand -hex 24 > "$STAGE/db/$role.password"); done
+PGSERVICE=openmettle-superuser psql -X -v ON_ERROR_STOP=1 <<'SQL'
+\set owner_password `cat "$STAGE/db/owner.password"`
+\set api_password `cat "$STAGE/db/api.password"`
+\set issuance_password `cat "$STAGE/db/issuance.password"`
+\set worker_password `cat "$STAGE/db/worker.password"`
 CREATE ROLE openmettle_owner LOGIN PASSWORD :'owner_password';
 CREATE ROLE openmettle_api LOGIN PASSWORD :'api_password' CONNECTION LIMIT 8;
 CREATE ROLE openmettle_issuance LOGIN PASSWORD :'issuance_password' CONNECTION LIMIT 4;
 CREATE ROLE openmettle_worker LOGIN PASSWORD :'worker_password' CONNECTION LIMIT 8;
 CREATE ROLE openmettle_gateway NOLOGIN;
 CREATE DATABASE openmettle OWNER openmettle_owner;
+SQL
 ```
+
+Add the owner password to `~/.pgpass` for the `openmettle-owner` service.
 
 Size the connection limits with the [connection budget](../charts/openmettle-core/README.md#connection-budget). The figures above are core's illustrative ones.
 
-Create one URL Secret per login role, each with the key `url`. The chart compares only Secret names and keys, so use a separate Secret for each role. Write each URL to a file with a restrictive umask so the password does not reach shell history:
+Create one URL Secret per login role, each with the key `url`. The chart compares only Secret names and keys, so use a separate Secret for each role. The URLs are what the pods use, so `sslrootcert` names the in-pod CA path. Write them in `$STAGE` with no trailing newline, so the passwords stay out of shell history and out of the checkouts. `$STAGE/db/db-ca.pem` is the PEM bundle of the CA that issued the PostgreSQL server certificate:
 
 ```sh
-# url file content (synthetic):
-# postgres://openmettle_api:<password>@db.example.test:5432/openmettle?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt
-kubectl -n openmettle create secret generic openmettle-owner-database    --from-file=url=./owner.url
-kubectl -n openmettle create secret generic openmettle-api-database      --from-file=url=./api.url
-kubectl -n openmettle create secret generic openmettle-issuance-database --from-file=url=./issuance.url
-kubectl -n openmettle create secret generic openmettle-worker-database   --from-file=url=./worker.url
-kubectl -n openmettle create configmap openmettle-db-ca --from-file=ca.crt=./db-ca.pem
+for role in owner api issuance worker; do
+  (umask 077; printf 'postgres://openmettle_%s:%s@db.example.test:5432/openmettle?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt' \
+    "$role" "$(cat "$STAGE/db/$role.password")" > "$STAGE/db/$role.url")
+done
+kubectl -n openmettle create secret generic openmettle-owner-database    --from-file=url="$STAGE/db/owner.url"
+kubectl -n openmettle create secret generic openmettle-api-database      --from-file=url="$STAGE/db/api.url"
+kubectl -n openmettle create secret generic openmettle-issuance-database --from-file=url="$STAGE/db/issuance.url"
+kubectl -n openmettle create secret generic openmettle-worker-database   --from-file=url="$STAGE/db/worker.url"
+kubectl -n openmettle create configmap openmettle-db-ca --from-file=ca.crt="$STAGE/db/db-ca.pem"
 ```
 
 | Secret | Chart value | Mounted into |
@@ -101,7 +144,7 @@ kubectl -n openmettle create configmap openmettle-db-ca --from-file=ca.crt=./db-
 
 Set `sslmode` explicitly in every URL. Without it SQLx uses `prefer`, which permits plaintext. When the URLs name `sslrootcert=/etc/openmettle/db-ca/ca.crt`, set `database.caBundle` to the ConfigMap above ([Database CA](../charts/openmettle-core/README.md#database-ca)). Keep the owner URL Secret: the migrate hook and [`openmettle-admin`](#running-openmettle-admin) use it, and you also need the owner login for the `psql` steps.
 
-**Check:** `psql` as `openmettle_owner` connects to `openmettle`, and `SELECT rolname FROM pg_roles WHERE rolname LIKE 'openmettle_%' ORDER BY 1;` lists the five roles.
+**Check:** with `export PGSERVICE=openmettle-owner`, `psql -X -c "SELECT rolname FROM pg_roles WHERE rolname LIKE 'openmettle_%' ORDER BY 1;"` connects as the owner and lists the five roles.
 
 ## 4. OIDC provider registration
 
@@ -119,21 +162,25 @@ Register one client for the application. Core's Keycloak qualification (`$CORE/t
 
 Record the issuer and the client ID. Copy the `authorization_endpoint`, `token_endpoint` and `jwks_uri` from the realm's discovery document at `<issuer>/.well-known/openid-configuration`. For each person who will sign in, record the stable `sub` claim from the provider's administration records. The first sign-in uses it in [step 10](#10-operator-steps-on-the-fresh-database).
 
-The API alone calls the provider, directly and without a proxy (core ADR 0010). Allow that egress with `networkPolicy.api.oidc.to` and `networkPolicy.api.oidc.port` (for example `8443` for a self-hosted Keycloak). If the issuer hostname resolves to a private address, list a CIDR that covers that address in `providers[].private_cidrs`. If the provider uses a private CA, mount it with `auth.providerCaBundle` and set `providers[].trust` to `{"roots": "bundle", "bundle_path": "/etc/openmettle/auth-ca/ca.crt"}`.
+The API alone calls the provider, directly and without a proxy (core ADR 0010). Allow that egress with `networkPolicy.api.oidc.to` and `networkPolicy.api.oidc.port` (for example `8443` for a self-hosted Keycloak). If the issuer hostname resolves to a private address, list a CIDR that covers that address in `providers[].private_cidrs`. If the provider uses a private CA, save its PEM bundle as `$STAGE/auth-ca/ca.crt` and create `kubectl -n openmettle create configmap openmettle-oidc-ca --from-file=ca.crt="$STAGE/auth-ca/ca.crt"`. Then set `auth.providerCaBundle` to `{enabled: true, configMapName: openmettle-oidc-ca}` and `providers[].trust` to `{"roots": "bundle", "bundle_path": "/etc/openmettle/auth-ca/ca.crt"}`.
 
 ## 5. Images
 
 Core publishes no images. Build `api`, `worker`, `migrate` and `admin` from core's `Dockerfile` at the pinned commit, push them to your registry and reference each one by digest. The chart refuses tags.
 
 ```sh
-cd "$CORE"
-for target in api worker migrate admin; do
-  docker buildx build --platform "linux/$NODE_ARCH" --target "$target" \
-    --tag "$REGISTRY/openmettle/$target:$(git rev-parse --short=12 HEAD)" \
-    --metadata-file "/tmp/openmettle-$target.json" --push .
-  jq -r '."containerimage.digest"' "/tmp/openmettle-$target.json"   # sha256:...
-done
+(
+  cd "$CORE"
+  for target in api worker migrate admin; do
+    docker buildx build --platform "linux/$NODE_ARCH" --target "$target" \
+      --tag "$REGISTRY/openmettle/$target:$(git rev-parse --short=12 HEAD)" \
+      --metadata-file "$STAGE/images/$target.json" --push .
+    jq -r '."containerimage.digest"' "$STAGE/images/$target.json"   # sha256:...
+  done
+)
 ```
+
+The subshell keeps your working directory unchanged.
 
 `NODE_ARCH` is your node's architecture (`amd64` or `arm64`), and `REGISTRY` is your registry host and path. The `Dockerfile` pins its base images by digest. This guide does not verify that those digests cover your architecture. Check with `docker buildx imagetools inspect` on each pinned `FROM` reference before you build. The kind smoke test builds amd64 only. If the registry is private, create a pull Secret and list it in `images.pullSecrets`. Image distribution remains subject to core's V1-42 provenance inventory, so keep the images in a private registry.
 
@@ -148,16 +195,17 @@ Write `images.{api,worker,migrate}.{registry,repository,digest}` into the privat
 Generate one 32-byte login key and one separate 32-byte cursor key. Then store both in one Secret (core README, "Run cursor keys"):
 
 ```sh
-(umask 077; set -C; openssl rand 32 > login-active.key; openssl rand 32 > cursor-active.key)
+(umask 077; set -C; openssl rand 32 > "$STAGE/keys/login-active.key"; openssl rand 32 > "$STAGE/keys/cursor-active.key")
 kubectl -n openmettle create secret generic openmettle-auth-keys \
-  --from-file=login-active.key=./login-active.key --from-file=cursor-active.key=./cursor-active.key
+  --from-file=login-active.key="$STAGE/keys/login-active.key" \
+  --from-file=cursor-active.key="$STAGE/keys/cursor-active.key"
 ```
 
 The chart mounts the Secret read-only at `/etc/openmettle/auth-keys` with mode `0440` in the API pod only (`auth.loginKeysSecretName`).
 
 ### `auth.json` (version 2)
 
-Fresh `POST /v1/runs` admission needs `catalog_file`, `admission_limits` and `cursor_keys`. Without any one of them, it answers `503 provisioning`. The rest of the document is required for sign-in. The shape below is the kind smoke document without its native profile. The values are illustrative, not recommendations; core ADR 0015 lists each field's bounds.
+Fresh `POST /v1/runs` admission needs `catalog_file`, `admission_limits` and `cursor_keys`. Without any one of them, it answers `503 provisioning`. The rest of the document is required for sign-in. Write it as `$STAGE/auth/auth.json`. The shape below is the kind smoke document without its native profile. The values are illustrative, not recommendations; core ADR 0015 lists each field's bounds.
 
 ```json
 {
@@ -213,7 +261,7 @@ Fresh `POST /v1/runs` admission needs `catalog_file`, `admission_limits` and `cu
 ```sh
 jq '.models.a.prompt_bound = {"fixed_tokens": 4, "tokens_per_turn": 4, "tokens_per_part": 2,
                               "tokens_per_byte": 1, "tokens_per_attachment": 10}' \
-  "$CORE/tests/fixtures/conversation-catalog-v1.json" > catalog.json
+  "$CORE/tests/fixtures/conversation-catalog-v1.json" > "$STAGE/auth/catalog.json"
 ```
 
 The result is a synthetic catalog. It is enough for admission, because at this pin no model is called ([Not yet possible](#not-yet-possible-at-this-pin)). Leave out `cost_bound` and any `usage_cost_micros` quota until cost metering is qualified (core `docs/operator/storage-adoption-and-quota-upgrade.md`, section 2).
@@ -224,26 +272,27 @@ Store both files in one ConfigMap. `auth.configKey` projects `auth.json`, and `a
 
 ```sh
 kubectl -n openmettle create configmap openmettle-auth \
-  --from-file=auth.json=./auth.json --from-file=catalog.json=./catalog.json
+  --from-file=auth.json="$STAGE/auth/auth.json" --from-file=catalog.json="$STAGE/auth/catalog.json"
 ```
 
 **Check (offline, before install; *unverified* outside a pod).** Run core's validator in the API image with the files at their in-pod paths. Run the container as your own user, because the key files are mode `0600`:
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/auth:/etc/openmettle/auth:ro" -v "$PWD/keys:/etc/openmettle/auth-keys:ro" \
+  -v "$STAGE/auth:/etc/openmettle/auth:ro" -v "$STAGE/keys:/etc/openmettle/auth-keys:ro" \
+  -v "$STAGE/auth-ca:/etc/openmettle/auth-ca:ro" \
   "$REGISTRY/openmettle/api@<api digest>" --check-auth-config /etc/openmettle/auth/auth.json
 ```
 
-Here `./auth` holds `auth.json` and `catalog.json`, and `./keys` holds both key files. Expect `auth configuration valid (local files only)` and exit 0. [Step 9](#9-install-and-migrate) repeats the check inside the running pod, which is the form the kind smoke test exercises.
+The three mounts match the in-pod paths: `auth.json` and `catalog.json`, both key files, and the provider CA. The CA directory is empty unless you configured a private CA in step 4. Expect `auth configuration valid (local files only)` and exit 0. [Step 9](#9-install-and-migrate) repeats the check inside the running pod, which is the form the kind smoke test exercises.
 
 ## 7. Ingress, TLS and request limits
 
-Create these in the release namespace. The chart references them but does not create them:
+The chart references these but does not create them. The TLS Secret and the Middleware go in the release namespace; the redaction settings are controller configuration:
 
-- **TLS Secret** for the hostname, for example `kubectl -n openmettle create secret tls openmettle-tls --cert=tls.crt --key=tls.key`, or one issued by cert-manager.
-- **Access-log redaction** in the controller's static configuration. This is mandatory before routing sign-in traffic: [Mandatory before routing login traffic](../charts/openmettle-core/README.md#mandatory-before-routing-login-traffic-no-request-targets-cookies-or-bodies-in-logs). On K3s, use the `traefik` `HelmChartConfig`.
-- **Body-limit middleware.** `POST /v1/runs` bodies can be up to 128 KiB (`131072` bytes), so a limit of `65536` refuses large run proposals. Artifact uploads need more, up to their `max_bytes` (at most 64 MiB) plus multipart overhead:
+- **TLS Secret** in `openmettle` for the hostname, for example `kubectl -n openmettle create secret tls openmettle-tls --cert="$STAGE/tls.crt" --key="$STAGE/tls.key"`, or one issued by cert-manager.
+- **Access-log redaction** in the controller's static configuration. This is mandatory before routing sign-in traffic: [Mandatory before routing login traffic](../charts/openmettle-core/README.md#mandatory-before-routing-login-traffic-no-request-targets-cookies-or-bodies-in-logs). K3s's bundled Traefik reads it from a `HelmChartConfig` named `traefik` in `kube-system`, not the release namespace.
+- **Body-limit Middleware** in `openmettle`. `POST /v1/runs` bodies can be up to 128 KiB (`131072` bytes), so a limit of `65536` refuses large run proposals. Artifact uploads need more, up to their `max_bytes` (at most 64 MiB) plus multipart overhead:
 
   ```yaml
   apiVersion: traefik.io/v1alpha1
@@ -260,7 +309,13 @@ Create these in the release namespace. The chart references them but does not cr
 
 ## 8. Values overlay
 
-Start from [`examples/values-workstation-profile.yaml`](../examples/values-workstation-profile.yaml). Put your real values in `config/site.local.yaml`, which Git ignores:
+Start from [`examples/values-workstation-profile.yaml`](../examples/values-workstation-profile.yaml). It leaves `auth.catalogKey` empty, so set it in your overlay. Put your real values in `$DEPLOY/config/site.local.yaml`; Git ignores `config/*.local.yaml`, and a fresh checkout has no `config/` directory yet:
+
+```sh
+mkdir -p "$DEPLOY/config"
+```
+
+Then write `$DEPLOY/config/site.local.yaml`:
 
 ```yaml
 images:
@@ -279,7 +334,7 @@ auth:
   configKey: auth.json
   catalogKey: catalog.json
   loginKeysSecretName: openmettle-auth-keys
-  providerCaBundle: {enabled: false}
+  providerCaBundle: {enabled: false}   # {enabled: true, configMapName: openmettle-oidc-ca} with a private CA
 ingress:
   hosts: [openmettle.example.test]
   tls: [{secretName: openmettle-tls, hosts: [openmettle.example.test]}]
@@ -296,11 +351,12 @@ telemetry:
 
 Lists replace lists rather than merging, so each `to:` above replaces the example's peers. Storage uses the profile's chart-owned `ReadWriteOnce` claim (`storage.artifacts.size`). That works on one node. On several nodes, use a `ReadWriteMany` class qualified for POSIX `rename`, exclusive create and `fsync` ([Artifact storage](../charts/openmettle-core/README.md#artifact-storage)). On a constrained node, `api.strategy` and `worker.strategy` `{maxSurge: 0, maxUnavailable: 1}` avoid surge pods.
 
-**Check:** render and review before installing:
+**Check:** render and review before installing. Run this and step 9 from `$DEPLOY`:
 
 ```sh
+cd "$DEPLOY"
 helm template openmettle charts/openmettle-core --namespace openmettle \
-  -f examples/values-workstation-profile.yaml -f config/site.local.yaml > /tmp/openmettle.yaml
+  -f examples/values-workstation-profile.yaml -f config/site.local.yaml > "$STAGE/openmettle.yaml"
 ```
 
 The render fails with a message naming any missing or conflicting value.
@@ -331,7 +387,7 @@ Without the Ingress, use `kubectl -n openmettle port-forward service/openmettle-
 
 ## 10. Operator steps on the fresh database
 
-Run these in order, as `openmettle_owner` on the primary, from `$CORE`. Each core script prints one fixed line on success and changes nothing on refusal. Use canonical lowercase UUIDs for the provider, invitation, operator and request IDs, and record them in your change record.
+Run these in order with `PGSERVICE=openmettle-owner`, so each command connects to the primary as `openmettle_owner`. Core's scripts are passed by absolute path, so the working directory does not matter. A refused core script changes nothing and exits non-zero. Each step states what success prints. Use canonical lowercase UUIDs for the provider, invitation, operator and request IDs, and record them in your change record.
 
 ### 10.1 Record the login provider authority
 
@@ -342,6 +398,9 @@ psql -X -v ON_ERROR_STOP=1 \
   -v provider="$provider" -v issuer="$issuer" -v client="$client_id" -v revision="$revision" \
   -v actor="$actor" -v reason="$reason" <<'SQL'
 BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
 INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason)
     VALUES (:'provider', :'issuer', :'client', :'actor', :'reason');
 INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES (:'provider', :'revision');
@@ -349,7 +408,7 @@ COMMIT;
 SQL
 ```
 
-The smoke test runs these statements as the fixture superuser. Running them as `openmettle_owner` is *unverified*. To change the revision later, use the ADR 0013 operator protocol. Do not insert again.
+The `SET LOCAL` lines are the bounds of core ADR 0012's operator transaction. `openmettle_owner` owns both tables (migrations 7 and 8), and ADR 0013 calls for this owner transaction. The kind smoke test runs the two `INSERT`s as the fixture superuser. Success prints `BEGIN`, `SET` three times, `INSERT 0 1` twice and `COMMIT`. To change the revision later, use the ADR 0013 operator protocol. Do not insert again.
 
 ### 10.2 Set the login admission limit
 
@@ -357,31 +416,35 @@ Every sign-in initiation is refused until the outstanding-login limit is set (co
 
 ```sh
 psql -X -q -v expected_limit= -v limit=64 -v actor="$actor" -v reason="$reason" \
-  -f docs/operator/login-admission-limit.psql
+  -f "$CORE/docs/operator/login-admission-limit.psql"
 ```
+
+With `-q`, success prints nothing and exits 0. A refusal prints `operator change refused; no changes committed`.
 
 ### 10.3 Invite the first person
 
-Follow core's [home invitations procedure](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/home-invitations.md). Inspect the provider to get `expected_generation`, which is `0` for a new provider. Then run `docs/operator/home-invitation-create.psql` with the person's exact issuer and `sub`. `redeem_before_ms` may be at most seven days ahead. Run it in an unrecorded terminal. Its second output line is the one-time code: deliver it privately, and keep it out of tickets and logs.
+Follow core's [home invitations procedure](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/home-invitations.md). Inspect the provider to get `expected_generation`, which is `0` for a new provider. Then run `"$CORE/docs/operator/home-invitation-create.psql"` with the person's exact issuer and `sub`. `redeem_before_ms` may be at most seven days ahead. Run it in an unrecorded terminal. Success prints two lines: `home invitation created`, then the one-time code. Deliver the code privately, and keep it out of tickets and logs.
 
 ### 10.4 Storage and run quotas
 
 These are owner-set inputs, and core has no operator script for either. The kind smoke test (`session_seed_sql`) runs the following statements, and the values here are synthetic:
 
-```sql
+```sh
+psql -X -v ON_ERROR_STOP=1 <<'SQL'
 -- Uploads: without these, /v1/artifacts uploads answer 503 provisioning (core ADR 0005).
 UPDATE openmettle.storage_instance SET instance_budget_bytes = 1048576, personal_limit_bytes = 1048576;
 -- Runs: a fresh database enforces metering, so POST /v1/runs answers 503 provisioning
 -- (quota resource_kind usage_tokens, scope personal) until this default exists (core ADR 0040).
 INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
     VALUES ('personal', 'usage_tokens', 1000000);
+SQL
 ```
 
 Project uploads also need `project_limit_bytes`. Size the storage values for your volume, leaving operational headroom (core README, "Schema migrations").
 
 ## 11. First sign-in
 
-**Unverified at this pin.** The API serves the sign-in routes, but no sign-in page. Initiation accepts only a form `POST` whose `Origin` is exactly `browser.origin` (core README, "Browser login handoff"). Core expects the app (openmettle-app) to serve that form, and the chart deploys no app. Until an app is deployed, submit the form from a document already on the application origin:
+**Not exercised in a browser at this pin.** This method was checked against core's `Origin` and Fetch Metadata handling, not run. The API serves the sign-in routes, but no sign-in page. Initiation accepts only a form `POST` whose `Origin` is exactly `browser.origin` (core README, "Browser login handoff"). Core expects the app (openmettle-app) to serve that form, and the chart deploys no app. Until an app is deployed, submit the form from a document already on the application origin:
 
 1. In a desktop browser, open `https://openmettle.example.test/readyz`.
 2. Open the developer console on that tab and run:
@@ -398,7 +461,7 @@ Project uploads also need `project_limit_bytes`. Size the storage values for you
 
 The code travels only in the form body, which the ingress must not log. If `/readyz` ever answers with `Referrer-Policy: no-referrer`, the browser sends `Origin: null` and initiation is refused. A malformed code is refused at once with `login request refused`. A wrong code is refused only after the provider step, with the same message as any other refused sign-in (core `home-invitations.md`).
 
-Redemption creates the user, identity, personal scope and approval. To make this person the first account administrator (optional), follow core's [account administrator procedure](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/account-admin-recovery.md) with `docs/operator/grant-account-admin.psql`. That procedure needs the internal user UUID. Core names no query for it, so this read-only lookup by the invited issuer and subject is not defined by core:
+Redemption creates the user, identity, personal scope and approval. To make this person the first account administrator (optional), follow core's [account administrator procedure](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/account-admin-recovery.md) with `"$CORE/docs/operator/grant-account-admin.psql"`, which prints `account admin grant committed` on success. That procedure needs the internal user UUID. Core names no query for it, so this read-only lookup by the invited issuer and subject is not defined by core:
 
 ```sql
 SELECT user_id FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject';
@@ -432,11 +495,17 @@ const [s2, created] = await post('/v1/runs', 'first-run', run);                 
 
 Sending the same key and body again returns `200` with the same `run_id`. Then `GET /v1/runs/{run_id}` returns the snapshot. These are the endpoint of this guide: a person signed in, called authenticated `/v1` routes and admitted a run. Kind smoke check 10 runs the same conversation, admission, replay and cancel through the API with a seeded session.
 
-| Response | Cause |
+Each symptom below has one cause at the pinned core (`src/auth_config.rs` and `src/v1/submission.rs`):
+
+| Symptom | Cause |
 | --- | --- |
+| API pod crash-loops; the log shows `auth configuration error: model catalog is unreadable or invalid` and exit `78` | `auth.json` names `catalog_file`, but the file is missing or invalid. This includes `auth.catalogKey` left empty, so nothing is mounted at that path |
+| New API pod stays in `ContainerCreating` with a `FailedMount` event naming the auth ConfigMap | `auth.catalogKey` names a key that the ConfigMap does not hold |
 | `503 provisioning` with `quota` `{"resource_kind": "usage_tokens", "scope_kind": "personal"}` | Step 10.4's default is missing |
-| `503 provisioning` without `quota` | `catalog_file`, `admission_limits` or `cursor_keys` is missing from `auth.json`, or `auth.catalogKey` is unset |
-| `429` | An `admission_limits` bound or a quota is exhausted |
+| `503 provisioning` without `quota` | `catalog_file`, `admission_limits` or `cursor_keys` is absent from `auth.json`. The API starts without them |
+| `503 unavailable`, "The run queue is full." | `admission_limits.queued_in_instance` is reached across the instance |
+| `429 rate_limited` | `admission_limits.live_per_actor` or `live_per_scope` is reached |
+| `429 quota` | A quota is exhausted |
 | `401` | No session, or the write's `Origin` is not `browser.origin` |
 
 The run stays queued until `queue_timeout_seconds`. The worker then expires it as `run.failed` with `reason=queue_expired` (kind smoke check 11). To end it sooner, send `POST /v1/runs/{run_id}/cancel` with an `Idempotency-Key`.
@@ -463,6 +532,8 @@ spec:
       restartPolicy: Never
       automountServiceAccountToken: false
       enableServiceLinks: false
+      imagePullSecrets:                               # the images.pullSecrets Secret; omit for a public registry
+        - name: openmettle-registry
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
