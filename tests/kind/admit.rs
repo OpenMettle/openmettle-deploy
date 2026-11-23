@@ -65,6 +65,8 @@ async fn main() {
         capabilities: &[],
         requested_rounds: None,
         now_ms,
+        // No catalog profile: the low-level caller form (core ADR 0040).
+        cost_qualified: None,
     };
     let limits = AdmissionLimits {
         live_per_actor: 1,

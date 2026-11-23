@@ -278,8 +278,11 @@ class FakeArtifacts:
     def __call__(self, port, method, path, headers, body=b""):
         self.calls.append((port, method, path, dict(headers)))
         cookie = headers.get("Cookie", "").partition(f"{smoke.SESSION_COOKIE}=")[2]
-        self.cluster.passwords["session"] = cookie
-        if self.cluster.session is None or headers.get("Origin") != smoke.AUTH_ORIGIN \
+        if cookie:
+            self.cluster.passwords["session"] = cookie
+        if not self.cluster.profile_enabled:
+            response = (404, {}, b"")  # without auth no /v1 route is mounted
+        elif self.cluster.session is None or headers.get("Origin") != smoke.AUTH_ORIGIN \
                 or session_hash(cookie) != self.cluster.session:
             response = self.problem(401, "unauthenticated")
         else:
@@ -375,6 +378,7 @@ class FakeCluster:
         self.readyz = 200
         self.auth_http_overrides = {}
         self.run_admission = ["t" if expected else "f" for _, expected in smoke.RUN_ADMISSION_CHECKS]
+        self.fresh_bootstrap = "t|t"
         self.session = None  # (session id, secret hash hex) as seeded
         self.replaced = False
         self.admitted_at = None
@@ -552,16 +556,20 @@ class FakeCluster:
         return self.admitted_at is not None and smoke.time.monotonic() >= self.admitted_at + smoke.QUEUE_TIMEOUT_SECONDS
 
     def database(self, sql):
-        """`psql` on stdin in the fixture database: migration history, migration 19 grants, session seed."""
+        """`psql` on stdin in the fixture database: migration history, migration 19 grants, fresh-install
+        markers, session seed."""
         if "openmettle._sqlx_migrations" in sql:
-            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in (17, 18, 19, 20)), ""
+            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in range(17, 28)), ""
+        if sql == smoke.FRESH_BOOTSTRAP_SQL:
+            return 0, self.fresh_bootstrap + "\n", ""
         if "xmin::text" in sql:
             state, terminals = ("failed", 1) if self.expired else ("queued", 0)
             return 0, f"{RUN_ID}|{state}|12|1234|t|{terminals}\n", ""
         if sql == smoke.run_admission_sql():
             return 0, "|".join(self.run_admission) + "\n", ""
         seeded = re.search(r"SELECT '([A-Za-z0-9_-]{43})', decode\('([0-9a-f]{64})', 'hex'\)", sql)
-        if seeded and "INSERT INTO openmettle.local_sessions" in sql and "personal_limit_bytes" in sql:
+        if seeded and "INSERT INTO openmettle.local_sessions" in sql and "personal_limit_bytes" in sql \
+                and "VALUES ('personal', 'usage_tokens', " in sql:
             self.session = seeded.groups()
             return 0, "", ""
         self.unknown.append(["psql", sql])
@@ -942,6 +950,13 @@ class OrchestrationTest(unittest.TestCase):
         optional_check = next(c for c in report["checks"] if "no optional package present" in c["check"])
         self.assertEqual(optional_check["unmounted_http"],
                          {"/auth/session": 404, "/auth/native/session": 404, "/v1/capabilities": 404})
+        quota_names = [f"{m} {p}" for m, p in smoke.QUOTA_ROUTES]
+        self.assertEqual(optional_check["unmounted_quota_routes"], dict.fromkeys(quota_names, 404))
+        self.assertEqual(profile_check["quota_routes"], dict.fromkeys(quota_names, 401))
+        # Both profiles send every quota route through the API Service with no session, Origin or key.
+        quota_calls = [c for c in self.fake.artifacts.calls if not c[2].startswith("/v1/artifacts")]
+        self.assertEqual([(port, method, path, headers) for port, method, path, headers in quota_calls],
+                         [(8080, m, p, {}) for m, p in smoke.QUOTA_ROUTES] * 2)
         self.assertEqual(optional_check["issuance"], {"api_pods": 1, "api_issuance_env": False, "issuance_pool": None,
                                                       "worker_isolated": True, "migrate_isolated": True})
         self.assertEqual(profile_check["issuance"], {"api_pods": 2, "api_issuance_env": True, "issuance_pool": "2",
@@ -950,19 +965,22 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(install_check["latest_version"], smoke.REQUIRED_MIGRATION)
         self.assertEqual(install_check["run_admission"], {"dispatch_lock_singleton": True,
                                                           "privileges_checked": len(smoke.RUN_ADMISSION_CHECKS) - 1})
+        self.assertEqual(install_check["fresh_bootstrap"], {"metering_and_overrides_enforced": True,
+                                                            "artifact_volume_unpinned_auto_pin_allowed": True})
         self.assertEqual(profile_check["artifacts"], {
             "session": "synthetic browser session (cookie channel)", "api_pods": 2, "revisions": 2,
             "idempotent_retry": "same revision from the other replica",
             "downloads": {"full_bytes": len(smoke.ARTIFACT_PAYLOADS[1]), "range": "bytes=0-9", "range_status": 206,
                           "unsatisfiable_status": 416}})
         # Writes alternate between the two API pods; every read goes to the pod that did not write.
-        self.assertEqual([(port, method, path.split("?")[0].count("/")) for port, method, path, _ in self.fake.artifacts.calls],
+        artifact_calls = [c for c in self.fake.artifacts.calls if c[2].startswith("/v1/artifacts")]
+        self.assertEqual([(port, method, path.split("?")[0].count("/")) for port, method, path, _ in artifact_calls],
                          [(9000, "POST", 2), (9001, "POST", 2), (9000, "POST", 4), (9001, "GET", 5),
                           (9001, "GET", 6), (9001, "GET", 6), (9001, "GET", 6)])
-        self.assertEqual([h.get("Range") for *_, h in self.fake.artifacts.calls][-3:],
+        self.assertEqual([h.get("Range") for *_, h in artifact_calls][-3:],
                          [None, "bytes=0-9", smoke.UNSATISFIABLE_RANGE])
         # The idempotent retry used another boundary under the same key; the revision a new key.
-        keys = [(h.get("Idempotency-Key"), h.get("Content-Type")) for *_, h in self.fake.artifacts.calls[:3]]
+        keys = [(h.get("Idempotency-Key"), h.get("Content-Type")) for *_, h in artifact_calls[:3]]
         self.assertEqual([k for k, _ in keys], ["kind-smoke-create", "kind-smoke-create", "kind-smoke-revision"])
         self.assertNotEqual(keys[0][1], keys[1][1])
         self.assertEqual(len(self.fake.artifacts.revisions), 2)
@@ -1124,7 +1142,8 @@ class OrchestrationTest(unittest.TestCase):
 
     def test_a_v1_failure_echoing_the_session_cookie_is_redacted(self):
         def echo(method, path, headers, response):
-            return 500, response[1], ("echo " + headers["Cookie"]).encode()
+            if path.startswith("/v1/artifacts"):
+                return 500, response[1], ("echo " + headers["Cookie"]).encode()
         self.fake.artifacts.doctor = echo
         status, report, stderr = self.run_main()
         self.assertEqual(status, 1)
@@ -1335,8 +1354,23 @@ class OrchestrationTest(unittest.TestCase):
                     "env", [{"name": "OPENMETTLE_WORKER_AUTH_CONFIG", "value": smoke.AUTH_CONFIG_PATH}])),
                 when=revision(4)), "worker container must not receive AUTH_CONFIG env"),
             "migration history before the run admission migration": (doctor_output(
-                ["exec", "--stdin", "deployment/postgres", "psql"], stdout="1|t|aa|t\n18|t|bb|t\n"),
-                "before the worker lease migration 20"),
+                ["exec", "--stdin", "deployment/postgres", "psql"], stdout="1|t|aa|t\n26|t|bb|t\n"),
+                "before the fenced capacity migration 27"),
+            "upgraded rather than fresh quota markers": (
+                lambda args, result: setattr(fake_ref(), "fresh_bootstrap", "f|t"),
+                "fresh-install quota and artifact-volume markers are 'f|t'"),
+            "default install mounts a quota route": (HttpDoctor(
+                lambda m, p, h, r: m == "PUT" and not fake_ref().profile_enabled,
+                replace=lambda r: fake_ref().artifacts.problem(401, "unauthenticated")),
+                f"unmounted PUT /v1/admin/scopes/{smoke.QUOTA_SCOPE}/quotas/usage_tokens: HTTP 401, expected 404"),
+            "quota summary served without a session": (HttpDoctor(
+                lambda m, p, h, r: p == "/v1/quotas/personal" and fake_ref().profile_enabled,
+                replace=lambda r: FakeArtifacts.reply(200, {"items": []})),
+                "GET /v1/quotas/personal: HTTP 200, expected 401"),
+            "quota revoke refusal with another code": (HttpDoctor(
+                lambda m, p, h, r: p.endswith("/revoke") and fake_ref().profile_enabled,
+                lambda doc, body: doc.__setitem__("code", "forbidden")),
+                "/quotas/usage_tokens/revoke: unexpected 401 problem"),
             "run_dispatch_lock singleton row missing": (
                 lambda args, result: fake_ref().run_admission.__setitem__(0, "f"),
                 f"(SELECT count(*) = 1 AND bool_and(id AND NOT lock_guard) FROM {smoke.RUN_DISPATCH_LOCK}) "
@@ -1354,7 +1388,8 @@ class OrchestrationTest(unittest.TestCase):
                 lambda args, result: setattr(fake_ref(), "session", None) if fake_ref().session else None,
                 "POST /v1/artifacts: HTTP 401, expected 201"),
             "artifact upload sha256 differs": (HttpDoctor(
-                lambda m, p, h, r: m == "POST", lambda doc, body: doc.__setitem__("sha256", "0" * 64)),
+                lambda m, p, h, r: m == "POST" and p.startswith("/v1/artifacts"),
+                lambda doc, body: doc.__setitem__("sha256", "0" * 64)),
                 "artifact revision 1:"),
             "artifact retry creates another revision": (HttpDoctor(
                 lambda m, p, h, r: smoke.ARTIFACT_BOUNDARIES[1] in h.get("Content-Type", ""),
@@ -1365,11 +1400,12 @@ class OrchestrationTest(unittest.TestCase):
                 lambda doc, body: doc.__setitem__("artifact_id", "00000000-0000-4000-8000-0000000000ff")),
                 "revision 2 did not append a new revision to the same artifact"),
             "revision metadata differs": (HttpDoctor(
-                lambda m, p, h, r: m == "GET" and not p.endswith("/content"),
+                lambda m, p, h, r: m == "GET" and p.startswith("/v1/artifacts") and not p.endswith("/content"),
                 lambda doc, body: doc.__setitem__("created_at", "2026-11-20T11:00:00Z")),
                 "revision 2 metadata differs from its upload response"),
             "v1 response lacks no-store": (HttpDoctor(
-                lambda m, p, h, r: m == "GET", headers=lambda hs: hs.pop("cache-control")),
+                lambda m, p, h, r: m == "GET" and p.startswith("/v1/artifacts"),
+                headers=lambda hs: hs.pop("cache-control")),
                 "missing OpenMettle-API-Version 1.0 or Cache-Control no-store"),
             "download lacks nosniff": (HttpDoctor(
                 lambda m, p, h, r: p.endswith("/content") and "Range" not in h,
@@ -2074,6 +2110,71 @@ class IngressReplayTest(unittest.TestCase):
         self.assertEqual(seen, [smoke.INGRESS_HOST, (smoke.INGRESS_HOST, "start")])
 
 
+class FreshBootstrapTest(unittest.TestCase):
+    def test_query_reads_both_singleton_markers(self):
+        sql = smoke.FRESH_BOOTSTRAP_SQL
+        for fragment in ("metering_enforced AND metering_enforced_at IS NOT NULL", "overrides_enforced AND",
+                         "overrides_enforced_at IS NOT NULL", "bootstrap_auto_pin_allowed AND volume_id IS NULL",
+                         "FROM openmettle.quota_enforcement CROSS JOIN openmettle.storage_volume_control;"):
+            self.assertIn(fragment, sql)
+
+    def test_evaluate(self):
+        self.assertEqual(smoke.evaluate_fresh_bootstrap("t|t\n"), {
+            "metering_and_overrides_enforced": True, "artifact_volume_unpinned_auto_pin_allowed": True})
+        # An upgraded database (f|f), a pinned volume (t|f), a NULL marker or a missing row all fail.
+        for output in ("f|f", "t|f", "f|t", "|t", "", "t|t|t"):
+            with self.subTest(output=output), self.assertRaisesRegex(smoke.SmokeFailure, "expected 't\\|t'"):
+                smoke.evaluate_fresh_bootstrap(output)
+
+
+class QuotaRoutesTest(unittest.TestCase):
+    PROBLEM = {"type": "about:blank", "title": "t", "status": 401, "detail": "d", "code": "unauthenticated",
+               "request_id": "11111111-1111-4111-8111-111111111111"}
+    HEADERS = {"openmettle-api-version": smoke.V1_API_VERSION, "cache-control": "no-store",
+               "content-type": "application/problem+json"}
+
+    def responses(self, status=401, headers=None, body=None):
+        body = json.dumps(self.PROBLEM).encode() if body is None else body
+        return {f"{m} {p}": (status, dict(self.HEADERS if headers is None else headers), body)
+                for m, p in smoke.QUOTA_ROUTES}
+
+    def test_routes_cover_the_four_quota_operations(self):
+        self.assertEqual([m for m, _ in smoke.QUOTA_ROUTES], ["GET", "GET", "PUT", "POST"])
+        self.assertEqual([p.replace(smoke.QUOTA_SCOPE, "{id}") for _, p in smoke.QUOTA_ROUTES], [
+            "/v1/quotas/personal", "/v1/projects/{id}/quotas", "/v1/admin/scopes/{id}/quotas/usage_tokens",
+            "/v1/admin/scopes/{id}/quotas/usage_tokens/revoke"])
+        self.assertRegex(smoke.QUOTA_SCOPE, smoke.UUID)
+
+    def test_mounted_requires_a_versioned_unauthenticated_problem(self):
+        self.assertEqual(smoke.evaluate_quota_routes(self.responses(), mounted=True),
+                         {f"{m} {p}": 401 for m, p in smoke.QUOTA_ROUTES})
+        problem = "unexpected 401 problem"
+        cases = [
+            ("HTTP 404, expected 401", self.responses(status=404)),
+            ("missing OpenMettle-API-Version", self.responses(headers={**self.HEADERS, "cache-control": "max-age=60"})),
+            ("401 body is not JSON", self.responses(body=b"unauthorized")),
+            (problem, self.responses(body=json.dumps({**self.PROBLEM, "code": "forbidden"}).encode())),
+            (problem, self.responses(body=json.dumps({**self.PROBLEM, "status": 403}).encode())),
+            (problem, self.responses(body=b"[]")),
+            (problem, self.responses(headers={**self.HEADERS, "content-type": "application/json"})),
+        ]
+        for message, responses in cases:
+            with self.subTest(message), self.assertRaisesRegex(smoke.SmokeFailure, re.escape(message)):
+                smoke.evaluate_quota_routes(responses, mounted=True)
+        partial = self.responses()
+        missing = f"{smoke.QUOTA_ROUTES[-1][0]} {smoke.QUOTA_ROUTES[-1][1]}"
+        del partial[missing]
+        with self.assertRaisesRegex(smoke.SmokeFailure, re.escape(f"{missing}: no response")):
+            smoke.evaluate_quota_routes(partial, mounted=True)
+
+    def test_unmounted_requires_404(self):
+        self.assertEqual(smoke.evaluate_quota_routes(self.responses(404, {}, b""), mounted=False),
+                         {f"{m} {p}": 404 for m, p in smoke.QUOTA_ROUTES})
+        for status in (401, 200, 405):
+            with self.subTest(status=status), self.assertRaisesRegex(smoke.SmokeFailure, "expected 404"):
+                smoke.evaluate_quota_routes(self.responses(status), mounted=False)
+
+
 class SessionSeedTest(unittest.TestCase):
     RAW = bytes(range(64))
 
@@ -2095,6 +2196,10 @@ class SessionSeedTest(unittest.TestCase):
         self.assertIn(f"SELECT '{session_id}', decode('{secret_hash}', 'hex'), '{login}'", sql)
         self.assertIn(f"SET instance_budget_bytes = {smoke.STORAGE_LIMIT_BYTES}, "
                       f"personal_limit_bytes = {smoke.STORAGE_LIMIT_BYTES}", sql)
+        # A fresh install enforces metering: admission needs the personal usage_tokens limit.
+        self.assertIn("INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)\n"
+                      f"    VALUES ('personal', 'usage_tokens', {smoke.PERSONAL_TOKEN_LIMIT});", sql)
+        self.assertGreater(smoke.PERSONAL_TOKEN_LIMIT, 0)
         self.assertGreater(smoke.STORAGE_LIMIT_BYTES, 2 * smoke.ARTIFACT_MAX_BYTES)
         self.assertGreaterEqual(smoke.ARTIFACT_MAX_BYTES, max(map(len, smoke.ARTIFACT_PAYLOADS)))
         for table in ("login_providers", "login_provider_revisions", "users", "scopes", "user_identities",
@@ -2266,11 +2371,15 @@ class FixtureTest(unittest.TestCase):
         fixture = self.find("Secret", "postgres-fixture")
         self.assertEqual(fixture["metadata"]["namespace"], smoke.DB_NAMESPACE)
         sql = fixture["stringData"]["provision.sql"]
-        # Four disjoint login roles before migration 1; migration 18 refuses without openmettle_issuance.
+        # Four disjoint login roles before migration 1; migration 18 refuses without openmettle_issuance
+        # and migration 23 without openmettle_gateway, which no chart process logs in as.
         self.assertEqual(sorted(re.findall(r"CREATE ROLE (\w+) ", sql)),
-                         ["openmettle_api", "openmettle_issuance", "openmettle_owner", "openmettle_worker"])
+                         ["openmettle_api", "openmettle_gateway", "openmettle_issuance", "openmettle_owner",
+                          "openmettle_worker"])
         for role in smoke.DB_LOGINS:
             self.assertIn(f"CREATE ROLE {smoke.DB_ROLE[role]} LOGIN PASSWORD '{PASSWORDS[role]}';", sql)
+        self.assertIn(f"CREATE ROLE {smoke.GATEWAY_ROLE} NOLOGIN;\n", sql)
+        self.assertNotIn("gateway", " ".join(smoke.SECRET.values()) + " ".join(smoke.DB_ROLE.values()))
         self.assertIn("CREATE DATABASE openmettle OWNER openmettle_owner;", sql)
         self.assertNotRegex(sql, r"SUPERUSER|CREATEROLE|CREATEDB|GRANT")
 
