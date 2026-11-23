@@ -9,8 +9,9 @@ migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-pro
 API-only auth + /v1/* mounts and session issuance credential, and a live /v1/artifacts upload,
 idempotent retry, revision and byte-range download round trip across both API replicas on the
 PVC), uninstall (with chart-owned PVC preservation), absence of optional packages, issuance
-settings and unmounted 404 routes on default install, migrations 19/20 role grants,
-queued-run SSE replay, API pod replacement and worker expiry through HTTPS ingress,
+settings and unmounted 404 routes on default install, migrations 19/20 role grants, the
+fresh-install quota and artifact-volume markers of migrations 24/26, the unauthenticated posture of
+the /v1 quota routes, queued-run SSE replay, API pod replacement and worker expiry through HTTPS ingress,
 Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
 live cluster, Helm, HTTP or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
@@ -82,7 +83,10 @@ DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "o
 # Every PostgreSQL login the fixture provisions: one per image role, plus the API-only session
 # issuance login (core ADR 0030), which core migration 18 requires before it runs.
 DB_LOGINS = (*ROLES, "issuance")
-REQUIRED_MIGRATION = 20
+# Core migration 23 refuses unless a restricted openmettle_gateway role exists (core ADR 0037). The chart
+# runs no gateway reconciliation process, so the fixture creates the role without a login or password.
+GATEWAY_ROLE = "openmettle_gateway"
+REQUIRED_MIGRATION = 27
 RUN_DISPATCH_LOCK = "openmettle.run_dispatch_lock"
 # Migration 19 role boundaries, read live as the fixture superuser: each expression and its expected
 # value. The worker locks the singleton dispatch row through an inert column and records claims; the
@@ -106,6 +110,22 @@ RUN_ADMISSION_CHECKS = (
       for column in ("lease_expires_at", "execution_expires_at", "cancel_reason")),
     (f"has_any_column_privilege('openmettle_api', '{RUN_DISPATCH_LOCK}', 'SELECT')", False),
     (f"has_any_column_privilege('openmettle_api', '{RUN_DISPATCH_LOCK}', 'UPDATE')", False),
+)
+# Migrations 24 and 26 applied to an empty database (openmettle-migrate's bootstrap_from_zero): metering
+# and override enforcement start active, and the API may pin the still-unpinned artifact store (core ADR
+# 0040). An upgraded database reads f|f here until an operator activates it.
+FRESH_BOOTSTRAP_SQL = (
+    "SELECT metering_enforced AND metering_enforced_at IS NOT NULL AND overrides_enforced"
+    " AND overrides_enforced_at IS NOT NULL, bootstrap_auto_pin_allowed AND volume_id IS NULL"
+    " FROM openmettle.quota_enforcement CROSS JOIN openmettle.storage_volume_control;")
+# The four /v1 quota operations (core ADR 0040, V1-17). Mounted, a request without a session is 401 before
+# any path, key or body check; unmounted, every /v1 path is 404. The identifier is synthetic.
+QUOTA_SCOPE = "00000000-0000-4000-8000-00000000b001"
+QUOTA_ROUTES = (
+    ("GET", "/v1/quotas/personal"),
+    ("GET", f"/v1/projects/{QUOTA_SCOPE}/quotas"),
+    ("PUT", f"/v1/admin/scopes/{QUOTA_SCOPE}/quotas/usage_tokens"),
+    ("POST", f"/v1/admin/scopes/{QUOTA_SCOPE}/quotas/usage_tokens/revoke"),
 )
 ISSUANCE_URL_ENV = "OPENMETTLE_API_ISSUANCE_DATABASE_URL"
 ISSUANCE_POOL_ENV = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
@@ -147,6 +167,8 @@ SESSION_IDS = {"provider": "00000000-0000-4000-8000-00000000a001", "user": "0000
                "identity": "00000000-0000-4000-8000-00000000a003", "approval": "00000000-0000-4000-8000-00000000a004"}
 # Uploads need configured storage limits (else 503 provisioning); max_bytes bounds each reservation.
 STORAGE_LIMIT_BYTES = 1 << 20
+# A fresh install enforces metering, so run admission needs a personal usage_tokens limit (core ADR 0040).
+PERSONAL_TOKEN_LIMIT = 1_000_000
 ARTIFACT_MAX_BYTES = 1024
 ARTIFACT_FILENAME = "smoke.txt"
 ARTIFACT_MEDIA_TYPE = "text/plain"
@@ -170,7 +192,8 @@ ALLOWED_LOG_FIELDS = {
     "timestamp", "level", "event", "role", "signal", "request_id",
     "http.route", "http.request.method", "http.response.status_code",
     "duration_us", "error.type", "schema_version", "dropped_lines", "dropped_spans",
-    "dropped_metric_exports",
+    "dropped_metric_exports", "target_kind", "scope_kind", "resource_kind", "threshold_pct",
+    "dedupe_bucket", "gateway.step",
 }
 # NetworkPolicy fixtures. The app namespace denies all traffic by default, as the owner's application
 # namespaces do; the release must work under it. PEER is a second PostgreSQL server in the database
@@ -453,11 +476,12 @@ def fixture_manifests(postgres_image: str, passwords: dict, run_id: str) -> dict
 
     passwords holds per-run random values for admin and each login in DB_LOGINS. Provisioning follows
     core README "Schema migrations": four login roles (owner, api, issuance, worker), created before
-    migration 1, and one database owned by the owner role.
+    migration 1, and one database owned by the owner role. GATEWAY_ROLE is created without a login.
     """
     labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
     sql = "".join(f"CREATE ROLE {DB_ROLE[role]} LOGIN PASSWORD '{passwords[role]}';\n"
                   for role in DB_LOGINS)
+    sql += f"CREATE ROLE {GATEWAY_ROLE} NOLOGIN;\n"
     sql += "CREATE DATABASE openmettle OWNER openmettle_owner;\n"
     selector = POSTGRES_LABELS
     items = [
@@ -923,6 +947,40 @@ def evaluate_run_admission(output: str) -> dict:
     return {"dispatch_lock_singleton": True, "privileges_checked": len(RUN_ADMISSION_CHECKS) - 1}
 
 
+def evaluate_fresh_bootstrap(output: str) -> dict:
+    """FRESH_BOOTSTRAP_SQL's one psql -tA row: both markers must be true."""
+    if output.strip() != "t|t":
+        raise SmokeFailure(f"fresh-install quota and artifact-volume markers are {output.strip()!r}, "
+                           "expected 't|t'")
+    return {"metering_and_overrides_enforced": True, "artifact_volume_unpinned_auto_pin_allowed": True}
+
+
+def evaluate_quota_routes(responses: dict, *, mounted: bool) -> dict:
+    """Each QUOTA_ROUTES (status, headers, body) for a request without a session. Mounted: a versioned,
+    uncacheable 401 `unauthenticated` problem. Unmounted: 404."""
+    statuses = {}
+    for method, path in QUOTA_ROUTES:
+        name = f"{method} {path}"
+        if name not in responses:
+            raise SmokeFailure(f"{name}: no response")
+        status, headers, body = responses[name]
+        if not mounted:
+            if status != 404:
+                raise SmokeFailure(f"unmounted {name}: HTTP {status}, expected 404")
+        else:
+            expect_v1(name, responses[name], 401)
+            try:
+                problem = json.loads(body)
+            except ValueError as exc:
+                raise SmokeFailure(f"{name}: 401 body is not JSON") from exc
+            if not str(headers.get("content-type", "")).startswith("application/problem+json") \
+                    or not isinstance(problem, dict) or problem.get("status") != 401 \
+                    or problem.get("code") != "unauthenticated":
+                raise SmokeFailure(f"{name}: unexpected 401 problem {problem!r}")
+        statuses[name] = status
+    return statuses
+
+
 def b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -940,7 +998,8 @@ def session_credential(raw: bytes) -> tuple:
 
 def session_seed_sql(session_id: str, secret_hash: str, login_id: str) -> str:
     """One personal-scope user with an active approval and a browser session stored as issuance
-    stores it, plus storage limits. Only the hash reaches the database, never the secret."""
+    stores it, plus storage limits and a personal usage_tokens limit. Only the hash reaches the
+    database, never the secret."""
     if not (B64_ID.fullmatch(session_id) and B64_ID.fullmatch(login_id)
             and re.fullmatch(r"[0-9a-f]{64}", secret_hash)):
         raise SmokeFailure("malformed synthetic session values")
@@ -972,6 +1031,8 @@ INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, i
       FROM openmettle.login_provider_revisions WHERE provider_id = '{ids['provider']}';
 UPDATE openmettle.storage_instance
     SET instance_budget_bytes = {STORAGE_LIMIT_BYTES}, personal_limit_bytes = {STORAGE_LIMIT_BYTES};
+INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+    VALUES ('personal', 'usage_tokens', {PERSONAL_TOKEN_LIMIT});
 """
 
 
@@ -1585,6 +1646,15 @@ class Smoke:
     def completions(self) -> list:
         return job_completions(self.events("involvedObject.kind=Job"), f"{FULLNAME}-migrate")
 
+    def quota_route_responses(self) -> dict:
+        """Each QUOTA_ROUTES request without a cookie, Origin or Authorization, through the API Service."""
+        forward = PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080)
+        try:
+            return {f"{method} {path}": http_exchange(forward.port, method, path, {})
+                    for method, path in QUOTA_ROUTES}
+        finally:
+            forward.close()
+
     def seed_session(self) -> str:
         """Seed a synthetic browser session; return its cookie value, which is redacted from then on."""
         session_id, cookie, secret_hash = session_credential(secrets.token_bytes(64))
@@ -1799,6 +1869,7 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
             **MOUNTED_AUTH_HTTP,
         })
         auth_routes = evaluate_mounted_auth_http({path: exchanged[path] for path in AUTH_ROUTE_PATHS})
+        quota_routes = evaluate_quota_routes(self.quota_route_responses(), mounted=True)
         pdb = self.wait_for(
             "API PodDisruptionBudget disruptionsAllowed >= 1",
             lambda: evaluate_pdb(self.kube_json("--namespace", APP_NAMESPACE,
@@ -1829,11 +1900,12 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                 timeout=30)
         auth_summary = {**auth_mounts, "checked_pods": len(profile["pods"]["api"]), "routes": auth_routes}
         self.passed("enabled-profile upgrade: API replicas=2, PDB, artifact PVC and ARTIFACTS_DIR store, auth + /v1/* mounts, "
-                    "API-only issuance credential, /v1/artifacts upload, retry, revision and byte ranges on the PVC, "
-                    "and JSON/debug logs",
+                    "unauthenticated /v1 quota routes 401, API-only issuance credential, /v1/artifacts upload, "
+                    "retry, revision and byte ranges on the PVC, and JSON/debug logs",
                     ready_replicas=profile["ready_replicas"],
                     healthz=exchanged["/healthz"][0], readyz=exchanged["/readyz"][0],
-                    pdb=pdb, pvc=pvc, auth=auth_summary, issuance=issuance, artifacts=artifacts,
+                    pdb=pdb, pvc=pvc, auth=auth_summary, quota_routes=quota_routes, issuance=issuance,
+                    artifacts=artifacts,
                     logs=logs_summary)
         self.passed("HTTPS ingress queued run replay and worker expiry",
                     **self.ingress_replay(cookie, cert))
@@ -1850,9 +1922,10 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         self.expect(history and all(row[1] == "t" for row in history),
                     "migration history is empty or has a failed entry")
         self.expect(int(history[-1][0]) >= REQUIRED_MIGRATION,
-                    f"migration history ends at version {history[-1][0]}, before the worker lease "
+                    f"migration history ends at version {history[-1][0]}, before the fenced capacity "
                     f"migration {REQUIRED_MIGRATION}")
         run_admission = evaluate_run_admission(self.psql(run_admission_sql()))
+        fresh_bootstrap = evaluate_fresh_bootstrap(self.psql(FRESH_BOOTSTRAP_SQL))
         created = {c: parse_time(self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
                                                 f"{FULLNAME}-{c}")["metadata"]["creationTimestamp"])
                    for c in WORKLOADS}
@@ -1864,9 +1937,9 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         self.expect(present == sorted(references),
                     f"kubelet did not report every digest reference as present: {present}")
         self.passed("install by digest: migrate hook completed before Deployments; API and worker Ready; "
-                    "migrations 19/20 role boundaries",
+                    "migrations 19/20 role boundaries; fresh-install quota and artifact-volume markers",
                     migrations_applied=len(history), latest_version=int(history[-1][0]),
-                    run_admission=run_admission,
+                    run_admission=run_admission, fresh_bootstrap=fresh_bootstrap,
                     ready_replicas=installed["ready_replicas"], readyz=installed["readyz"],
                     images_present=len(present))
 
@@ -1894,10 +1967,11 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         extra = unexpected_resources(all_pods)
         self.expect(not extra, f"pods request optional resources: {extra}")
         unmounted_http = self.probe_api_http(AUTH_ROUTE_PATHS, expected_status=404)
+        unmounted_quota = evaluate_quota_routes(self.quota_route_responses(), mounted=False)
         issuance = check_issuance_env({c: self.pods(c) for c in WORKLOADS},
                                       self.helm_run("get", "hooks", RELEASE).stdout, enabled=False)
         self.passed("no optional package present", release_objects=inventory, helm_releases=1,
-                    unmounted_http=unmounted_http, issuance=issuance)
+                    unmounted_http=unmounted_http, unmounted_quota_routes=unmounted_quota, issuance=issuance)
 
         namespace = self.kube_json("get", "namespace", APP_NAMESPACE)["metadata"]["labels"]
         self.expect(namespace.get("pod-security.kubernetes.io/enforce") == "restricted",

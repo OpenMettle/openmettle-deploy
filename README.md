@@ -6,6 +6,8 @@ Generic Kubernetes/Helm packaging for the [accepted architecture](https://github
 
 Wave 18a pins core to `2d3bc21` (migration 20). Set `worker.sweepMs` to an integer from 1000 through 3600000 to change the worker maintenance interval. Its default, `null`, uses the core interval. The enabled kind profile sets it to 1000 and provisions separate API cursor keys. Its HTTPS ingress check follows one queued run across disconnect, periodic heartbeats, replacement of both API replicas and worker-driven queue expiry. The hosted `kind-smoke` job reports the live result. [Settings and rerun procedure](tests/kind/README.md#queued-run-replay-through-https-ingress)
 
+The current pin is core `24808cb` (migrations 21–27), with no template changes. Provision a restricted `openmettle_gateway` role before migration 23. On an existing database, follow core's storage-adoption and quota upgrade runbook; see [Quotas from migrations 24–27](charts/openmettle-core/README.md#quotas-from-migrations-2427). `kind-smoke` also checks that migration reaches 27 from an empty database with quota enforcement active, and that the `/v1` quota routes answer `404` unmounted and `401` without a session.
+
 ## Package boundaries
 
 - `charts/openmettle-core`: CPU-only API/worker core and its configured PostgreSQL/storage integrations. It must render without a GPU, DRA API or vendor operator.
