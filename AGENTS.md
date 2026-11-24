@@ -15,10 +15,20 @@ Read the README and relevant documentation before changing code. This repository
 
 ## OpenMettle delivery
 
-- Read the accepted baseline linked from README and the ticket acceptance/dependencies before implementing.
-- Update and follow the project tickets and sprint board when possible: check ticket scope before coding, record delivered increments, audit/review findings and remaining gaps on the owning issues, and place follow-up items into an appropriate sprint without closing parent tickets early.
+- Read the accepted baseline linked from README before implementing.
 - Keep backend API delivery ahead of Flutter. Preserve private user/project scopes and server-authoritative permissions.
 - Work in a branch and open a focused PR. The owner performs merges, releases, IDE installs and live rollouts.
 - Bootstrap scaffolding does not satisfy V1-01, V1-32 or V1-33 acceptance. Keep implementation and qualification claims separate.
 - Record dependency versions, origin and licence before reuse. Do not copy or translate restricted Open WebUI implementation into these repositories.
 - Keep real site details and personal identifiers out of tracked examples. Use synthetic test data.
+
+## Ticket and sprint coordination
+
+[Project 1](https://github.com/orgs/OpenMettle/projects/1) and the [delivery tracker](https://github.com/OpenMettle/openmettle-core/issues/1) are the live work index. This policy applies to every ticket, including delegated work.
+
+- **Accountability:** the main (coordinating) agent owns task selection, scope control and tracker reconciliation. Delegating work does not transfer these duties.
+- **Check before work:** before implementing or delegating, after resuming or recovering context, and before starting another ticket, fetch the live issue, its Project 1 fields and the relevant sprint record. Check the acceptance criteria, dependencies, recent relevant comments and existing PRs. Then briefly state the selected issue, its sprint or goal and the bounded scope.
+- **Scope:** give each subagent an explicit assignment and the evidence it must return. Record unrelated discoveries and out-of-scope review findings as follow-up issues in Project 1, in an appropriate sprint or the backlog. Preserve agreed priorities, historical sprint assignments and capacity decisions. Follow explicit user-directed scope changes and record them on the sprint record.
+- **Tracking updates:** when work starts, reaches review or is handed off, reconcile the owning issue, its Project 1 status and the relevant sprint record. Record PR links, the verification actually run, remaining gaps and next steps. Read each update back to confirm that it persisted.
+- **Completion:** close an issue or set it to Done only when its full acceptance criteria and any applicable owner gates are met. Keep partial increments and unfinished parent issues open.
+- **Access failures:** if a tracker read or write fails, report it and list the outstanding updates. Continue only clearly authorized work. Do not guess missing state or claim that synchronization succeeded.
