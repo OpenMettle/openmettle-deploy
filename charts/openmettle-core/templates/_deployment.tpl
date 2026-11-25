@@ -6,6 +6,7 @@ Arguments: dict "root" $ "component" "api|worker|gateway-<name>" "port" <contain
 */}}
 {{- define "openmettle-core.deployment" -}}
 {{- $root := .root -}}
+{{- include "openmettle-core.validate.booleans" $root -}}
 {{- $component := .component -}}
 {{- $role := default $component .role -}}
 {{- $values := default (index $root.Values $component) .values -}}
@@ -76,7 +77,7 @@ spec:
               value: {{ int64 $settings.shutdownTimeoutMs | quote }}
             {{- if eq $role "gateway" }}
             - name: OPENMETTLE_GATEWAY_MODEL
-              value: {{ $values.model | quote }}
+              value: {{ replace "$" "$$" $values.model | quote }}
             - name: OPENMETTLE_GATEWAY_UPSTREAM_URL
               value: {{ $values.upstreamUrl | quote }}
             - name: OPENMETTLE_GATEWAY_CACHE_MODE

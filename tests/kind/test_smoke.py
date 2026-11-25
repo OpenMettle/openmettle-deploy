@@ -1562,6 +1562,13 @@ class OrchestrationTest(unittest.TestCase):
                                                          f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"])
                                       else None),
                 "NetworkPolicy is not enforced"),
+            "gateway tls topology leaks to egress-unrestricted postgres": (
+                lambda args, result: (subprocess.CompletedProcess(args, 0, "HTTP/1.1 200 OK\r\n", "")
+                                      if fake_ref().revision == 6
+                                      and matches(args, ["exec", "deployment/postgres",
+                                                         f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"])
+                                      else None),
+                "NetworkPolicy is not enforced"),
             "gateway leaks Authorization to stand-in": (HttpDoctor(
                 lambda m, p, h, r: (m, p) == ("GET", "/_recorded"),
                 lambda doc, body: doc[-1]["headers"].__setitem__("authorization", ["Bearer leaked"])),
@@ -3070,6 +3077,10 @@ class GatewayAndInferenceHelpersTest(unittest.TestCase):
         self.assertIn("openmettle.gateway_dispatch_scoped(uuid,bytea)", sql)
         self.assertIn(smoke.GATEWAY_SETTLE_FN, sql)
         self.assertIn("to_regclass('openmettle.gateway_bindings') IS NULL", sql)
+        for priv in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+            self.assertIn(f"has_table_privilege('openmettle_gateway', cl.oid, '{priv}')", sql)
+        for priv in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
+            self.assertIn(f"has_any_column_privilege('openmettle_gateway', cl.oid, '{priv}')", sql)
         good = "|".join("t" if expected else "f" for _, expected in smoke.GATEWAY_SCHEMA_CHECKS)
         self.assertEqual(smoke.evaluate_gateway_schema(good + "\n"), {
             "gateway_function_only": True, "superseded_tables_absent": True,
@@ -3136,6 +3147,7 @@ class GatewayAndInferenceHelpersTest(unittest.TestCase):
         })
 
     def test_gateway_probe_plan_controls(self):
+        gw_host = f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"
         for tls in (False, True):
             plan = smoke.gateway_probe_plan(tls=tls)
             by_name = {p["name"]: p for p in plan}
@@ -3143,21 +3155,44 @@ class GatewayAndInferenceHelpersTest(unittest.TestCase):
                 if p["expect"] == "deny":
                     self.assertIn(p["control"], by_name)
                     self.assertEqual(by_name[p["control"]]["expect"], "connect")
+        # TLS mode must verify the gateway's own ingressFrom rejects an egress-unrestricted pod
+        # in DB_NAMESPACE (same namespace as smoke-traefik, different pod labels).
+        tls_plan = smoke.gateway_probe_plan(tls=True)
+        db_deny = [p for p in tls_plan
+                   if p["namespace"] == smoke.DB_NAMESPACE and p["workload"] == "postgres"
+                   and p["expect"] == "deny" and gw_host in p["command"] and "8082" in p["command"]]
+        self.assertEqual(len(db_deny), 1)
+        self.assertTrue(db_deny[0]["http"])
 
     def test_evaluate_standin_record(self):
         req_id = "00000000-0000-4000-d000-000000000001"
         good = {"headers": {"x-request-id": [req_id]}, "body": {"model": smoke.CATALOG_MODEL, "cache_salt": "f" * 64}}
         self.assertEqual(smoke.evaluate_standin_record(good, req_id),
                          {"model": smoke.CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": 64})
-        for bad, msg in (
+        canary = "CANARY-SENSITIVE-VALUE"
+        for bad, msg, expect_len in (
             ({"headers": {"authorization": ["Bearer x"], "x-request-id": [req_id]}, "body": good["body"]},
-             "leaked Authorization"),
-            ({"headers": {"x-request-id": ["other"]}, "body": good["body"]}, "upstream x-request-id"),
-            ({"headers": good["headers"], "body": {"model": "wrong", "cache_salt": "f" * 64}}, "upstream body model"),
-            ({"headers": good["headers"], "body": {"model": smoke.CATALOG_MODEL, "cache_salt": "BAD"}}, "cache_salt"),
+             "leaked Authorization", None),
+            ({"headers": {"x-request-id": ["other"]}, "body": good["body"]}, "upstream x-request-id", None),
+            ({"headers": good["headers"], "body": canary}, "upstream body is not a JSON object", len(canary)),
+            ({"headers": good["headers"], "body": [canary]}, "upstream body is not a JSON object", None),
+            ({"headers": good["headers"], "body": {"model": canary, "cache_salt": "f" * 64}},
+             "upstream body model mismatch", len(canary)),
+            ({"headers": good["headers"], "body": {"model": 123, "cache_salt": "f" * 64}},
+             "upstream body model mismatch", None),
+            ({"headers": good["headers"], "body": {"model": smoke.CATALOG_MODEL, "cache_salt": canary}},
+             "cache_salt", len(canary)),
+            ({"headers": good["headers"], "body": {"model": smoke.CATALOG_MODEL, "cache_salt": None}},
+             "cache_salt", None),
         ):
-            with self.subTest(msg=msg), self.assertRaisesRegex(smoke.SmokeFailure, msg):
-                smoke.evaluate_standin_record(bad, req_id)
+            with self.subTest(msg=msg, body=str(bad["body"])[:20]):
+                with self.assertRaisesRegex(smoke.SmokeFailure, msg) as ctx:
+                    smoke.evaluate_standin_record(bad, req_id)
+                err = str(ctx.exception)
+                self.assertNotIn(canary, err)
+                if expect_len is not None:
+                    self.assertIn(f"len={expect_len}", err)
+                    self.assertIn("type=str", err)
 
     def test_settled_round_sql_and_evaluate(self):
         run_id = "00000000-0000-4000-c000-000000000001"

@@ -2201,9 +2201,49 @@ class NegativeCaseTest(unittest.TestCase):
            fragments)
           for label, url in (("path", "http://sglang:30000/v1"), ("query", "http://sglang:30000/?a=1"),
                              ("fragment", "http://sglang:30000/#x"), ("userinfo", "http://u@sglang:30000"),
-                             ("port 0", "http://sglang:0"), ("double slash", "http://sglang:30000//"))
+                             ("port 0", "http://sglang:0"), ("double slash", "http://sglang:30000//"),
+                             ("short ipv6", "http://[1:2:3]:30000"),
+                             ("too many ipv6 groups", "http://[1:2:3:4:5:6:7:8:9]:30000"),
+                             ("double :: ipv6", "http://[2001::db8::1]:30000"),
+                             ("ipv6 with zone", "http://[::1%eth0]:30000"),
+                             ("ipv4 in brackets", "http://[127.0.0.1]:30000"),
+                             ("ipv6 8 groups with ::", "http://[1:2:3:4:5:6:7::8]:30000"),
+                             ("ipv6 bad v4 octet", "http://[::ffff:256.0.0.1]:30000"),
+                             ("ipv6 leading zero v4", "http://[::ffff:01.0.0.1]:30000"),
+                             ("double dot host", "http://sglang..local:30000"),
+                             ("leading dot host", "http://.sglang:30000"),
+                             ("double trailing dot", "http://sglang.local..:30000"),
+                             ("empty port", "http://sglang:"))
           for suffix, extra, fragments in (("", [], [SCHEMA_ERROR, "/gateways/a/upstreamUrl"]),
                                            (" without schema", [SKIP], ["gateways.a.upstreamUrl must be a canonical"]))],
+        *[(f"gateway model exceeds 128 UTF-8 bytes{suffix}",
+           ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+            "database.gateway.existingSecret=openmettle-gateway-database",
+            "gateways.a.model=" + ("é" * 65), "gateways.a.upstreamUrl=http://sglang:30000"],
+           ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', *extra],
+           ["gateways.a.model must be a non-empty string of at most 128 bytes"])
+          for suffix, extra in (("", []), (" without schema", [SKIP]))],
+        *[(f"string boolean {flag} refused without schema", [],
+           ["--set-string", f"{flag}=false", SKIP],
+           [f"{flag} must be a boolean (true or false)"])
+          for flag in ("migration.enabled", "networkPolicy.enabled", "storage.artifacts.enabled",
+                       "ingress.enabled", "api.podDisruptionBudget.enabled", "auth.enabled",
+                       "telemetry.otlp.enabled", "api.serviceAccount.create", "worker.serviceAccount.create",
+                       "migration.serviceAccount.create", "database.caBundle.enabled",
+                       "auth.providerCaBundle.enabled", "telemetry.otlp.caBundle.enabled",
+                       "worker.inference.enabled", "worker.inference.caBundle.enabled")],
+        ("string boolean worker.inference.caBundle.enabled refused when inference enabled without schema",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm"],
+         ["--set-string", "worker.inference.caBundle.enabled=false",
+          "--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["worker.inference.caBundle.enabled must be a boolean (true or false)"]),
+        ("string boolean gateways.a.serviceAccount.create refused without schema",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000"],
+         ["--set-string", "gateways.a.serviceAccount.create=false",
+          "--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["gateways.a.serviceAccount.create must be a boolean (true or false)"]),
         ("gateway upstreamUrl port above 65535",
          ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
           "database.gateway.existingSecret=openmettle-gateway-database",
@@ -2701,6 +2741,68 @@ class GatewayTest(Rendered):
         gw_env = env_map(find(docs, "Deployment", "-gateway-a")["spec"]["template"]["spec"]["containers"][0])
         self.assertEqual(gw_env["OPENMETTLE_GATEWAY_DATABASE_URL"]["valueFrom"]["secretKeyRef"],
                          {"name": "openmettle-api-database", "key": "gateway-url"})
+
+    def test_upstream_url_trailing_dot_and_ipv6_accepted(self):
+        """Fails if trailing-dot DNS or valid RFC 4291 IPv6 upstreamUrl forms are rejected."""
+        urls = (
+            "http://sglang.models.svc.cluster.local.:30000",
+            "http://[2001:db8::1]:30000",
+            "http://[::1]:30000",
+            "http://[::ffff:127.0.0.1]:30000",
+            "http://[::]:30000/",
+            "http://[2001:db8:0:0:0:0:2:1]:30000",
+        )
+        for url in urls:
+            for extra in ([], [SKIP]):
+                with self.subTest(url=url, skip=bool(extra)):
+                    result = helm_template(
+                        set_values=[
+                            "images.gateway.repository=openmettle/gateway",
+                            f"images.gateway.digest={DIGEST}",
+                            "database.gateway.existingSecret=openmettle-gateway-database",
+                            "gateways.a.model=a",
+                            f"gateways.a.upstreamUrl={url}",
+                        ],
+                        extra=["--set-json",
+                               'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]',
+                               *extra],
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+                    gw_env = env_map(find(docs, "Deployment", "-gateway-a")["spec"]["template"]["spec"]["containers"][0])
+                    self.assertEqual(gw_env["OPENMETTLE_GATEWAY_UPSTREAM_URL"]["value"], url)
+
+    def test_model_dollar_escaping_and_utf8_byte_limit(self):
+        """Fails if literal $ in model is not escaped as $$ for Kubernetes EnvVar or 128-byte UTF-8 model fails."""
+        base = [
+            "images.gateway.repository=openmettle/gateway",
+            f"images.gateway.digest={DIGEST}",
+            "database.gateway.existingSecret=openmettle-gateway-database",
+            "gateways.a.upstreamUrl=http://sglang:30000",
+        ]
+        peer = ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]']
+        for raw, expected in (("study$$v2", "study$$$$v2"),
+                              ("a$(OPENMETTLE_GATEWAY_BIND)", "a$$(OPENMETTLE_GATEWAY_BIND)"),
+                              ("é" * 64, "é" * 64)):
+            for extra in (peer, [*peer, SKIP]):
+                with self.subTest(model=raw[:20], skip=SKIP in extra):
+                    result = helm_template(set_values=base, extra=["--set-string", f"gateways.a.model={raw}", *extra])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+                    gw_env = env_map(find(docs, "Deployment", "-gateway-a")["spec"]["template"]["spec"]["containers"][0])
+                    self.assertEqual(gw_env["OPENMETTLE_GATEWAY_MODEL"]["value"], expected)
+        # Uniqueness is still checked on the raw model string.
+        dup = helm_template(
+            set_values=[*base, "gateways.b.upstreamUrl=http://sglang-b:30000"],
+            extra=[
+                "--set-string", "gateways.a.model=study$$v2",
+                "--set-string", "gateways.b.model=study$$v2",
+                *peer,
+                "--set-json", 'gateways.b.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.41/32"}}]',
+            ],
+        )
+        self.assertNotEqual(dup.returncode, 0)
+        self.assertIn('gateways.b.model "study$$v2" duplicates gateways.a.model', dup.stderr)
 
 
 class ContractDriftTest(unittest.TestCase):

@@ -111,7 +111,14 @@ GATEWAY_SCHEMA_CHECKS = (
      " AND (has_table_privilege('openmettle_gateway', cl.oid, 'SELECT')"
      " OR has_table_privilege('openmettle_gateway', cl.oid, 'INSERT')"
      " OR has_table_privilege('openmettle_gateway', cl.oid, 'UPDATE')"
-     " OR has_table_privilege('openmettle_gateway', cl.oid, 'DELETE')))", True),
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'DELETE')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'TRUNCATE')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'REFERENCES')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'TRIGGER')"
+     " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'SELECT')"
+     " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'INSERT')"
+     " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'UPDATE')"
+     " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'REFERENCES')))", True),
     ("to_regclass('openmettle.gateway_bindings') IS NULL", True),
     ("to_regclass('openmettle.gateway_generations') IS NULL", True),
     ("to_regclass('openmettle.gateway_policy') IS NULL", True),
@@ -1249,6 +1256,8 @@ def gateway_probe_plan(*, tls: bool) -> list:
               tcp_command(GATEWAY_TLS_HOST, 8443), "connect"),
         probe("worker reaches TLS terminator smoke-traefik on 8443", APP_NAMESPACE, f"{FULLNAME}-worker", "worker",
               tcp_command(GATEWAY_TLS_HOST, 8443), "connect"),
+        probe("database namespace denied direct connection to TLS-fronted gateway on 8082",
+              DB_NAMESPACE, "postgres", "postgres", gw_readyz, "deny", gw_self, is_http=True),
         probe("worker denied direct connection to TLS-fronted gateway on 8082",
               APP_NAMESPACE, f"{FULLNAME}-worker", "worker", gw_readyz, "deny", gw_self, is_http=True),
         probe("api denied direct connection to TLS-fronted gateway on 8082",
@@ -1333,16 +1342,22 @@ def check_inference_and_gateway_mounts(pods_by_role: dict, *, tls: bool) -> dict
 def evaluate_standin_record(record: dict, expected_request_id: str) -> dict:
     """Verify the stand-in observed stripped Authorization, matching x-request-id and 64-hex cache_salt."""
     headers = record.get("headers") or {}
-    body = record.get("body") or {}
+    body = record.get("body")
     if "authorization" in headers:
         raise SmokeFailure("openmettle-gateway leaked Authorization header to upstream")
     if headers.get("x-request-id") != [expected_request_id]:
         raise SmokeFailure(f"upstream x-request-id is {headers.get('x-request-id')!r}, expected {[expected_request_id]}")
-    if not isinstance(body, dict) or body.get("model") != CATALOG_MODEL:
-        raise SmokeFailure(f"upstream body model is {body.get('model') if isinstance(body, dict) else body!r}")
+    if not isinstance(body, dict):
+        detail = f"type={type(body).__name__}, len={len(body)}" if isinstance(body, str) else f"type={type(body).__name__}"
+        raise SmokeFailure(f"upstream body is not a JSON object ({detail})")
+    model = body.get("model")
+    if model != CATALOG_MODEL:
+        detail = f"type={type(model).__name__}, len={len(model)}" if isinstance(model, str) else f"type={type(model).__name__}"
+        raise SmokeFailure(f"upstream body model mismatch ({detail})")
     salt = body.get("cache_salt")
     if not isinstance(salt, str) or not CACHE_SALT.fullmatch(salt):
-        raise SmokeFailure(f"upstream body missing 64-char lowercase hex cache_salt: {salt!r}")
+        detail = f"type={type(salt).__name__}, len={len(salt)}" if isinstance(salt, str) else f"type={type(salt).__name__}"
+        raise SmokeFailure(f"upstream body missing 64-char lowercase hex cache_salt ({detail})")
     return {"model": CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": len(salt)}
 
 
