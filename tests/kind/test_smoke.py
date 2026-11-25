@@ -3077,7 +3077,7 @@ class GatewayAndInferenceHelpersTest(unittest.TestCase):
         self.assertIn("openmettle.gateway_dispatch_scoped(uuid,bytea)", sql)
         self.assertIn(smoke.GATEWAY_SETTLE_FN, sql)
         self.assertIn("to_regclass('openmettle.gateway_bindings') IS NULL", sql)
-        for priv in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+        for priv in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"):
             self.assertIn(f"has_table_privilege('openmettle_gateway', cl.oid, '{priv}')", sql)
         for priv in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
             self.assertIn(f"has_any_column_privilege('openmettle_gateway', cl.oid, '{priv}')", sql)
@@ -3171,9 +3171,10 @@ class GatewayAndInferenceHelpersTest(unittest.TestCase):
                          {"model": smoke.CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": 64})
         canary = "CANARY-SENSITIVE-VALUE"
         for bad, msg, expect_len in (
-            ({"headers": {"authorization": ["Bearer x"], "x-request-id": [req_id]}, "body": good["body"]},
+            ({"headers": {"authorization": [f"Bearer {canary}"], "x-request-id": [req_id]}, "body": good["body"]},
              "leaked Authorization", None),
-            ({"headers": {"x-request-id": ["other"]}, "body": good["body"]}, "upstream x-request-id", None),
+            ({"headers": {"x-request-id": [canary]}, "body": good["body"]}, "upstream x-request-id mismatch", None),
+            ({"headers": {}, "body": good["body"]}, "upstream x-request-id mismatch", None),
             ({"headers": good["headers"], "body": canary}, "upstream body is not a JSON object", len(canary)),
             ({"headers": good["headers"], "body": [canary]}, "upstream body is not a JSON object", None),
             ({"headers": good["headers"], "body": {"model": canary, "cache_salt": "f" * 64}},

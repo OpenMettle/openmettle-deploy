@@ -115,6 +115,7 @@ GATEWAY_SCHEMA_CHECKS = (
      " OR has_table_privilege('openmettle_gateway', cl.oid, 'TRUNCATE')"
      " OR has_table_privilege('openmettle_gateway', cl.oid, 'REFERENCES')"
      " OR has_table_privilege('openmettle_gateway', cl.oid, 'TRIGGER')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'MAINTAIN')"
      " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'SELECT')"
      " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'INSERT')"
      " OR has_any_column_privilege('openmettle_gateway', cl.oid, 'UPDATE')"
@@ -1345,8 +1346,10 @@ def evaluate_standin_record(record: dict, expected_request_id: str) -> dict:
     body = record.get("body")
     if "authorization" in headers:
         raise SmokeFailure("openmettle-gateway leaked Authorization header to upstream")
-    if headers.get("x-request-id") != [expected_request_id]:
-        raise SmokeFailure(f"upstream x-request-id is {headers.get('x-request-id')!r}, expected {[expected_request_id]}")
+    req_ids = headers.get("x-request-id")
+    if req_ids != [expected_request_id]:
+        count = len(req_ids) if isinstance(req_ids, list) else 0
+        raise SmokeFailure(f"upstream x-request-id mismatch (type={type(req_ids).__name__}, count={count})")
     if not isinstance(body, dict):
         detail = f"type={type(body).__name__}, len={len(body)}" if isinstance(body, str) else f"type={type(body).__name__}"
         raise SmokeFailure(f"upstream body is not a JSON object ({detail})")
