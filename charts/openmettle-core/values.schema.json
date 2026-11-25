@@ -18,7 +18,11 @@
         },
         "api": {"$ref": "#/$defs/image"},
         "worker": {"$ref": "#/$defs/image"},
-        "migrate": {"$ref": "#/$defs/image"}
+        "migrate": {"$ref": "#/$defs/image"},
+        "gateway": {
+          "description": "Required (repository and digest) while gateways is non-empty; must stay empty while gateways is {}.",
+          "$ref": "#/$defs/image"
+        }
       }
     },
     "database": {
@@ -33,9 +37,13 @@
           "description": "openmettle_issuance URL mounted into the API container only (core ADR 0030). Required while auth.enabled is true and empty otherwise; rendering also fails if it reuses the api, worker or migrate Secret key.",
           "$ref": "#/$defs/secretKeyRef"
         },
+        "gateway": {
+          "description": "openmettle_gateway URL mounted into openmettle-gateway containers only (core ADR 0044). Required while gateways is non-empty and empty otherwise; rendering also fails if it reuses the api, worker, migrate or issuance Secret key.",
+          "$ref": "#/$defs/secretKeyRef"
+        },
         "connectionBudget": {"type": ["integer", "null"], "minimum": 1},
         "caBundle": {
-          "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/db-ca/ca.crt in api, worker and migrate pods.",
+          "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/db-ca/ca.crt in api, worker, migrate and gateway pods.",
           "$ref": "#/$defs/caBundle"
         }
       }
@@ -89,6 +97,8 @@
       "properties": {
         "replicas": {"$ref": "#/$defs/replicas"},
         "sweepMs": {"type": ["integer", "null"], "minimum": 1000, "maximum": 3600000},
+        "pollMs": {"type": ["integer", "null"], "minimum": 100, "maximum": 60000},
+        "inference": {"$ref": "#/$defs/workerInference"},
         "resources": {"$ref": "#/$defs/resources"},
         "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
         "settings": {"$ref": "#/$defs/processSettings"},
@@ -146,6 +156,23 @@
             "ingressFrom": {"$ref": "#/$defs/networkPolicyPeers"},
             "oidc": {
               "description": "OIDC provider peers reachable from the API pod only. Required while auth.enabled and networkPolicy.enabled are true; must be empty while auth.enabled is false.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "port"],
+              "properties": {
+                "to": {"$ref": "#/$defs/networkPolicyPeers"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            }
+          }
+        },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["inference"],
+          "properties": {
+            "inference": {
+              "description": "Inference gateway or external TLS-terminator peers reachable from the worker pod only. Required while worker.inference.enabled and networkPolicy.enabled are true; must be empty while worker.inference.enabled is false.",
               "type": "object",
               "additionalProperties": false,
               "required": ["to", "port"],
@@ -360,11 +387,75 @@
           }
         }
       }
+    },
+    "gateways": {
+      "description": "Optional per-model openmettle-gateway instances (core ADR 0044), keyed by DNS-1123 name. Empty by default: when empty, no gateway Deployment, Service, ServiceAccount or NetworkPolicy is rendered, and images.gateway and database.gateway.existingSecret must stay empty.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$"
+      },
+      "additionalProperties": {"$ref": "#/$defs/gatewayInstance"}
     }
   },
-  "if": {"properties": {"auth": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}, "required": ["auth"]},
-  "then": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"minLength": 1}}}}}}},
-  "else": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"const": ""}}}}}}},
+  "allOf": [
+    {
+      "if": {"properties": {"auth": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}, "required": ["auth"]},
+      "then": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"minLength": 1}}}}}}},
+      "else": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"const": ""}}}}}}}
+    },
+    {
+      "if": {"properties": {"gateways": {"minProperties": 1}}, "required": ["gateways"]},
+      "then": {
+        "properties": {
+          "images": {
+            "required": ["gateway"],
+            "properties": {
+              "gateway": {
+                "properties": {
+                  "repository": {"minLength": 1},
+                  "digest": {"minLength": 1}
+                }
+              }
+            }
+          },
+          "database": {
+            "required": ["gateway"],
+            "properties": {
+              "gateway": {
+                "properties": {
+                  "existingSecret": {"minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "images": {
+            "properties": {
+              "gateway": {
+                "properties": {
+                  "registry": {"const": ""},
+                  "repository": {"const": ""},
+                  "digest": {"const": ""}
+                }
+              }
+            }
+          },
+          "database": {
+            "properties": {
+              "gateway": {
+                "properties": {
+                  "existingSecret": {"const": ""}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "otlpEndpoint": {
       "description": "Canonical HTTPS URL with a lowercase DNS host (at least two labels; final label not numeric or 0x-hex), optional non-default port and path; no http://, IP literal, credentials, query, fragment, percent-encoding or dot-segments.",
@@ -602,6 +693,131 @@
       "description": "IPv4 or IPv6 CIDR; Kubernetes validates the address itself.",
       "type": "string",
       "pattern": "^([0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}|[0-9a-fA-F:.]*:[0-9a-fA-F:.]*/[0-9]{1,3})$"
+    },
+    "workerInference": {
+      "description": "Optional worker turn-execution configuration against openmettle-gateway (core ADRs 0033, 0043 and 0044). Mounted into worker only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "configMapName", "configKey", "catalogKey", "settings", "caBundle"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "configKey": {"$ref": "#/$defs/configMapKey"},
+        "catalogKey": {"$ref": "#/$defs/configMapKey"},
+        "settings": {
+          "description": "Bounds match core src/lib.rs WorkerSettings::parse.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runSlots", "leaseMs", "executionTimeoutMs", "executingPerActor", "executingPerScope"],
+          "properties": {
+            "runSlots": {"type": "integer", "minimum": 1, "maximum": 256},
+            "leaseMs": {"type": "integer", "minimum": 30000, "maximum": 600000},
+            "executionTimeoutMs": {"type": "integer", "minimum": 60000, "maximum": 86400000},
+            "executingPerActor": {"type": "integer", "minimum": 1, "maximum": 1024},
+            "executingPerScope": {"type": "integer", "minimum": 1, "maximum": 1024}
+          }
+        },
+        "caBundle": {
+          "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/inference-ca/ca.crt in the worker pod only.",
+          "$ref": "#/$defs/caBundle"
+        }
+      },
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {
+        "properties": {
+          "configMapName": {"minLength": 1}
+        }
+      },
+      "else": {
+        "properties": {
+          "configMapName": {"const": ""},
+          "caBundle": {
+            "properties": {
+              "enabled": {"const": false}
+            }
+          }
+        }
+      }
+    },
+    "gatewayUpstreamUrl": {
+      "description": "Canonical http://host[:port] origin with at most a / path (no https://, userinfo, non-root path, query or fragment; core src/gateway_proxy.rs).",
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^http://(([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*)|(\\[[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\\]))(:[1-9][0-9]{0,4})?/?$"
+    },
+    "gatewaySettings": {
+      "description": "Bounds match core src/lib.rs and src/gateway_proxy.rs.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cacheMode": {"enum": ["scoped", "per_request"]},
+        "upstreamConnectTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 30000},
+        "upstreamIdleTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 3600000},
+        "dbMaxConnections": {"$ref": "#/$defs/processSettings/properties/dbMaxConnections"},
+        "dbTimeoutMs": {"$ref": "#/$defs/processSettings/properties/dbTimeoutMs"},
+        "shutdownTimeoutMs": {"$ref": "#/$defs/processSettings/properties/shutdownTimeoutMs"}
+      }
+    },
+    "gatewayInstance": {
+      "description": "One per-model openmettle-gateway workload, Service, ServiceAccount and NetworkPolicy (core ADR 0044).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "upstreamUrl"],
+      "properties": {
+        "model": {"type": "string", "minLength": 1, "maxLength": 128},
+        "upstreamUrl": {"$ref": "#/$defs/gatewayUpstreamUrl"},
+        "replicas": {"$ref": "#/$defs/replicas"},
+        "resources": {"$ref": "#/$defs/resources"},
+        "serviceAccount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {"type": "boolean"},
+            "name": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "annotations": {"$ref": "#/$defs/stringMap"}
+          }
+        },
+        "settings": {"$ref": "#/$defs/gatewaySettings"},
+        "terminationGracePeriodSeconds": {"$ref": "#/$defs/gracePeriod"},
+        "strategy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxSurge": {"type": "integer", "minimum": 0},
+            "maxUnavailable": {"type": "integer", "minimum": 0}
+          }
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ingressFrom": {
+              "description": "null (default): allow TCP 8082 from this release's worker pods only. Explicit list: allow those exact peers (empty list denies all ingress).",
+              "anyOf": [{"type": "null"}, {"$ref": "#/$defs/networkPolicyPeers"}]
+            },
+            "upstream": {
+              "description": "Upstream model-server peers reachable from this gateway pod only. Required non-empty when networkPolicy.enabled is true.",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "to": {"$ref": "#/$defs/networkPolicyPeers"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            }
+          }
+        },
+        "podAnnotations": {"$ref": "#/$defs/stringMap"},
+        "nodeSelector": {"$ref": "#/$defs/stringMap"},
+        "tolerations": {"$ref": "#/$defs/tolerations"},
+        "affinity": {"$ref": "#/$defs/affinity"}
+      }
     }
   }
 }

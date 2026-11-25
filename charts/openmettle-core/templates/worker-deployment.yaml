@@ -1,1 +1,1 @@
-{{ include "openmettle-core.deployment" (dict "root" . "component" "worker" "port" 8081 "sweepMs" .Values.worker.sweepMs) }}
+{{ include "openmettle-core.deployment" (dict "root" . "component" "worker" "port" 8081 "sweepMs" .Values.worker.sweepMs "pollMs" .Values.worker.pollMs) }}

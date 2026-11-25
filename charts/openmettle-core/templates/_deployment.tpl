@@ -1,15 +1,20 @@
 {{/*
-API and worker Deployments share one shape (core runtime/process-contract.json).
-Arguments: dict "root" $ "component" "api|worker" "port" <container port>
+API, worker and per-model gateway Deployments share one shape (core runtime/process-contract.json).
+Arguments: dict "root" $ "component" "api|worker|gateway-<name>" "port" <container port>
+           ["role" "api|worker|gateway"] ["values" <resolved map>] ["field" <values path>]
+           ["sweepMs" ...] ["pollMs" ...]
 */}}
 {{- define "openmettle-core.deployment" -}}
 {{- $root := .root -}}
 {{- $component := .component -}}
-{{- $values := index $root.Values $component -}}
+{{- $role := default $component .role -}}
+{{- $values := default (index $root.Values $component) .values -}}
 {{- $settings := $values.settings -}}
-{{- $prefix := printf "OPENMETTLE_%s_" (upper $component) -}}
+{{- $prefix := printf "OPENMETTLE_%s_" (upper $role) -}}
 {{- $context := dict "root" $root "component" $component -}}
-{{- $auth := and (eq $component "api") $root.Values.auth.enabled -}}
+{{- $artifacts := and (ne $role "gateway") $root.Values.storage.artifacts.enabled -}}
+{{- $auth := and (eq $role "api") $root.Values.auth.enabled -}}
+{{- $inference := and (eq $role "worker") (default false (get (default dict $root.Values.worker.inference) "enabled")) -}}
 {{- $logging := $root.Values.telemetry.logging -}}
 {{- $otlp := $root.Values.telemetry.otlp -}}
 apiVersion: apps/v1
@@ -38,12 +43,12 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "openmettle-core.serviceAccountName" (merge (dict "serviceAccount" $values.serviceAccount) $context) | quote }}
+      serviceAccountName: {{ include "openmettle-core.serviceAccountName" (merge (dict "serviceAccount" $values.serviceAccount "field" (default $component .field)) $context) | quote }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ int64 $values.terminationGracePeriodSeconds }}
-      {{- $volumes := dict "root" $root "artifacts" $root.Values.storage.artifacts.enabled "auth" $auth "otlp" $otlp.enabled }}
-      {{- include "openmettle-core.podSecurityContext" (dict "storage" $root.Values.storage.artifacts.enabled "auth" $auth) | nindent 6 }}
+      {{- $volumes := dict "root" $root "artifacts" $artifacts "auth" $auth "otlp" $otlp.enabled "inference" $inference }}
+      {{- include "openmettle-core.podSecurityContext" (dict "storage" $artifacts "auth" $auth) | nindent 6 }}
       {{- with $root.Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
@@ -51,8 +56,8 @@ spec:
         {{- end }}
       {{- end }}
       containers:
-        - name: {{ $component }}
-          image: {{ include "openmettle-core.image" (dict "name" $component "image" (index $root.Values.images $component)) | quote }}
+        - name: {{ $role }}
+          image: {{ include "openmettle-core.image" (dict "name" $role "image" (index $root.Values.images $role)) | quote }}
           imagePullPolicy: {{ $root.Values.images.pullPolicy | quote }}
           ports:
             - name: http
@@ -62,16 +67,47 @@ spec:
             - name: {{ $prefix }}BIND
               value: {{ printf "0.0.0.0:%d" (int .port) | quote }}
             - name: {{ $prefix }}DATABASE_URL
-              {{- include "openmettle-core.databaseUrlEnv" (dict "name" $component "ref" (index $root.Values.database $component)) | nindent 14 }}
+              {{- include "openmettle-core.databaseUrlEnv" (dict "name" $role "ref" (index $root.Values.database $role)) | nindent 14 }}
             - name: {{ $prefix }}DB_MAX_CONNECTIONS
               value: {{ int64 $settings.dbMaxConnections | quote }}
             - name: {{ $prefix }}DB_TIMEOUT_MS
               value: {{ int64 $settings.dbTimeoutMs | quote }}
             - name: {{ $prefix }}SHUTDOWN_TIMEOUT_MS
               value: {{ int64 $settings.shutdownTimeoutMs | quote }}
+            {{- if eq $role "gateway" }}
+            - name: OPENMETTLE_GATEWAY_MODEL
+              value: {{ $values.model | quote }}
+            - name: OPENMETTLE_GATEWAY_UPSTREAM_URL
+              value: {{ $values.upstreamUrl | quote }}
+            - name: OPENMETTLE_GATEWAY_CACHE_MODE
+              value: {{ $settings.cacheMode | quote }}
+            - name: OPENMETTLE_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_MS
+              value: {{ int64 $settings.upstreamConnectTimeoutMs | quote }}
+            - name: OPENMETTLE_GATEWAY_UPSTREAM_IDLE_TIMEOUT_MS
+              value: {{ int64 $settings.upstreamIdleTimeoutMs | quote }}
+            {{- end }}
             {{- if not (kindIs "invalid" .sweepMs) }}
             - name: OPENMETTLE_WORKER_SWEEP_MS
               value: {{ int64 .sweepMs | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .pollMs) }}
+            - name: OPENMETTLE_WORKER_POLL_MS
+              value: {{ int64 .pollMs | quote }}
+            {{- end }}
+            {{- if $inference }}
+            {{- $infSettings := $root.Values.worker.inference.settings }}
+            - name: OPENMETTLE_WORKER_INFERENCE_CONFIG
+              value: {{ include "openmettle-core.inferenceConfigPath" $root | quote }}
+            - name: OPENMETTLE_WORKER_RUN_SLOTS
+              value: {{ int64 $infSettings.runSlots | quote }}
+            - name: OPENMETTLE_WORKER_LEASE_MS
+              value: {{ int64 $infSettings.leaseMs | quote }}
+            - name: OPENMETTLE_WORKER_EXECUTION_TIMEOUT_MS
+              value: {{ int64 $infSettings.executionTimeoutMs | quote }}
+            - name: OPENMETTLE_WORKER_EXECUTING_PER_ACTOR
+              value: {{ int64 $infSettings.executingPerActor | quote }}
+            - name: OPENMETTLE_WORKER_EXECUTING_PER_SCOPE
+              value: {{ int64 $infSettings.executingPerScope | quote }}
             {{- end }}
             {{- if not (kindIs "invalid" $logging.format) }}
             - name: {{ $prefix }}LOG_FORMAT
@@ -99,7 +135,7 @@ spec:
               value: {{ join "," $otlp.privateRanges | quote }}
             {{- end }}
             {{- end }}
-            {{- if $root.Values.storage.artifacts.enabled }}
+            {{- if $artifacts }}
             - name: {{ $prefix }}ARTIFACTS_DIR
               value: {{ include "openmettle-core.artifactsMountPath" $root | quote }}
             {{- end }}

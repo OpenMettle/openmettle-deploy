@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 I2/I3/I7/I10 smoke test).
+"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 / V1-06 smoke test).
 
-Test harness only; not an installer. It builds core's api, worker and migrate images from a
+Test harness only; not an installer. It builds core's api, worker, migrate and gateway images from a
 pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
-migration hook, readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
+migration hook (through migration 37, including migrations 19/20/37 role boundaries and fresh-install
+quota/storage markers), readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
 (API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug structured logs,
 API-only auth + /v1/* mounts and session issuance credential, and a live /v1/artifacts upload,
 idempotent retry, revision and byte-range download round trip across both API replicas on the
-PVC), uninstall (with chart-owned PVC preservation), absence of optional packages, issuance
-settings and unmounted 404 routes on default install, migrations 19/20 role grants, the
-fresh-install quota and artifact-volume markers of migrations 24/26, the unauthenticated posture of
-the /v1 quota routes, queued-run SSE replay, API pod replacement and worker expiry through HTTPS ingress,
-Pod Security `restricted` enforcement and NetworkPolicy enforcement (I3). Every assertion reads
+PVC), queued-run SSE replay, API pod replacement and worker expiry through HTTPS ingress,
+live end-to-end turn execution through `openmettle-gateway` and `worker.inference` (both plain-HTTP
+in-cluster under NetworkPolicy and fronted by the Traefik TLS terminator with `worker.inference.caBundle`
+and `ingressFrom` enforcement, verified against a synthetic SGLang stand-in and settled PostgreSQL
+usage/quota rows), uninstall (with chart-owned PVC preservation), absence of optional packages,
+Pod Security `restricted` enforcement and NetworkPolicy enforcement. Every assertion reads
 live cluster, Helm, HTTP or database state. Core's process-contract assertions are not repeated
 (core tests/kubernetes).
 
@@ -71,24 +73,52 @@ FULLNAME = RELEASE  # the release name contains the chart name (templates/_helpe
 APP_NAMESPACE = "openmettle-smoke"
 DB_NAMESPACE = "openmettle-smoke-db"
 RUN_LABEL = "openmettle.dev/smoke-run"
-ROLES = ("api", "worker", "migrate")
+ROLES = ("api", "worker", "migrate", "gateway")
+DEFAULT_ROLES = ("api", "worker", "migrate")
 WORKLOADS = ("api", "worker")
 # RFC 6761 reserves .invalid: the name never resolves. Images are never pulled (pullPolicy Never);
 # the node's containerd resolves the digest reference locally (see README "Image digests").
 REGISTRY = "openmettle-smoke.invalid"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SECRET = {"api": "openmettle-api-database", "worker": "openmettle-worker-database",
-          "migrate": "openmettle-owner-database", "issuance": "openmettle-issuance-database"}
+          "migrate": "openmettle-owner-database", "issuance": "openmettle-issuance-database",
+          "gateway": "openmettle-gateway-database"}
 DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "openmettle_owner",
-           "issuance": "openmettle_issuance"}
-# Every PostgreSQL login the fixture provisions: one per image role, plus the API-only session
-# issuance login (core ADR 0030), which core migration 18 requires before it runs.
-DB_LOGINS = (*ROLES, "issuance")
-# Core migration 23 refuses unless a restricted openmettle_gateway role exists (core ADR 0037). The chart
-# runs no gateway reconciliation process, so the fixture creates the role without a login or password.
-GATEWAY_ROLE = "openmettle_gateway"
-REQUIRED_MIGRATION = 27
+           "issuance": "openmettle_issuance", "gateway": "openmettle_gateway"}
+# Every PostgreSQL login the fixture provisions: api, worker, owner (migrate), session issuance
+# (core ADR 0030, migration 18) and gateway proxy (core ADR 0044, migrations 23 and 37).
+DB_LOGINS = ("api", "worker", "migrate", "issuance", "gateway")
+REQUIRED_MIGRATION = 37
 RUN_DISPATCH_LOCK = "openmettle.run_dispatch_lock"
+GATEWAY_SETTLE_FN = (
+    "openmettle.gateway_settle_report("
+    "uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)"
+)
+# Migration 37 gateway boundaries (core ADR 0044 increment 6): openmettle_gateway has EXECUTE on
+# gateway_dispatch, gateway_dispatch_scoped and gateway_settle_report, zero table privileges on
+# openmettle.*, and the superseded ADR 0037 provisioning tables are gone.
+GATEWAY_SCHEMA_CHECKS = (
+    ("has_function_privilege('openmettle_gateway', 'openmettle.gateway_dispatch(uuid,bytea)', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_gateway', 'openmettle.gateway_dispatch_scoped(uuid,bytea)', 'EXECUTE')", True),
+    (f"has_function_privilege('openmettle_gateway', '{GATEWAY_SETTLE_FN}', 'EXECUTE')", True),
+    ("has_table_privilege('openmettle_gateway', 'openmettle.gateway_usage_reports', 'SELECT')", False),
+    ("has_table_privilege('openmettle_gateway', 'openmettle.gateway_usage_reports', 'INSERT')", False),
+    ("has_table_privilege('openmettle_gateway', 'openmettle.gateway_requests', 'SELECT')", False),
+    ("has_table_privilege('openmettle_gateway', 'openmettle.gateway_requests', 'INSERT')", False),
+    ("has_table_privilege('openmettle_gateway', 'openmettle.gateway_requests', 'UPDATE')", False),
+    ("(SELECT count(*) = 0 FROM pg_class cl JOIN pg_namespace ns ON ns.oid = cl.relnamespace"
+     " WHERE ns.nspname = 'openmettle' AND cl.relkind IN ('r', 'p')"
+     " AND (has_table_privilege('openmettle_gateway', cl.oid, 'SELECT')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'INSERT')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'UPDATE')"
+     " OR has_table_privilege('openmettle_gateway', cl.oid, 'DELETE')))", True),
+    ("to_regclass('openmettle.gateway_bindings') IS NULL", True),
+    ("to_regclass('openmettle.gateway_generations') IS NULL", True),
+    ("to_regclass('openmettle.gateway_policy') IS NULL", True),
+    ("to_regclass('openmettle.gateway_audit') IS NULL", True),
+    ("to_regclass('openmettle.gateway_intents') IS NULL", True),
+    ("to_regclass('openmettle.gateway_nonces') IS NULL", True),
+)
 # Migration 19 role boundaries, read live as the fixture superuser: each expression and its expected
 # value. The worker locks the singleton dispatch row through an inert column and records claims; the
 # API writes the admission decision with the run and never sees the dispatch lock.
@@ -211,8 +241,33 @@ ALLOWED_LOG_FIELDS = {
     "http.route", "http.request.method", "http.response.status_code",
     "duration_us", "error.type", "schema_version", "dropped_lines", "dropped_spans",
     "dropped_metric_exports", "target_kind", "scope_kind", "resource_kind", "threshold_pct",
-    "dedupe_bucket", "gateway.step",
+    "dedupe_bucket", "gateway.step", "gateway.request_id",
 }
+# ADR 0044 gateway + worker.inference live smoke fixtures.
+STANDIN = "sglang-standin"
+STANDIN_LABELS = {"app.kubernetes.io/name": STANDIN}
+STANDIN_PORT = 30000
+STANDIN_EXPECTED_PROMPT_TOKENS = 11
+STANDIN_EXPECTED_COMPLETION_TOKENS = 7
+STANDIN_EXPECTED_SETTLED_UNITS = STANDIN_EXPECTED_PROMPT_TOKENS + STANDIN_EXPECTED_COMPLETION_TOKENS
+STANDIN_EXPECTED_CONTENT = "smoke-ok"
+GATEWAY_NAME = "a"
+GATEWAY_COMPONENT = f"gateway-{GATEWAY_NAME}"
+GATEWAY_WORKLOAD = f"{FULLNAME}-{GATEWAY_COMPONENT}"
+GATEWAY_INSTALLATION = "00000000-0000-4000-8000-0000000000e1"
+GATEWAY_TLS_HOST = f"{INGRESS_CLASS}.{DB_NAMESPACE}.svc.cluster.local"
+GATEWAY_TLS_SECRET = "smoke-gateway-tls"
+GATEWAY_TLS_INGRESS = "smoke-gateway-tls"
+INFERENCE_CONFIG_DIR = "/etc/openmettle/inference"
+INFERENCE_CONFIG_PATH = f"{INFERENCE_CONFIG_DIR}/inference.json"
+INFERENCE_CATALOG_PATH = f"{INFERENCE_CONFIG_DIR}/{AUTH_CATALOG_KEY}"
+INFERENCE_CA_DIR = "/etc/openmettle/inference-ca"
+INFERENCE_CA_PATH = f"{INFERENCE_CA_DIR}/ca.crt"
+INFERENCE_PLAIN_CONFIG_MAP = "openmettle-smoke-inference-plain"
+INFERENCE_TLS_CONFIG_MAP = "openmettle-smoke-inference-tls"
+INFERENCE_CA_CONFIG_MAP = "openmettle-smoke-inference-ca"
+CLUSTER_PRIVATE_CIDRS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+CACHE_SALT = re.compile(r"[0-9a-f]{64}")
 # NetworkPolicy fixtures. The app namespace denies all traffic by default, as the owner's application
 # namespaces do; the release must work under it. PEER is a second PostgreSQL server in the database
 # namespace that is not a configured database peer; it is also the one configured API ingress peer.
@@ -358,19 +413,24 @@ def digest_reference(role: str, digest: str) -> str:
     return f"{REGISTRY}/openmettle/{role}@{digest}"
 
 
-def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool = False) -> dict:
+def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool = False,
+                 gateway_mode: str | None = None) -> dict:
     """Chart values for the smoke release. Shorter migration timeouts bound a hung hook."""
     if set(digests) != set(ROLES):
-        raise SmokeFailure("a digest is required for each of api, worker and migrate")
+        raise SmokeFailure("a digest is required for each of api, worker, migrate and gateway")
     for role in ROLES:
         digest_reference(role, digests[role])
     if worker_replicas not in (1, 2):
         raise SmokeFailure("worker replicas must be 1 or 2")
+    if gateway_mode not in (None, "plain", "tls"):
+        raise SmokeFailure(f"unexpected gateway_mode: {gateway_mode!r}")
+    if gateway_mode is not None and not enabled_profile:
+        raise SmokeFailure("gateway_mode requires enabled_profile=True")
     values = {
         "images": {"pullPolicy": "Never", **{
             role: {"registry": REGISTRY, "repository": f"openmettle/{role}", "digest": digests[role]}
-            for role in ROLES}},
-        "database": {role: {"existingSecret": SECRET[role]} for role in ROLES},
+            for role in DEFAULT_ROLES}},
+        "database": {role: {"existingSecret": SECRET[role]} for role in DEFAULT_ROLES},
         "worker": {"replicas": worker_replicas},
         "migration": {"activeDeadlineSeconds": MIGRATION_DEADLINE_SECONDS,
                       "settings": {"connectTimeoutMs": 5000, "lockTimeoutMs": 15000,
@@ -405,7 +465,165 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
             "port": 443,
         }
         values["database"]["issuance"] = {"existingSecret": SECRET["issuance"]}
+    if gateway_mode is not None:
+        values["images"]["gateway"] = {
+            "registry": REGISTRY, "repository": "openmettle/gateway", "digest": digests["gateway"],
+        }
+        values["database"]["gateway"] = {"existingSecret": SECRET["gateway"]}
+        values["worker"]["pollMs"] = 100
+        inference = {
+            "enabled": True,
+            "configMapName": INFERENCE_PLAIN_CONFIG_MAP if gateway_mode == "plain" else INFERENCE_TLS_CONFIG_MAP,
+            "configKey": "inference.json",
+            "catalogKey": AUTH_CATALOG_KEY,
+            "settings": {
+                "runSlots": 2,
+                "leaseMs": 30000,
+                "executionTimeoutMs": 60000,
+                "executingPerActor": 2,
+                "executingPerScope": 4,
+            },
+        }
+        if gateway_mode == "tls":
+            inference["caBundle"] = {
+                "enabled": True,
+                "configMapName": INFERENCE_CA_CONFIG_MAP,
+                "key": "ca.crt",
+            }
+        values["worker"]["inference"] = inference
+        gateway_peer = {"podSelector": {"matchLabels": {
+            "app.kubernetes.io/name": "openmettle-core",
+            "app.kubernetes.io/instance": RELEASE,
+            "app.kubernetes.io/component": GATEWAY_COMPONENT,
+        }}}
+        traefik_peer = database_namespace_peer({"app": INGRESS_CLASS})
+        values["networkPolicy"]["worker"] = {
+            "inference": {"to": [gateway_peer], "port": 8082} if gateway_mode == "plain"
+            else {"to": [traefik_peer], "port": 8443},
+        }
+        gw_np: dict = {"upstream": {"to": [database_namespace_peer(STANDIN_LABELS)], "port": STANDIN_PORT}}
+        if gateway_mode == "tls":
+            gw_np["ingressFrom"] = [traefik_peer]
+        values["gateways"] = {
+            GATEWAY_NAME: {
+                "model": CATALOG_MODEL,
+                "upstreamUrl": f"http://{STANDIN}.{DB_NAMESPACE}.svc.cluster.local:{STANDIN_PORT}",
+                "networkPolicy": gw_np,
+            },
+        }
     return values
+
+
+def smoke_inference_document(catalog: dict, *, tls: bool) -> dict:
+    """ADR 0043 worker inference document covering every model of `catalog`."""
+    endpoint = (
+        f"https://{GATEWAY_TLS_HOST}:8443/v1/chat/completions"
+        if tls
+        else f"http://{GATEWAY_WORKLOAD}.{APP_NAMESPACE}.svc.cluster.local:8082/v1/chat/completions"
+    )
+    routes = {}
+    for model, profile in catalog["models"].items():
+        route: dict = {
+            "endpoint": endpoint,
+            "private_cidrs": list(CLUSTER_PRIVATE_CIDRS),
+            "pin": dict(profile["pin"]),
+            "protocol": "chat_completions",
+            "stream": False,
+            "images": False,
+            "usage": True,
+            "setup_timeout_milliseconds": 5000,
+            "idle_timeout_milliseconds": 45000,
+            "overall_timeout_milliseconds": 50000,
+        }
+        if tls:
+            route["trust"] = {"roots": "bundle", "bundle_path": INFERENCE_CA_PATH}
+        routes[model] = route
+    return {
+        "version": 1,
+        "catalog_file": INFERENCE_CATALOG_PATH,
+        "installation": GATEWAY_INSTALLATION,
+        "routes": routes,
+    }
+
+
+def gateway_tls_commands(ca_cert: Path, ca_key: Path, leaf_csr: Path, leaf_key: Path,
+                         leaf_ext: Path, leaf_cert: Path) -> tuple:
+    """OpenSSL commands and extfile body for a CA + signed leaf server cert accepted by rustls/webpki."""
+    ext_body = (
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\n"
+        "extendedKeyUsage=serverAuth\n"
+        f"subjectAltName=DNS:{GATEWAY_TLS_HOST}\n"
+    )
+    commands = (
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+         "-subj", "/CN=openmettle-smoke-gateway-ca",
+         "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,keyCertSign",
+         "-keyout", str(ca_key), "-out", str(ca_cert)],
+        ["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+         "-subj", f"/CN={GATEWAY_TLS_HOST}",
+         "-keyout", str(leaf_key), "-out", str(leaf_csr)],
+        ["openssl", "x509", "-req", "-in", str(leaf_csr), "-CA", str(ca_cert), "-CAkey", str(ca_key),
+         "-CAcreateserial", "-days", "1", "-extfile", str(leaf_ext), "-out", str(leaf_cert)],
+    )
+    return ext_body, commands
+
+
+def standin_manifests(image: str, run_id: str) -> dict:
+    """Synthetic recorded SGLang upstream stand-in in DB_NAMESPACE (Pod Security restricted)."""
+    labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
+    return {"apiVersion": "v1", "kind": "List", "items": [
+        {"apiVersion": "apps/v1", "kind": "Deployment",
+         "metadata": {"name": STANDIN, "namespace": DB_NAMESPACE, "labels": labels},
+         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                  "selector": {"matchLabels": STANDIN_LABELS},
+                  "template": {"metadata": {"labels": STANDIN_LABELS}, "spec": {
+                      "automountServiceAccountToken": False, "enableServiceLinks": False,
+                      "securityContext": {"runAsNonRoot": True, "runAsUser": 65532, "runAsGroup": 65532,
+                                          "seccompProfile": {"type": "RuntimeDefault"}},
+                      "containers": [{
+                          "name": STANDIN, "image": image, "imagePullPolicy": "Never",
+                          "ports": [{"name": "http", "containerPort": STANDIN_PORT}],
+                          "readinessProbe": {"httpGet": {"path": "/healthz", "port": "http"},
+                                             "periodSeconds": 2, "failureThreshold": 3},
+                          "securityContext": {"privileged": False, "allowPrivilegeEscalation": False,
+                                              "readOnlyRootFilesystem": True,
+                                              "capabilities": {"drop": ["ALL"]}},
+                      }],
+                  }}}},
+        {"apiVersion": "v1", "kind": "Service",
+         "metadata": {"name": STANDIN, "namespace": DB_NAMESPACE, "labels": labels},
+         "spec": {"type": "ClusterIP", "selector": STANDIN_LABELS,
+                  "ports": [{"name": "http", "port": STANDIN_PORT, "targetPort": "http"}]}},
+    ]}
+
+
+def inference_fixture_manifests(ca_pem: str, catalog: dict, run_id: str) -> dict:
+    """Test-owned inference ConfigMaps (plain & TLS), CA ConfigMap and TLS gateway Ingress."""
+    labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
+    catalog_json = json.dumps(catalog)
+    return {"apiVersion": "v1", "kind": "List", "items": [
+        {"apiVersion": "v1", "kind": "ConfigMap",
+         "metadata": {"name": INFERENCE_PLAIN_CONFIG_MAP, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"inference.json": json.dumps(smoke_inference_document(catalog, tls=False)),
+                  AUTH_CATALOG_KEY: catalog_json}},
+        {"apiVersion": "v1", "kind": "ConfigMap",
+         "metadata": {"name": INFERENCE_TLS_CONFIG_MAP, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"inference.json": json.dumps(smoke_inference_document(catalog, tls=True)),
+                  AUTH_CATALOG_KEY: catalog_json}},
+        {"apiVersion": "v1", "kind": "ConfigMap",
+         "metadata": {"name": INFERENCE_CA_CONFIG_MAP, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"ca.crt": ca_pem}},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+         "metadata": {"name": GATEWAY_TLS_INGRESS, "namespace": APP_NAMESPACE, "labels": labels},
+         "spec": {"ingressClassName": INGRESS_CLASS,
+                  "tls": [{"secretName": GATEWAY_TLS_SECRET, "hosts": [GATEWAY_TLS_HOST]}],
+                  "rules": [{"host": GATEWAY_TLS_HOST, "http": {"paths": [{
+                      "path": "/", "pathType": "Prefix",
+                      "backend": {"service": {"name": GATEWAY_WORKLOAD, "port": {"name": "http"}}},
+                  }]}}]}},
+    ]}
 
 
 def smoke_auth_document() -> dict:
@@ -507,17 +725,16 @@ def database_url(role: str, password: str) -> str:
 
 
 def fixture_manifests(postgres_image: str, passwords: dict, run_id: str, catalog: dict) -> dict:
-    """Namespaces, a synthetic PostgreSQL fixture, the four URL Secrets the chart reads and the auth
+    """Namespaces, a synthetic PostgreSQL fixture, the five URL Secrets the chart reads and the auth
     ConfigMap (auth document and `catalog`) and key Secret.
 
     passwords holds per-run random values for admin and each login in DB_LOGINS. Provisioning follows
-    core README "Schema migrations": four login roles (owner, api, issuance, worker), created before
-    migration 1, and one database owned by the owner role. GATEWAY_ROLE is created without a login.
+    core README "Schema migrations": five login roles (owner, api, issuance, worker, gateway),
+    created before migration 1, and one database owned by the owner role.
     """
     labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
     sql = "".join(f"CREATE ROLE {DB_ROLE[role]} LOGIN PASSWORD '{passwords[role]}';\n"
                   for role in DB_LOGINS)
-    sql += f"CREATE ROLE {GATEWAY_ROLE} NOLOGIN;\n"
     sql += "CREATE DATABASE openmettle OWNER openmettle_owner;\n"
     selector = POSTGRES_LABELS
     items = [
@@ -987,6 +1204,188 @@ def evaluate_run_admission(output: str) -> dict:
     return {"dispatch_lock_singleton": True, "privileges_checked": len(RUN_ADMISSION_CHECKS) - 1}
 
 
+def gateway_schema_sql() -> str:
+    return "SELECT " + ", ".join(expression for expression, _ in GATEWAY_SCHEMA_CHECKS) + ";"
+
+
+def evaluate_gateway_schema(output: str) -> dict:
+    """Compare gateway_schema_sql()'s one psql -tA row with GATEWAY_SCHEMA_CHECKS (migration 37)."""
+    observed = output.strip().split("|")
+    expected = ["t" if value else "f" for _, value in GATEWAY_SCHEMA_CHECKS]
+    if len(observed) != len(expected):
+        raise SmokeFailure(f"migration 37 gateway privilege query returned {output.strip()!r}")
+    wrong = [f"{expression} is {got!r}, expected {want!r}"
+             for (expression, _), got, want in zip(GATEWAY_SCHEMA_CHECKS, observed, expected) if got != want]
+    if wrong:
+        raise SmokeFailure("migration 37 gateway boundary: " + "; ".join(wrong))
+    return {"gateway_function_only": True, "superseded_tables_absent": True,
+            "checks": len(GATEWAY_SCHEMA_CHECKS)}
+
+
+def gateway_probe_plan(*, tls: bool) -> list:
+    """Live NetworkPolicy probes for plain-HTTP vs TLS-terminated gateway topologies."""
+    gw_host = f"{GATEWAY_WORKLOAD}.{APP_NAMESPACE}.svc.cluster.local"
+    gw_readyz = http_command(gw_host, 8082, "/readyz")
+
+    def probe(name, namespace, workload, container, command, expect, control=None, is_http=False):
+        return {"name": name, "namespace": namespace, "workload": workload, "container": container,
+                "command": command, "expect": expect, "control": control, "http": is_http}
+
+    if not tls:
+        worker_allowed = "worker reaches plain-HTTP gateway /readyz 200"
+        return [
+            probe(worker_allowed, APP_NAMESPACE, f"{FULLNAME}-worker", "worker", gw_readyz, "connect", is_http=True),
+            probe("api denied from plain-HTTP gateway", APP_NAMESPACE, f"{FULLNAME}-api", "api",
+                  gw_readyz, "deny", worker_allowed, is_http=True),
+            probe("database namespace denied from plain-HTTP gateway", DB_NAMESPACE, "postgres", "postgres",
+                  gw_readyz, "deny", worker_allowed, is_http=True),
+        ]
+    gw_self = "control: gateway-a serves /readyz locally on 8082"
+    traefik_control = "control: database namespace reaches smoke-traefik on 8443"
+    return [
+        probe(gw_self, APP_NAMESPACE, GATEWAY_WORKLOAD, "gateway",
+              http_command("127.0.0.1", 8082, "/readyz"), "connect", is_http=True),
+        probe(traefik_control, DB_NAMESPACE, "postgres", "postgres",
+              tcp_command(GATEWAY_TLS_HOST, 8443), "connect"),
+        probe("worker reaches TLS terminator smoke-traefik on 8443", APP_NAMESPACE, f"{FULLNAME}-worker", "worker",
+              tcp_command(GATEWAY_TLS_HOST, 8443), "connect"),
+        probe("worker denied direct connection to TLS-fronted gateway on 8082",
+              APP_NAMESPACE, f"{FULLNAME}-worker", "worker", gw_readyz, "deny", gw_self, is_http=True),
+        probe("api denied direct connection to TLS-fronted gateway on 8082",
+              APP_NAMESPACE, f"{FULLNAME}-api", "api", gw_readyz, "deny", gw_self, is_http=True),
+    ]
+
+
+def check_inference_and_gateway_mounts(pods_by_role: dict, *, tls: bool) -> dict:
+    """Verify worker.inference mounts/env and gateway-a pod isolation on live pod specs."""
+    api_pods = pods_by_role.get("api") or []
+    worker_pods = pods_by_role.get("worker") or []
+    gateway_pods = pods_by_role.get(GATEWAY_COMPONENT) or []
+    if not api_pods or not worker_pods or not gateway_pods:
+        raise SmokeFailure("api, worker and gateway pods are required to verify inference and gateway mounts")
+    expected_cm = INFERENCE_TLS_CONFIG_MAP if tls else INFERENCE_PLAIN_CONFIG_MAP
+    for pod in worker_pods:
+        spec = pod.get("spec", {})
+        vols = {v.get("name"): v for v in spec.get("volumes") or []}
+        cm = vols.get("inference-config", {}).get("configMap", {})
+        if cm.get("name") != expected_cm or cm.get("items") != [
+            {"key": "inference.json", "path": "inference.json"},
+            {"key": AUTH_CATALOG_KEY, "path": AUTH_CATALOG_KEY},
+        ]:
+            raise SmokeFailure(f"worker pod does not project {expected_cm} as inference.json and catalog.json")
+        if tls:
+            ca = vols.get("inference-ca", {}).get("configMap", {})
+            if ca.get("name") != INFERENCE_CA_CONFIG_MAP or ca.get("items") != [{"key": "ca.crt", "path": "ca.crt"}]:
+                raise SmokeFailure(f"worker pod does not project {INFERENCE_CA_CONFIG_MAP} as ca.crt")
+        elif "inference-ca" in vols:
+            raise SmokeFailure("worker pod must not mount inference-ca in plain-HTTP mode")
+        container = next((c for c in spec.get("containers") or [] if c.get("name") == "worker"), None)
+        if container is None:
+            raise SmokeFailure("worker pod has no container named 'worker'")
+        mounts = {m.get("name"): m for m in container.get("volumeMounts") or []}
+        if mounts.get("inference-config") != {"name": "inference-config", "mountPath": INFERENCE_CONFIG_DIR,
+                                              "readOnly": True}:
+            raise SmokeFailure(f"worker container does not mount inference-config read-only at {INFERENCE_CONFIG_DIR}")
+        if tls and mounts.get("inference-ca") != {"name": "inference-ca", "mountPath": INFERENCE_CA_DIR,
+                                                  "readOnly": True}:
+            raise SmokeFailure(f"worker container does not mount inference-ca read-only at {INFERENCE_CA_DIR}")
+        env = {e.get("name"): e.get("value") for e in container.get("env") or []}
+        expected_env = {
+            "OPENMETTLE_WORKER_POLL_MS": "100",
+            "OPENMETTLE_WORKER_INFERENCE_CONFIG": INFERENCE_CONFIG_PATH,
+            "OPENMETTLE_WORKER_RUN_SLOTS": "2",
+            "OPENMETTLE_WORKER_LEASE_MS": "30000",
+            "OPENMETTLE_WORKER_EXECUTION_TIMEOUT_MS": "60000",
+            "OPENMETTLE_WORKER_EXECUTING_PER_ACTOR": "2",
+            "OPENMETTLE_WORKER_EXECUTING_PER_SCOPE": "4",
+        }
+        for key, value in expected_env.items():
+            if env.get(key) != value:
+                raise SmokeFailure(f"worker container lacks {key}={value}")
+    for pod in gateway_pods:
+        spec = pod.get("spec", {})
+        if "fsGroup" in (spec.get("securityContext") or {}):
+            raise SmokeFailure("gateway pod must not set fsGroup")
+        if spec.get("volumes"):
+            raise SmokeFailure(f"gateway pod mounted unexpected volumes: {[v.get('name') for v in spec['volumes']]}")
+        container = next((c for c in spec.get("containers") or [] if c.get("name") == "gateway"), None)
+        if container is None:
+            raise SmokeFailure("gateway pod has no container named 'gateway'")
+        env = {e.get("name"): e for e in container.get("env") or []}
+        ref = env.get("OPENMETTLE_GATEWAY_DATABASE_URL", {}).get("valueFrom", {}).get("secretKeyRef", {})
+        if (ref.get("name"), ref.get("key")) != (SECRET["gateway"], "url") or ref.get("optional", False) is not False:
+            raise SmokeFailure(f"gateway DATABASE_URL is not a required reference to Secret {SECRET['gateway']} key url")
+        if env.get("OPENMETTLE_GATEWAY_MODEL", {}).get("value") != CATALOG_MODEL:
+            raise SmokeFailure(f"gateway container lacks OPENMETTLE_GATEWAY_MODEL={CATALOG_MODEL}")
+        if env.get("OPENMETTLE_GATEWAY_CACHE_MODE", {}).get("value") != "scoped":
+            raise SmokeFailure("gateway container lacks OPENMETTLE_GATEWAY_CACHE_MODE=scoped")
+        for key in env:
+            if not str(key).startswith("OPENMETTLE_GATEWAY_"):
+                raise SmokeFailure(f"gateway container received non-gateway env {key}")
+    for pod in api_pods:
+        spec_text = json.dumps(pod.get("spec", {}))
+        if "INFERENCE_CONFIG" in spec_text or "RUN_SLOTS" in spec_text or "inference-config" in spec_text:
+            raise SmokeFailure("api pod must not receive worker inference config or settings")
+    return {"mode": "tls" if tls else "plain", "worker_pods": len(worker_pods),
+            "gateway_pods": len(gateway_pods), "ca_mounted": tls}
+
+
+def evaluate_standin_record(record: dict, expected_request_id: str) -> dict:
+    """Verify the stand-in observed stripped Authorization, matching x-request-id and 64-hex cache_salt."""
+    headers = record.get("headers") or {}
+    body = record.get("body") or {}
+    if "authorization" in headers:
+        raise SmokeFailure("openmettle-gateway leaked Authorization header to upstream")
+    if headers.get("x-request-id") != [expected_request_id]:
+        raise SmokeFailure(f"upstream x-request-id is {headers.get('x-request-id')!r}, expected {[expected_request_id]}")
+    if not isinstance(body, dict) or body.get("model") != CATALOG_MODEL:
+        raise SmokeFailure(f"upstream body model is {body.get('model') if isinstance(body, dict) else body!r}")
+    salt = body.get("cache_salt")
+    if not isinstance(salt, str) or not CACHE_SALT.fullmatch(salt):
+        raise SmokeFailure(f"upstream body missing 64-char lowercase hex cache_salt: {salt!r}")
+    return {"model": CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": len(salt)}
+
+
+def settled_round_sql(run_id: str) -> str:
+    if not UUID.fullmatch(run_id):
+        raise SmokeFailure(f"invalid run_id for settlement check: {run_id!r}")
+    return (
+        "SELECT q.id::text, q.state, q.dispatched_at IS NOT NULL,"
+        " r.final, r.revision, r.prompt_tokens, r.completion_tokens, r.incomplete IS NULL,"
+        " qr.state, qr.held_units, qr.settled_units"
+        " FROM openmettle.gateway_requests q"
+        " JOIN openmettle.gateway_usage_reports r ON r.request_id = q.id"
+        " JOIN openmettle.quota_reservations qr"
+        "   ON qr.gateway_request_id = q.id AND qr.resource_kind = 'usage_tokens'"
+        f" WHERE q.run_id = '{run_id}'::uuid;"
+    )
+
+
+def evaluate_settled_round(output: str) -> dict | None:
+    """Return settlement summary once gateway usage report & quota settlement are committed, else None."""
+    rows = [line for line in output.splitlines() if line]
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise SmokeFailure(f"expected one settled gateway request row, found {len(rows)}")
+    fields = rows[0].split("|")
+    if len(fields) != 11 or not UUID.fullmatch(fields[0]):
+        raise SmokeFailure(f"malformed gateway settlement row: {rows[0]!r}")
+    expected_tail = [
+        "handed_off", "t", "t", "1",
+        str(STANDIN_EXPECTED_PROMPT_TOKENS), str(STANDIN_EXPECTED_COMPLETION_TOKENS), "t",
+        "settled", "0", str(STANDIN_EXPECTED_SETTLED_UNITS),
+    ]
+    if fields[1:] != expected_tail:
+        raise SmokeFailure(f"unexpected gateway settlement row: {fields[1:]} != {expected_tail}")
+    return {
+        "request_id": fields[0],
+        "prompt_tokens": STANDIN_EXPECTED_PROMPT_TOKENS,
+        "completion_tokens": STANDIN_EXPECTED_COMPLETION_TOKENS,
+        "settled_units": STANDIN_EXPECTED_SETTLED_UNITS,
+    }
+
+
 def evaluate_fresh_bootstrap(output: str) -> dict:
     """FRESH_BOOTSTRAP_SQL's one psql -tA row: both markers must be true."""
     if output.strip() != "t|t":
@@ -1170,13 +1569,13 @@ def ingress_certificate_command(cert, key):
 
 
 @contextmanager
-def ingress_get(port, context, path, headers, *, timeout=HTTP_TIMEOUT):
-    """Dial only the controller's loopback tunnel. SNI, host validation and Host use the chart host."""
+def ingress_get(port, context, path, headers, *, timeout=HTTP_TIMEOUT, host=INGRESS_HOST):
+    """Dial only the controller's loopback tunnel. SNI, host validation and Host use `host`."""
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as tcp:
-        with context.wrap_socket(tcp, server_hostname=INGRESS_HOST) as tls:
-            with closing(http.client.HTTPConnection(INGRESS_HOST, timeout=timeout)) as conn:
+        with context.wrap_socket(tcp, server_hostname=host) as tls:
+            with closing(http.client.HTTPConnection(host, timeout=timeout)) as conn:
                 conn.sock = tls
-                conn.request("GET", path, headers={"Host": INGRESS_HOST, **headers})
+                conn.request("GET", path, headers={"Host": host, **headers})
                 with conn.getresponse() as response:
                     yield response
 
@@ -1463,6 +1862,8 @@ class Smoke:
         self.passwords: dict = {}
         self.cluster_attempted = False
         self.built_images: list = []
+        self.catalog: dict = {}
+        self.standin_image = f"{REGISTRY}/openmettle/{STANDIN}:smoke-{self.run_id}"
         self.report: dict = {
             "result": "failed", "classification": "dev", "core_commit": CORE_COMMIT,
             "cluster": self.name, "release": RELEASE, "namespace": APP_NAMESPACE,
@@ -1613,6 +2014,7 @@ class Smoke:
             "auth_login_key": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
         }
         catalog = smoke_catalog(json.loads((self.core_dir / CORE_CATALOG_FIXTURE).read_text(encoding="utf-8")))
+        self.catalog = catalog
         manifests = fixture_manifests(self.core.POSTGRES_IMAGE, self.passwords, self.run_id, catalog)
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(manifests))
@@ -1632,9 +2034,11 @@ class Smoke:
                         "FROM openmettle._sqlx_migrations ORDER BY version;")
         return [line.split("|") for line in out.splitlines() if line]
 
-    def helm_deploy(self, command: str, worker_replicas: int, *, enabled_profile: bool = False):
+    def helm_deploy(self, command: str, worker_replicas: int, *, enabled_profile: bool = False,
+                    gateway_mode: str | None = None):
         self.values.write_text(json.dumps(smoke_values(self.digests, worker_replicas,
-                                                       enabled_profile=enabled_profile)))
+                                                       enabled_profile=enabled_profile,
+                                                       gateway_mode=gateway_mode)))
         self.verify_identity()
         self.helm_run(command, RELEASE, str(CHART), "--values", str(self.values),
                       "--wait=watcher", "--timeout", HELM_TIMEOUT)
@@ -1695,6 +2099,22 @@ class Smoke:
                                                   f"{FULLNAME}-{c}")["metadata"]["generation"]
                                 for c in WORKLOADS}}
 
+    def run_probe_plan(self, plan: list) -> list:
+        results = []
+        for probe in plan:
+            result = self.kube("--namespace", probe["namespace"], "exec", f"deployment/{probe['workload']}",
+                               "--container", probe["container"], "--", *probe["command"],
+                               check=False, timeout=PROBE_SECONDS + 60)
+            outcome = probe_outcome(result.returncode, result.stdout, result.stderr, probe["http"])
+            if outcome == "inconclusive" or outcome == "unexpected-response":
+                detail = redacted_tail((result.stderr or result.stdout or "").strip(), self.passwords.values(), 200)
+                _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']}, rc={result.returncode}, detail={detail!r})")
+            else:
+                _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']})")
+            results.append({key: probe[key] for key in ("name", "expect", "control")} | {"outcome": outcome})
+        evaluate_probes(results)
+        return results
+
     def network_policy(self):
         """Prove that the cluster enforces the release's NetworkPolicies, from inside running pods.
 
@@ -1708,19 +2128,7 @@ class Smoke:
                                                DNS_SELECTOR)["items"], "CoreDNS")
         peer_ip = running_pod_ip(self.kube_json("--namespace", DB_NAMESPACE, "get", "pods", "--selector",
                                                 f"app.kubernetes.io/name={PEER}")["items"], PEER)
-        results = []
-        for probe in probe_plan(dns_ip, peer_ip):
-            result = self.kube("--namespace", probe["namespace"], "exec", f"deployment/{probe['workload']}",
-                               "--container", probe["container"], "--", *probe["command"],
-                               check=False, timeout=PROBE_SECONDS + 60)
-            outcome = probe_outcome(result.returncode, result.stdout, result.stderr, probe["http"])
-            if outcome == "inconclusive" or outcome == "unexpected-response":
-                detail = redacted_tail((result.stderr or result.stdout or "").strip(), self.passwords.values(), 200)
-                _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']}, rc={result.returncode}, detail={detail!r})")
-            else:
-                _log(f"probe {probe['name']}: {outcome} (expected {probe['expect']})")
-            results.append({key: probe[key] for key in ("name", "expect", "control")} | {"outcome": outcome})
-        evaluate_probes(results)
+        results = self.run_probe_plan(probe_plan(dns_ip, peer_ip))
         self.passed("NetworkPolicy enforced: DNS and database egress only, API ingress from the configured peer",
                     namespace_policies=policies,
                     probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]} for r in results])
@@ -2015,6 +2423,186 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                     logs=logs_summary)
         self.passed("HTTPS ingress queued run replay and worker expiry",
                     **self.ingress_replay(cookie, cert))
+        self.gateway_end_to_end(history, cookie)
+
+    def prepare_gateway_fixtures(self):
+        """Build & deploy the synthetic SGLang stand-in and apply plain/TLS inference fixtures."""
+        _log(f"building {self.standin_image} from cached core build stage (local only; never pushed)")
+        recipe = (self.core_dir / "Dockerfile").read_text() + """
+FROM build AS standin-build
+COPY --from=fixture /standin.rs /source/src/bin/kind-standin.rs
+RUN cargo build --release --locked --offline --bin kind-standin
+FROM runtime AS standin-runtime
+COPY --from=standin-build /source/target/release/kind-standin /usr/local/bin/kind-standin
+EXPOSE 30000
+ENTRYPOINT ["/usr/local/bin/kind-standin"]
+"""
+        self.run(["docker", "build", "--builder", "default", "--file", "-", "--target", "standin-runtime",
+                  "--build-context", f"fixture={ROOT / 'tests/kind'}", "--tag", self.standin_image,
+                  str(self.core_dir)], input=recipe, timeout=600)
+        self.built_images.append(self.standin_image)
+        self.run(["kind", "load", "docker-image", self.standin_image, "--name", self.name], timeout=300)
+        work = self.kubeconfig.parent
+        ca_cert, ca_key = work / "gw-ca.crt", work / "gw-ca.key"
+        leaf_csr, leaf_key, leaf_ext, leaf_cert = (
+            work / "gw-leaf.csr", work / "gw-leaf.key", work / "gw-leaf.ext", work / "gw-leaf.crt")
+        ext_body, commands = gateway_tls_commands(ca_cert, ca_key, leaf_csr, leaf_key, leaf_ext, leaf_cert)
+        leaf_ext.write_text(ext_body, encoding="utf-8")
+        for command in commands:
+            self.run(command)
+        ca_pem = ca_cert.read_text(encoding="utf-8")
+        self.verify_identity()
+        self.kube("apply", "--filename", "-", input=json.dumps(standin_manifests(self.standin_image, self.run_id)))
+        self.kube("--namespace", DB_NAMESPACE, "rollout", "status", f"deployment/{STANDIN}",
+                  "--timeout=180s", timeout=210)
+        self.verify_identity()
+        self.kube("--namespace", APP_NAMESPACE, "create", "secret", "tls", GATEWAY_TLS_SECRET,
+                  f"--cert={leaf_cert}", f"--key={leaf_key}")
+        self.verify_identity()
+        self.kube("apply", "--filename", "-",
+                  input=json.dumps(inference_fixture_manifests(ca_pem, self.catalog, self.run_id)))
+        return ca_cert
+
+    def observe_gateway_pod(self) -> list:
+        """Verify gateway-a pod runs the digest-pinned gateway image cleanly under CRI and passes /readyz."""
+        gw_pods = self.pods(GATEWAY_COMPONENT)
+        self.expect(len(gw_pods) == 1, f"expected one {GATEWAY_COMPONENT} pod, found {len(gw_pods)}")
+        pod = gw_pods[0]
+        ready = {c["type"]: c["status"] for c in pod["status"].get("conditions", [])}.get("Ready")
+        self.expect(ready == "True", f"{GATEWAY_COMPONENT} pod is not Ready")
+        self.expect(all(c.get("restartCount") == 0 for c in pod["status"]["containerStatuses"]),
+                    f"{GATEWAY_COMPONENT} container restarted")
+        container = pod["spec"]["containers"][0]
+        image = self.report["images"]["gateway"]
+        self.expect(container["image"] == image["reference"] and container["imagePullPolicy"] == "Never",
+                    f"{GATEWAY_COMPONENT} pod does not run {image['reference']} with pullPolicy Never")
+        status = pod["status"]["containerStatuses"][0]
+        container_id = status.get("containerID", "").removeprefix("containerd://")
+        self.expect(bool(container_id), f"{GATEWAY_COMPONENT} container has no containerd id")
+        running = parse_cri_container_image_id(self.node_exec(
+            "crictl", "ps", "--id", container_id, "--output", "json").stdout)
+        self.expect(running == image["cri_image_id"],
+                    f"{GATEWAY_COMPONENT} container runs image {running}, not {image['cri_image_id']}")
+        present = images_reported_present(self.events("reason=Pulled"), [image["reference"]])
+        self.expect(present == [image["reference"]],
+                    f"kubelet did not report gateway digest reference as present: {present}")
+        forward = PortForward(self.kubectl, self.env, f"service/{GATEWAY_WORKLOAD}", 8082)
+        try:
+            self.wait_for(f"{GATEWAY_COMPONENT} /readyz 200",
+                          lambda: self.core.http_get(forward.port, "/readyz")[0] == 200, timeout=30)
+        finally:
+            forward.close()
+        return gw_pods
+
+    def execute_turn_through_gateway(self, api_pod: str, cookie: str, *, mode: str,
+                                     expected_records: int) -> dict:
+        """Admit a run, wait for worker -> gateway -> stand-in execution, and verify settlement + cache_salt."""
+        forward = PortForward(self.kubectl, self.env, f"pod/{api_pod}", 8080)
+        try:
+            def send(method, path, status, *, key=None, document=None):
+                headers = v1_headers(cookie, key=key)
+                body = b""
+                if document is not None:
+                    headers["Content-Type"] = "application/json"
+                    body = json.dumps(document).encode()
+                return v1_json(f"{method} {path}", http_exchange(forward.port, method, path, headers, body), status)
+
+            root = send("POST", "/v1/conversations", 201, key=f"kind-smoke-gw-conv-{mode}", document={})
+            request = run_request(root, str(uuid.uuid4()))
+            created = send("POST", "/v1/runs", 201, key=f"kind-smoke-gw-run-{mode}", document=request)
+            run_id = created.get("run_id")
+            self.expect(bool(UUID.fullmatch(str(run_id))), f"gateway {mode}: POST /v1/runs returned invalid run_id")
+
+            def succeeded():
+                snap = send("GET", f"/v1/runs/{run_id}", 200)
+                state = snap.get("state")
+                if state in ("failed", "cancelled"):
+                    raise SmokeFailure(f"gateway {mode}: run reached unexpected terminal state {state!r}: {snap!r}")
+                return snap if state == "succeeded" else None
+
+            self.wait_for(f"gateway {mode} run to succeed", succeeded, timeout=60, interval=0.5)
+            messages = send(
+                "GET", f"/v1/conversations/{root['conversation_id']}/branches/{root['branch_id']}/messages", 200)
+            items = messages.get("items") or []
+            assistant = next((m for m in items if m.get("role") == "assistant"), None)
+            self.expect(
+                assistant is not None
+                and (assistant.get("parts") or [{}])[0].get("text") == STANDIN_EXPECTED_CONTENT
+                and assistant.get("input_count") == str(STANDIN_EXPECTED_PROMPT_TOKENS)
+                and assistant.get("output_count") == str(STANDIN_EXPECTED_COMPLETION_TOKENS),
+                f"gateway {mode}: unexpected assistant message {assistant!r}",
+            )
+        finally:
+            forward.close()
+        settled = self.wait_for(
+            f"gateway {mode} usage report and quota settlement",
+            lambda: evaluate_settled_round(self.psql(settled_round_sql(run_id))),
+            timeout=30, interval=0.5,
+        )
+        standin_fwd = PortForward(self.kubectl, self.env, f"service/{STANDIN}", STANDIN_PORT,
+                                  namespace=DB_NAMESPACE)
+        try:
+            status, _, raw = http_exchange(standin_fwd.port, "GET", "/_recorded", {})
+            self.expect(status == 200, f"stand-in GET /_recorded returned HTTP {status}")
+            records = json.loads(raw)
+        finally:
+            standin_fwd.close()
+        self.expect(isinstance(records, list) and len(records) == expected_records,
+                    f"gateway {mode}: expected {expected_records} recorded upstream call(s), found {len(records)}")
+        upstream = evaluate_standin_record(records[-1], settled["request_id"])
+        return {"run_state": "succeeded", "assistant_content": STANDIN_EXPECTED_CONTENT,
+                "settlement": {k: v for k, v in settled.items() if k != "request_id"},
+                "upstream": upstream}
+
+    def gateway_end_to_end(self, history: list, cookie: str):
+        """Exercise both plain-HTTP and external TLS-terminated gateway + worker.inference topologies."""
+        gw_ca_cert = self.prepare_gateway_fixtures()
+        for step, (mode, revision, expected_records) in enumerate(
+                (("plain", 5, 1), ("tls", 6, 2)), start=1):
+            tls = mode == "tls"
+            self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True, gateway_mode=mode)
+            for deployment in (f"{FULLNAME}-worker", GATEWAY_WORKLOAD):
+                self.kube("--namespace", APP_NAMESPACE, "rollout", "status", f"deployment/{deployment}",
+                          f"--timeout={PROFILE_ROLLOUT_TIMEOUT}", timeout=210)
+            profile = self.observe_release(revision=revision)
+            self.expect(len(self.completions()) == revision,
+                        f"gateway {mode} upgrade did not run the migrate hook")
+            self.expect(self.migrations() == history,
+                        f"migration history changed on gateway {mode} upgrade")
+            gw_pods = self.observe_gateway_pod()
+            pods_by_role = {**{c: self.pods(c) for c in WORKLOADS}, GATEWAY_COMPONENT: gw_pods}
+            mounts_summary = check_inference_and_gateway_mounts(pods_by_role, tls=tls)
+            gw_logs = self.wait_for(
+                f"gateway ({mode}) ADR 0024 JSON structured logs",
+                lambda gp=gw_pods: evaluate_structured_logs(
+                    "gateway",
+                    {p["metadata"]["name"]: self.kube("--namespace", APP_NAMESPACE, "logs", p["metadata"]["name"],
+                                                      "--container", "gateway", timeout=60).stdout
+                     for p in gp}),
+                timeout=30,
+            )
+            probes = self.run_probe_plan(gateway_probe_plan(tls=tls))
+            if tls:
+                gw_context = ssl.create_default_context(cafile=str(gw_ca_cert))
+                with closing(PortForward(self.kubectl, self.env, f"deployment/{INGRESS_CLASS}", 8443,
+                                         namespace=DB_NAMESPACE)) as forward:
+                    def tls_ready():
+                        try:
+                            with ingress_get(forward.port, gw_context, "/readyz", {},
+                                             timeout=INGRESS_READY_TIMEOUT, host=GATEWAY_TLS_HOST) as response:
+                                return response.status == 200
+                        except (OSError, http.client.HTTPException):
+                            return False
+                    self.wait_for("Traefik TLS terminator ready for gateway-a backend", tls_ready, timeout=60)
+            turn = self.execute_turn_through_gateway(
+                profile["pods"]["api"][0], cookie, mode=mode, expected_records=expected_records)
+            self.passed(
+                f"gateway + worker.inference end-to-end ({mode} topology, step {step}/2)",
+                mounts=mounts_summary,
+                gateway_logs=gw_logs,
+                probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]} for r in probes],
+                turn=turn,
+            )
 
     def scenario(self):
         # 1-3, 5, 8: install by digest; migrate hook; Ready; no optional package; PSA restricted.
@@ -2028,9 +2616,9 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         self.expect(history and all(row[1] == "t" for row in history),
                     "migration history is empty or has a failed entry")
         self.expect(int(history[-1][0]) >= REQUIRED_MIGRATION,
-                    f"migration history ends at version {history[-1][0]}, before the fenced capacity "
-                    f"migration {REQUIRED_MIGRATION}")
+                    f"migration history ends at version {history[-1][0]}, before migration {REQUIRED_MIGRATION}")
         run_admission = evaluate_run_admission(self.psql(run_admission_sql()))
+        gateway_schema = evaluate_gateway_schema(self.psql(gateway_schema_sql()))
         fresh_bootstrap = evaluate_fresh_bootstrap(self.psql(FRESH_BOOTSTRAP_SQL))
         created = {c: parse_time(self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
                                                 f"{FULLNAME}-{c}")["metadata"]["creationTimestamp"])
@@ -2038,14 +2626,14 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         first = runs[0].replace(microsecond=0)
         self.expect(all(first <= when for when in created.values()),
                     "migrate Job completed after the Deployments were created")
-        references = [self.report["images"][r]["reference"] for r in ROLES]
+        references = [self.report["images"][r]["reference"] for r in DEFAULT_ROLES]
         present = images_reported_present(self.events("reason=Pulled"), references)
         self.expect(present == sorted(references),
                     f"kubelet did not report every digest reference as present: {present}")
         self.passed("install by digest: migrate hook completed before Deployments; API and worker Ready; "
-                    "migrations 19/20 role boundaries; fresh-install quota and artifact-volume markers",
+                    "migrations 19/20/37 role boundaries; fresh-install quota and artifact-volume markers",
                     migrations_applied=len(history), latest_version=int(history[-1][0]),
-                    run_admission=run_admission, fresh_bootstrap=fresh_bootstrap,
+                    run_admission=run_admission, gateway_schema=gateway_schema, fresh_bootstrap=fresh_bootstrap,
                     ready_replicas=installed["ready_replicas"], readyz=installed["readyz"],
                     images_present=len(present))
 
@@ -2134,6 +2722,8 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                                                 f"owner=helm,name={RELEASE}")["items"])
             left += object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "endpointslices",
                                                 "--selector", f"kubernetes.io/service-name={FULLNAME}-api")["items"])
+            left += object_names(self.kube_json("--namespace", APP_NAMESPACE, "get", "endpointslices",
+                                                "--selector", f"kubernetes.io/service-name={GATEWAY_WORKLOAD}")["items"])
             return left
         self.wait_for("release objects to be removed", lambda: not residue(), timeout=120)
         releases = json.loads(self.helm_run("list", "--output", "json").stdout)
@@ -2143,13 +2733,16 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                                                 "--selector", f"app.kubernetes.io/instance={RELEASE}")["items"])
         self.expect(kept_pvcs == [f"PersistentVolumeClaim/{ARTIFACTS_CLAIM}"],
                     f"kept artifact PVC after uninstall: {kept_pvcs}")
-        # The test, not the chart, owns the four URL Secrets (including issuance), synthetic auth
-        # fixtures and namespace default-deny.
+        # The test, not the chart, owns the five URL Secrets (including issuance and gateway),
+        # synthetic auth/inference fixtures and namespace default-deny.
         remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get",
                                                 "configmaps,secrets,networkpolicies",
                                                 "--selector", RUN_LABEL)["items"])
         expected_owned = sorted([
             f"ConfigMap/{AUTH_CONFIG_MAP}",
+            f"ConfigMap/{INFERENCE_PLAIN_CONFIG_MAP}",
+            f"ConfigMap/{INFERENCE_TLS_CONFIG_MAP}",
+            f"ConfigMap/{INFERENCE_CA_CONFIG_MAP}",
             f"NetworkPolicy/{NAMESPACE_DENY}",
             f"Secret/{AUTH_LOGIN_KEYS_SECRET}",
             *(f"Secret/{SECRET[r]}" for r in DB_LOGINS),

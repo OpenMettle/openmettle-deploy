@@ -19,5 +19,15 @@
     "requests": {"cpu": "100m", "memory": "64Mi"},
     "livenessPath": "/healthz",
     "readinessPath": "/readyz"
+  },
+  "gateway": {
+    "imageTarget": "gateway",
+    "configurationPrefix": "OPENMETTLE_GATEWAY_",
+    "port": 8082,
+    "serviceAccountName": "openmettle-gateway",
+    "automountServiceAccountToken": false,
+    "requests": {"cpu": "100m", "memory": "64Mi"},
+    "livenessPath": "/healthz",
+    "readinessPath": "/readyz"
   }
 }

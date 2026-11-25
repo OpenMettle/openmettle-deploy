@@ -30,12 +30,17 @@ import smoke  # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 DIGEST = {role: "sha256:" + str(i) * 64 for i, role in enumerate(smoke.ROLES, start=1)}
 PASSWORDS = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "migrate": "d" * 32, "issuance": "g" * 32,
+             "gateway": "h" * 32,
              "auth_cursor_key": base64.b64encode(b"c" * 32).decode("ascii"),
              "auth_login_key": base64.b64encode(b"k" * 32).decode("ascii")}
 # `helm get hooks` for the release: the migrate ServiceAccount, NetworkPolicy and Job, abridged.
-# The shape smoke_catalog() relies on in core's tests/fixtures/conversation-catalog-v1.json; the real
-# fixture is read from the pinned core checkout at run time.
-CATALOG_FIXTURE = {"version": 1, "revision": "catalog/1", "models": {"a": {"output_limit": 4096}, "b": {}},
+# The shape smoke_catalog() and smoke_inference_document() rely on in core's
+# tests/fixtures/conversation-catalog-v1.json; the real fixture is read from the pinned core checkout.
+_PIN_A = {"provider": "synthetic-provider", "revision": "profile-a/1", "checkpoint": "fixture-a",
+          "template": "template/1", "parser": "parser/1", "runtime": "runtime/1", "gateway": "gateway/1"}
+_PIN_B = {**_PIN_A, "provider": "synthetic-other", "revision": "profile-b/1", "checkpoint": "fixture-b"}
+CATALOG_FIXTURE = {"version": 1, "revision": "catalog/1",
+                   "models": {"a": {"pin": _PIN_A, "output_limit": 4096}, "b": {"pin": _PIN_B}},
                    "presets": {"study": {"model": "a", "revision": "study/1"}}}
 HOOKS = f"""---
 # Source: openmettle-core/templates/migrate-job.yaml
@@ -71,6 +76,7 @@ import-2026-11-19@{DIGEST['api']} application/vnd.oci.image.index.v1+json {DIGES
 openmettle-smoke.invalid/openmettle/api:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json {DIGEST['api']} 40.1 MiB linux/amd64 io.cri-containerd.image=managed
 openmettle-smoke.invalid/openmettle/worker:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json {DIGEST['worker']} 40.0 MiB linux/amd64 io.cri-containerd.image=managed
 openmettle-smoke.invalid/openmettle/migrate:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json not-a-digest 39.0 MiB linux/amd64 -
+openmettle-smoke.invalid/openmettle/gateway:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json {DIGEST['gateway']} 40.2 MiB linux/amd64 io.cri-containerd.image=managed
 """
 
 STUB_CORE = '''
@@ -267,6 +273,7 @@ class FakeArtifacts:
         self.uploads = {}
         self.revisions = {}  # revision id -> (document, payload)
         self.runs = {}  # idempotency key -> (request body, run document)
+        self.standin_records = []
         self.doctor = None
 
     @property
@@ -289,6 +296,9 @@ class FakeArtifacts:
 
     def __call__(self, port, method, path, headers, body=b""):
         self.calls.append((port, method, path, dict(headers)))
+        if port == smoke.STANDIN_PORT and (method, path) == ("GET", "/_recorded"):
+            response = (200, {"content-type": "application/json"}, json.dumps(self.standin_records).encode())
+            return (self.doctor and self.doctor(method, path, headers, response)) or response
         cookie = headers.get("Cookie", "").partition(f"{smoke.SESSION_COOKIE}=")[2]
         if cookie:
             self.cluster.passwords["session"] = cookie
@@ -355,9 +365,29 @@ class FakeArtifacts:
             if request["proposal"]["selection"] != {"preset": smoke.CATALOG_PRESET}:
                 return self.problem(400, "validation")
             run = {"run_id": f"00000000-0000-4000-c000-{len(self.runs) + 1:012x}",
-                   "conversation_id": request["conversation_id"], "state": "queued"}
+                   "conversation_id": request["conversation_id"],
+                   "state": "succeeded" if key.startswith("kind-smoke-gw-run-") else "queued"}
+            if key.startswith("kind-smoke-gw-run-"):
+                req_id = f"00000000-0000-4000-d000-{len(self.standin_records) + 1:012x}"
+                self.cluster.gateway_settlements[run["run_id"]] = req_id
+                self.standin_records.append({
+                    "headers": {"x-request-id": [req_id], "content-type": ["application/json"]},
+                    "body": {"model": smoke.CATALOG_MODEL, "cache_salt": "a" * 64},
+                })
             self.runs[key] = (request, run)
             return self.reply(201, run)
+        if method == "GET" and len(segments) == 3 and segments[:2] == ["v1", "runs"]:
+            for _, run in self.runs.values():
+                if run["run_id"] == segments[2]:
+                    return self.reply(200, run)
+        if method == "GET" and len(segments) == 6 and segments[:2] == ["v1", "conversations"] \
+                and segments[3] == "branches" and segments[5] == "messages":
+            return self.reply(200, {"items": [{
+                "role": "assistant",
+                "parts": [{"kind": "text", "text": smoke.STANDIN_EXPECTED_CONTENT}],
+                "input_count": str(smoke.STANDIN_EXPECTED_PROMPT_TOKENS),
+                "output_count": str(smoke.STANDIN_EXPECTED_COMPLETION_TOKENS),
+            }]})
         if method == "POST" and segments[:2] == ["v1", "runs"] and segments[3:] == ["cancel"]:
             for _, run in self.runs.values():
                 if run["run_id"] == segments[2]:
@@ -408,11 +438,15 @@ class FakeCluster:
         self.replicas = {"api": 1, "worker": 1}
         self.generation = {"api": 1, "worker": 1}
         self.profile_enabled = False
+        self.gateway_mode = None
+        self.inference_fixtures_applied = False
         self.artifacts_pvc_created = False
         self.healthz = 200
         self.readyz = 200
         self.auth_http_overrides = {}
         self.run_admission = ["t" if expected else "f" for _, expected in smoke.RUN_ADMISSION_CHECKS]
+        self.gateway_schema = ["t" if expected else "f" for _, expected in smoke.GATEWAY_SCHEMA_CHECKS]
+        self.gateway_settlements = {}
         self.fresh_bootstrap = "t|t"
         self.session = None  # (session id, secret hash hex) as seeded
         self.replaced = False
@@ -480,7 +514,12 @@ class FakeCluster:
     def respond(self, args, input):
         if args[:2] == ["helm", "version"]:
             return 0, "v4.3.0\n", ""
-        if args[:1] == ["openssl"] or args[:2] == ["docker", "build"] and "admission-export" in args:
+        if args[:1] == ["openssl"]:
+            if "-out" in args:
+                Path(args[args.index("-out") + 1]).write_text(
+                    "-----BEGIN CERTIFICATE-----\nSYNTHETIC\n-----END CERTIFICATE-----\n", encoding="utf-8")
+            return 0, "", ""
+        if args[:2] == ["docker", "build"] and "admission-export" in args:
             return 0, "", ""
         if args[:2] == ["docker", "build"]:
             self.built.add(args[args.index("--tag") + 1])
@@ -493,6 +532,8 @@ class FakeCluster:
             return 0, "", ""
         if args[:3] == ["kind", "load", "docker-image"]:
             role = args[3].split("/")[2].split(":")[0]
+            if role == smoke.STANDIN:
+                return 0, "", ""
             self.ctr[args[3]] = DIGEST[role]
             self.ctr[f"import-2026-11-19@{DIGEST[role]}"] = DIGEST[role]
             return 0, "", ""
@@ -555,8 +596,11 @@ class FakeCluster:
             })
         return 404, ""
 
-    def ingress_get(self, port, context, path, headers, *, timeout=smoke.HTTP_TIMEOUT):
+    def ingress_get(self, port, context, path, headers, *, timeout=smoke.HTTP_TIMEOUT, host=smoke.INGRESS_HOST):
         assert port == 8443
+        if host == smoke.GATEWAY_TLS_HOST:
+            assert path == "/readyz"
+            return IngressResponse(200)
         if path == "/readyz":
             return IngressResponse(200)
         assert headers["Cookie"] == f"{smoke.SESSION_COOKIE}={self.passwords['session']}"
@@ -591,10 +635,10 @@ class FakeCluster:
         return self.admitted_at is not None and smoke.time.monotonic() >= self.admitted_at + smoke.QUEUE_TIMEOUT_SECONDS
 
     def database(self, sql):
-        """`psql` on stdin in the fixture database: migration history, migration 19 grants, fresh-install
-        markers, session seed."""
+        """`psql` on stdin in the fixture database: migration history, migrations 19/20/37 grants,
+        fresh-install markers, session seed and settled gateway requests."""
         if "openmettle._sqlx_migrations" in sql:
-            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in range(17, 28)), ""
+            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in range(17, 38)), ""
         if sql == smoke.FRESH_BOOTSTRAP_SQL:
             return 0, self.fresh_bootstrap + "\n", ""
         if "xmin::text" in sql:
@@ -602,6 +646,16 @@ class FakeCluster:
             return 0, f"{RUN_ID}|{state}|12|1234|t|{terminals}\n", ""
         if sql == smoke.run_admission_sql():
             return 0, "|".join(self.run_admission) + "\n", ""
+        if sql == smoke.gateway_schema_sql():
+            return 0, "|".join(self.gateway_schema) + "\n", ""
+        if "FROM openmettle.gateway_requests q" in sql:
+            match = re.search(r"WHERE q\.run_id = '([0-9a-f-]+)'::uuid", sql)
+            req_id = self.gateway_settlements.get(match.group(1)) if match else None
+            if not req_id:
+                return 0, "", ""
+            return 0, (f"{req_id}|handed_off|t|t|1|{smoke.STANDIN_EXPECTED_PROMPT_TOKENS}|"
+                       f"{smoke.STANDIN_EXPECTED_COMPLETION_TOKENS}|t|settled|0|"
+                       f"{smoke.STANDIN_EXPECTED_SETTLED_UNITS}\n"), ""
         seeded = re.search(r"SELECT '([A-Za-z0-9_-]{43})', decode\('([0-9a-f]{64})', 'hex'\)", sql)
         if seeded and "INSERT INTO openmettle.local_sessions" in sql and "personal_limit_bytes" in sql \
                 and "VALUES ('personal', 'usage_tokens', " in sql:
@@ -612,6 +666,24 @@ class FakeCluster:
 
     def pod(self, component, index):
         name = f"{smoke.FULLNAME}-{component}-{index}"
+        if component == smoke.GATEWAY_COMPONENT:
+            container = {"name": "gateway", "imagePullPolicy": "Never",
+                         "image": smoke.digest_reference("gateway", DIGEST["gateway"]),
+                         "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}},
+                         "env": [
+                             {"name": "OPENMETTLE_GATEWAY_DATABASE_URL",
+                              "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["gateway"], "key": "url"}}},
+                             {"name": "OPENMETTLE_GATEWAY_MODEL", "value": smoke.CATALOG_MODEL},
+                             {"name": "OPENMETTLE_GATEWAY_CACHE_MODE", "value": "scoped"},
+                         ]}
+            spec = {"containers": [container], "securityContext": {"runAsNonRoot": True}}
+            return {"metadata": {"name": name, "uid": f"{name}-{self.gateway_mode}",
+                                 "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
+                                            "app.kubernetes.io/component": component}},
+                    "spec": spec,
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                               "containerStatuses": [{"restartCount": 0, "containerID": f"containerd://cid-gateway-{index}",
+                                                      "imageID": f"import-2026-11-19@{DIGEST['gateway']}"}]}}
         container = {"name": component, "imagePullPolicy": "Never",
                      "image": smoke.digest_reference(component, DIGEST[component]),
                      "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}
@@ -639,6 +711,28 @@ class FakeCluster:
                 ]
                 container["env"] += [{"name": "OPENMETTLE_API_AUTH_CONFIG",
                                       "value": smoke.AUTH_CONFIG_PATH}, *issuance_env()]
+            if component == "worker" and self.gateway_mode is not None:
+                cm_name = (smoke.INFERENCE_TLS_CONFIG_MAP if self.gateway_mode == "tls"
+                           else smoke.INFERENCE_PLAIN_CONFIG_MAP)
+                spec["volumes"].append({"name": "inference-config", "configMap": {
+                    "name": cm_name, "items": [{"key": "inference.json", "path": "inference.json"},
+                                               {"key": smoke.AUTH_CATALOG_KEY, "path": smoke.AUTH_CATALOG_KEY}]}})
+                container["volumeMounts"].append({"name": "inference-config", "mountPath": smoke.INFERENCE_CONFIG_DIR,
+                                                  "readOnly": True})
+                if self.gateway_mode == "tls":
+                    spec["volumes"].append({"name": "inference-ca", "configMap": {
+                        "name": smoke.INFERENCE_CA_CONFIG_MAP, "items": [{"key": "ca.crt", "path": "ca.crt"}]}})
+                    container["volumeMounts"].append({"name": "inference-ca", "mountPath": smoke.INFERENCE_CA_DIR,
+                                                      "readOnly": True})
+                container["env"] += [
+                    {"name": "OPENMETTLE_WORKER_POLL_MS", "value": "100"},
+                    {"name": "OPENMETTLE_WORKER_INFERENCE_CONFIG", "value": smoke.INFERENCE_CONFIG_PATH},
+                    {"name": "OPENMETTLE_WORKER_RUN_SLOTS", "value": "2"},
+                    {"name": "OPENMETTLE_WORKER_LEASE_MS", "value": "30000"},
+                    {"name": "OPENMETTLE_WORKER_EXECUTION_TIMEOUT_MS", "value": "60000"},
+                    {"name": "OPENMETTLE_WORKER_EXECUTING_PER_ACTOR", "value": "2"},
+                    {"name": "OPENMETTLE_WORKER_EXECUTING_PER_SCOPE", "value": "4"},
+                ]
         return {"metadata": {"name": name, "uid": f"{name}-{self.replaced}", "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
                 "spec": spec,
@@ -650,13 +744,21 @@ class FakeCluster:
     def probe(self, args):
         """`kubectl exec deployment/<workload> ... -- timeout N bash -c <script> <host> <port> [path]`.
 
-        Models the chart's policies under the namespace deny-all: release pods reach only the
-        database; only the decoy peer reaches the API; pods in the database namespace are unrestricted.
+        Models the chart's policies under the namespace deny-all: release pods reach only configured
+        egress peers; only configured ingress peers reach API or gateway; database-namespace pods are unrestricted.
         """
         workload = args[1].split("/", 1)[1]
         command = args[args.index("--") + 1:]
         host, port, http = command[5], int(command[6]), len(command) > 7
-        if workload.startswith(smoke.FULLNAME):
+        gw_host = f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"
+        if (host, port) == ("127.0.0.1", 8082) and workload == smoke.GATEWAY_WORKLOAD:
+            allowed = True
+        elif (host, port) == (gw_host, 8082):
+            allowed = workload == f"{smoke.FULLNAME}-worker" and self.gateway_mode == "plain"
+        elif (host, port) == (smoke.GATEWAY_TLS_HOST, 8443):
+            allowed = (not workload.startswith(smoke.FULLNAME)) or (
+                workload == f"{smoke.FULLNAME}-worker" and self.gateway_mode == "tls")
+        elif workload.startswith(smoke.FULLNAME):
             allowed = (host, port) == (DATABASE_HOST, 5432)
         elif host == API_HOST:
             allowed = workload == smoke.PEER
@@ -711,6 +813,8 @@ class FakeCluster:
                 if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.AUTH_LOGIN_KEYS_SECRET:
                     self.passwords["auth_cursor_key"] = item["data"]["cursor.key"]
                     self.passwords["auth_login_key"] = item["data"]["active.key"]
+                if item["kind"] == "ConfigMap" and item["metadata"]["name"] == smoke.INFERENCE_PLAIN_CONFIG_MAP:
+                    self.inference_fixtures_applied = True
             return 0, "applied", ""
         if args[:2] == ["create", "--dry-run=server"]:
             return 1, "", f'pods "psa-probe" is forbidden: {smoke.PSA_DENIAL}:latest": allowPrivilegeEscalation'
@@ -772,7 +876,8 @@ class FakeCluster:
             names = [f"PersistentVolumeClaim/{smoke.ARTIFACTS_CLAIM}"] if self.artifacts_pvc_created else []
             return listing(self.items(names))
         if args[:2] == ["get", "deployment"]:
-            component = args[2].rsplit("-", 1)[1]
+            component = (smoke.GATEWAY_COMPONENT if args[2] == smoke.GATEWAY_WORKLOAD
+                         else args[2].rsplit("-", 1)[1])
             return ok({"metadata": {"name": args[2], "generation": self.generation[component],
                                     "creationTimestamp": "2026-11-19T10:01:30Z"},
                        "status": {"readyReplicas": self.replicas[component]}})
@@ -807,6 +912,10 @@ class FakeCluster:
                 if args[1] == "configmaps,secrets,networkpolicies":
                     owned.extend([f"ConfigMap/{smoke.AUTH_CONFIG_MAP}",
                                   f"NetworkPolicy/{smoke.NAMESPACE_DENY}"])
+                    if self.inference_fixtures_applied:
+                        owned.extend([f"ConfigMap/{smoke.INFERENCE_PLAIN_CONFIG_MAP}",
+                                      f"ConfigMap/{smoke.INFERENCE_TLS_CONFIG_MAP}",
+                                      f"ConfigMap/{smoke.INFERENCE_CA_CONFIG_MAP}"])
                 return listing(self.items(owned))
             return listing([])
         if args[:1] == ["logs"]:
@@ -831,13 +940,24 @@ class FakeCluster:
             worker_replicas = values["worker"]["replicas"]
             api_replicas = values.get("api", {}).get("replicas", 1)
             profile = bool(values.get("storage", {}).get("artifacts", {}).get("enabled"))
-            if self.installed and (worker_replicas != self.replicas["worker"] or profile != self.profile_enabled):
+            gw_mode = None
+            if values.get("gateways"):
+                gw_mode = ("tls" if values.get("worker", {}).get("inference", {}).get("caBundle", {}).get("enabled")
+                           else "plain")
+            if self.installed and (worker_replicas != self.replicas["worker"] or profile != self.profile_enabled
+                                   or gw_mode != self.gateway_mode):
                 self.generation["worker"] += 1
             if self.installed and (api_replicas != self.replicas["api"] or profile != self.profile_enabled):
                 self.generation["api"] += 1
             self.replicas["worker"] = worker_replicas
             self.replicas["api"] = api_replicas
+            if gw_mode is not None:
+                self.replicas[smoke.GATEWAY_COMPONENT] = 1
+                self.generation[smoke.GATEWAY_COMPONENT] = self.generation.get(smoke.GATEWAY_COMPONENT, 0) + 1
+            else:
+                self.replicas.pop(smoke.GATEWAY_COMPONENT, None)
             self.profile_enabled = profile
+            self.gateway_mode = gw_mode
             if profile:
                 self.artifacts_pvc_created = True
             self.installed, self.revision = True, self.revision + 1
@@ -872,7 +992,8 @@ class FakePortForward:
 
     def __init__(self, kubectl, env, target, port, namespace=smoke.APP_NAMESPACE):
         if namespace == smoke.DB_NAMESPACE:
-            assert target == f"deployment/{smoke.INGRESS_CLASS}" and port == 8443
+            assert (target, port) in ((f"deployment/{smoke.INGRESS_CLASS}", 8443),
+                                      (f"service/{smoke.STANDIN}", smoke.STANDIN_PORT))
             self.port = port
             return
         self.port = port if target.startswith("service/") else 9000 + int(target.rsplit("-", 1)[1])
@@ -962,18 +1083,21 @@ class OrchestrationTest(unittest.TestCase):
             status = smoke.main(["--core-dir", str(self.tmp), "--report", str(report)])
         return status, json.loads(report.read_text()), stderr.getvalue()
 
-    def assert_cleaned_up(self, built=smoke.ROLES, cluster=True):
+    def assert_cleaned_up(self, built=None, cluster=True):
         deleted = [c[4] for c in self.fake.commands("kind", "delete", "cluster", "--name")]
         self.assertEqual(deleted, [self.fake.name] if cluster else [])
         removed = [c[3] for c in self.fake.commands("docker", "image", "rm")]
-        self.assertEqual(sorted(removed), sorted(r for r in self.fake.built if r.split("/")[2].split(":")[0] in built))
-        self.assertEqual(len(removed), len(built))
+        if built is None:
+            self.assertEqual(sorted(removed), sorted(self.fake.built))
+        else:
+            self.assertEqual(sorted(removed), sorted(r for r in self.fake.built if r.split("/")[2].split(":")[0] in built))
+            self.assertEqual(len(removed), len(built))
 
     def test_passes_on_a_healthy_cluster(self):
         status, report, _ = self.run_main()
         self.assertEqual(self.fake.unknown, [])
         self.assertEqual((status, report["result"]), (0, "passed"), report.get("error"))
-        self.assertEqual(len(report["checks"]), 11)
+        self.assertEqual(len(report["checks"]), 13)
         self.assertEqual(self.fake.resumes, [(False, None), (False, "start"), (True, "start"),
                                              (True, None), (True, "end")])
         self.assertEqual(next(c["quiet_seconds"] for c in report["checks"] if "quiet_seconds" in c), 30)
@@ -1004,6 +1128,9 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(install_check["latest_version"], smoke.REQUIRED_MIGRATION)
         self.assertEqual(install_check["run_admission"], {"dispatch_lock_singleton": True,
                                                           "privileges_checked": len(smoke.RUN_ADMISSION_CHECKS) - 1})
+        self.assertEqual(install_check["gateway_schema"], {"gateway_function_only": True,
+                                                           "superseded_tables_absent": True,
+                                                           "checks": len(smoke.GATEWAY_SCHEMA_CHECKS)})
         self.assertEqual(install_check["fresh_bootstrap"], {"metering_and_overrides_enforced": True,
                                                             "artifact_volume_unpinned_auto_pin_allowed": True})
         self.assertEqual(profile_check["artifacts"], {
@@ -1028,13 +1155,24 @@ class OrchestrationTest(unittest.TestCase):
         run_calls = [c for c in self.fake.artifacts.calls if c[2].startswith(("/v1/models", "/v1/conversations",
                                                                              "/v1/runs"))]
         self.assertEqual([(port, method, path.rsplit("/", 1)[-1], headers.get("Idempotency-Key"))
-                          for port, method, path, headers in run_calls],
+                          for port, method, path, headers in run_calls[:5]],
                          [(9000, "GET", "models", None),
                           (9000, "POST", "conversations", smoke.HTTP_RUN_KEYS["conversation"]),
                           (9000, "POST", "runs", smoke.HTTP_RUN_KEYS["run"]),
                           (9000, "POST", "runs", smoke.HTTP_RUN_KEYS["run"]),
                           (9000, "POST", "cancel", smoke.HTTP_RUN_KEYS["cancel"])])
-        self.assertEqual(self.fake.artifacts.runs_state, {"cancelled": 1})
+        self.assertEqual(self.fake.artifacts.runs_state, {"cancelled": 1, "succeeded": 2})
+        plain_gw = next(c for c in report["checks"] if "(plain topology" in c["check"])
+        tls_gw = next(c for c in report["checks"] if "(tls topology" in c["check"])
+        self.assertEqual(plain_gw["mounts"], {"mode": "plain", "worker_pods": 1, "gateway_pods": 1, "ca_mounted": False})
+        self.assertEqual(tls_gw["mounts"], {"mode": "tls", "worker_pods": 1, "gateway_pods": 1, "ca_mounted": True})
+        for gw_check in (plain_gw, tls_gw):
+            self.assertEqual(gw_check["turn"], {
+                "run_state": "succeeded",
+                "assistant_content": smoke.STANDIN_EXPECTED_CONTENT,
+                "settlement": {"prompt_tokens": 11, "completion_tokens": 7, "settled_units": 18},
+                "upstream": {"model": smoke.CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": 64},
+            })
         self.assertEqual(len(self.fake.commands("helm", "get", "hooks", smoke.RELEASE)), 2)
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
                                                 "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3,
@@ -1058,10 +1196,11 @@ class OrchestrationTest(unittest.TestCase):
         self.assertIn("networkpolicies", smoke.INVENTORY_KINDS.split(","))
         self.assertNotIn("networkpolicies", smoke.OPTIONAL_KINDS.split(","))
         self.assertNotIn("error", report)
-        self.assert_cleaned_up()
+        self.assert_cleaned_up(built=(*smoke.ROLES, smoke.STANDIN))
         self.assertEqual([c[1:3] for c in self.fake.commands("helm") if c[1] in ("install", "upgrade", "uninstall")],
                          [["install", smoke.RELEASE], ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE],
-                          ["upgrade", smoke.RELEASE], ["uninstall", smoke.RELEASE]])
+                          ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE],
+                          ["uninstall", smoke.RELEASE]])
         for role in smoke.ROLES:
             self.assertEqual(report["images"][role], {"reference": smoke.digest_reference(role, DIGEST[role]),
                                                       "cri_image_id": IMAGE_ID[role],
@@ -1077,7 +1216,7 @@ class OrchestrationTest(unittest.TestCase):
                 observed.append("pods")
 
         def ingress(port, context, path, headers, **kwargs):
-            if self.fake.replaced:
+            if self.fake.replaced and kwargs.get("host", smoke.INGRESS_HOST) == smoke.INGRESS_HOST:
                 observed.append(path)
                 if path == "/readyz":
                     status = next(statuses)
@@ -1126,7 +1265,7 @@ class OrchestrationTest(unittest.TestCase):
                 mutations += 1
             if call[:3] != ["kubectl", "get", "namespace"]:
                 previous = call
-        self.assertEqual(mutations, 11)  # also TLS, controller, fixture copy/admission and API restart
+        self.assertEqual(mutations, 16)  # includes gateway stand-in, gateway TLS secret, inference fixtures and rev 5/6 upgrades
 
     def test_namespace_from_another_run_is_refused_before_any_change(self):
         self.fake.namespaces[smoke.APP_NAMESPACE] = {smoke.RUN_LABEL: "ffffffff"}
@@ -1188,8 +1327,9 @@ class OrchestrationTest(unittest.TestCase):
         (text, values), _ = guard.call_args
         self.assertEqual(json.loads(text), report)
         self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
-        self.assertEqual(len(self.fake.passwords), 8)
+        self.assertEqual(len(self.fake.passwords), 9)
         self.assertIn("issuance", self.fake.passwords)
+        self.assertIn("gateway", self.fake.passwords)
         self.assertEqual(len(self.fake.passwords["session"]), 87)
 
     def test_a_v1_failure_echoing_the_session_cookie_is_redacted(self):
@@ -1208,8 +1348,8 @@ class OrchestrationTest(unittest.TestCase):
         self.fake.doctors.append(doctor_output(["kind", "delete"], returncode=1))
         status, report, _ = self.run_main()
         self.assertEqual((status, report["result"]), (1, "failed"))
-        self.assertEqual(report["cleanup_errors"], [f"kind delete cluster --name {self.fake.name} --kubeconfig "
-                                                    f"{self.fake.calls[-4][-1]}: failed"])
+        delete_cmd = self.fake.commands("kind", "delete", "cluster")[0]
+        self.assertEqual(report["cleanup_errors"], [f"{' '.join(delete_cmd)}: failed"])
 
     def test_build_failure_removes_only_built_images(self):
         self.fake.doctors.append(doctor_output(["build", "worker"], returncode=1, stderr="build failed"))
@@ -1246,7 +1386,7 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(status, 0, report.get("error"))
         self.assertTrue(report["images"]["api"]["resolved_before_alias"])
         tagged = [c[-1] for c in self.fake.commands("docker", "exec") if c[5:7] == ["images", "tag"]]
-        self.assertEqual(tagged, [smoke.digest_reference(r, DIGEST[r]) for r in ("worker", "migrate")])
+        self.assertEqual(tagged, [smoke.digest_reference(r, DIGEST[r]) for r in ("worker", "migrate", "gateway")])
 
     def test_reference_resolving_before_the_name_exists_is_still_named(self):
         """CRI resolving the digest reference does not mean containerd holds that name."""
@@ -1405,9 +1545,27 @@ class OrchestrationTest(unittest.TestCase):
                 pod_status(lambda p: p["spec"]["containers"][0].__setitem__(
                     "env", [{"name": "OPENMETTLE_WORKER_AUTH_CONFIG", "value": smoke.AUTH_CONFIG_PATH}])),
                 when=revision(4)), "worker container must not receive AUTH_CONFIG env"),
-            "migration history before the run admission migration": (doctor_output(
-                ["exec", "--stdin", "deployment/postgres", "psql"], stdout="1|t|aa|t\n26|t|bb|t\n"),
-                "before the fenced capacity migration 27"),
+            "migration history before required migration": (doctor_output(
+                ["exec", "--stdin", "deployment/postgres", "psql"], stdout="1|t|aa|t\n36|t|bb|t\n"),
+                f"before migration {smoke.REQUIRED_MIGRATION}"),
+            "gateway schema privilege violation": (
+                lambda args, result: fake_ref().gateway_schema.__setitem__(0, "f"),
+                "migration 37 gateway boundary"),
+            "gateway plain topology leaks to api": (doctor_output(
+                ["exec", f"deployment/{api}", f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"],
+                returncode=0, stdout="HTTP/1.1 200 OK\r\n"),
+                "NetworkPolicy is not enforced"),
+            "gateway tls topology allows direct worker": (
+                lambda args, result: (subprocess.CompletedProcess(args, 0, "HTTP/1.1 200 OK\r\n", "")
+                                      if fake_ref().revision == 6
+                                      and matches(args, ["exec", f"deployment/{worker}",
+                                                         f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"])
+                                      else None),
+                "NetworkPolicy is not enforced"),
+            "gateway leaks Authorization to stand-in": (HttpDoctor(
+                lambda m, p, h, r: (m, p) == ("GET", "/_recorded"),
+                lambda doc, body: doc[-1]["headers"].__setitem__("authorization", ["Bearer leaked"])),
+                "leaked Authorization header"),
             "upgraded rather than fresh quota markers": (
                 lambda args, result: setattr(fake_ref(), "fresh_bootstrap", "f|t"),
                 "fresh-install quota and artifact-volume markers are 'f|t'"),
@@ -1607,8 +1765,9 @@ class OrchestrationTest(unittest.TestCase):
         readings = []
 
         def history_read(args, result):
-            """A psql read of the migration history; other psql reads (grants, seed) are not one."""
-            return "psql" in args and result.stdout[:1].isdigit()
+            """A psql read of the migration history; other psql reads (grants, seed, settlement UUIDs) are not."""
+            first = result.stdout.split("|", 1)[0]
+            return "psql" in args and first.isdigit()
 
         def history_changes(args, result):
             if history_read(args, result):
@@ -1710,24 +1869,33 @@ class ValuesTest(unittest.TestCase):
     def test_values_pin_every_image_by_digest_without_pulling(self):
         values = smoke.smoke_values(DIGEST, worker_replicas=2)
         self.assertEqual(values["images"]["pullPolicy"], "Never")
-        for role in smoke.ROLES:
+        for role in smoke.DEFAULT_ROLES:
             self.assertEqual(values["images"][role]["digest"], DIGEST[role])
-        # Without auth no issuance Secret is configured (the chart refuses one).
-        self.assertEqual(values["database"], {role: {"existingSecret": smoke.SECRET[role]} for role in smoke.ROLES})
+        self.assertNotIn("gateway", values["images"])
+        # Without auth or gateways neither issuance nor gateway Secret is configured (the chart refuses them).
+        self.assertEqual(values["database"],
+                         {role: {"existingSecret": smoke.SECRET[role]} for role in smoke.DEFAULT_ROLES})
         self.assertEqual(values["worker"], {"replicas": 2})
         self.assertNotIn("api", values)
+        self.assertNotIn("gateways", values)
         self.assertEqual(values["networkPolicy"], {
             "api": {"ingressFrom": [smoke.database_namespace_peer(smoke.PEER_LABELS)]},
             "database": {"to": [smoke.database_namespace_peer(smoke.POSTGRES_LABELS)]},
         })
 
     def test_values_require_every_valid_digest_and_bounded_replicas(self):
-        for digests in ({k: v for k, v in DIGEST.items() if k != "migrate"}, {**DIGEST, "api": "latest"}):
+        for digests in ({k: v for k, v in DIGEST.items() if k != "migrate"},
+                        {k: v for k, v in DIGEST.items() if k != "gateway"},
+                        {**DIGEST, "api": "latest"}):
             with self.subTest(digests=digests), self.assertRaises(smoke.SmokeFailure):
                 smoke.smoke_values(digests, 1)
         for replicas in (0, 3):
             with self.subTest(replicas=replicas), self.assertRaises(smoke.SmokeFailure):
                 smoke.smoke_values(DIGEST, replicas)
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.smoke_values(DIGEST, 1, gateway_mode="plain")
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.smoke_values(DIGEST, 1, enabled_profile=True, gateway_mode="other")
 
     def test_helm_bound_matches_migration_deadline(self):
         values = smoke.smoke_values(DIGEST, 1)["migration"]
@@ -1746,7 +1914,8 @@ class ValuesTest(unittest.TestCase):
                                     capture_output=True, text=True, timeout=120, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("ISSUANCE", result.stdout)
-        for role in smoke.ROLES:
+        self.assertNotIn("OPENMETTLE_GATEWAY_", result.stdout)
+        for role in smoke.DEFAULT_ROLES:
             self.assertIn(f'image: "{smoke.digest_reference(role, DIGEST[role])}"', result.stdout)
         # The non-hook objects the chart renders are exactly what the smoke expects in the release.
         rendered = []
@@ -1779,7 +1948,42 @@ class ValuesTest(unittest.TestCase):
             "to": [{"ipBlock": {"cidr": smoke.AUTH_OIDC_CIDR}}],
             "port": 443,
         })
-        self.assertEqual(values["database"], {role: {"existingSecret": smoke.SECRET[role]} for role in smoke.DB_LOGINS})
+        self.assertEqual(values["database"], {role: {"existingSecret": smoke.SECRET[role]}
+                                              for role in ("api", "worker", "migrate", "issuance")})
+
+    def test_values_and_chart_accept_gateway_plain_and_tls(self):
+        """Both gateway_mode='plain' and 'tls' produce valid chart values and render cleanly via Helm."""
+        if shutil.which(HELM) is None:
+            self.skipTest("helm not on PATH")
+        for mode, port, cm in (("plain", 8082, smoke.INFERENCE_PLAIN_CONFIG_MAP),
+                               ("tls", 8443, smoke.INFERENCE_TLS_CONFIG_MAP)):
+            with self.subTest(mode=mode):
+                values = smoke.smoke_values(DIGEST, 1, enabled_profile=True, gateway_mode=mode)
+                self.assertEqual(values["images"]["gateway"]["digest"], DIGEST["gateway"])
+                self.assertEqual(values["database"]["gateway"], {"existingSecret": smoke.SECRET["gateway"]})
+                self.assertEqual(values["worker"]["pollMs"], 100)
+                self.assertEqual(values["worker"]["inference"]["configMapName"], cm)
+                self.assertEqual(values["networkPolicy"]["worker"]["inference"]["port"], port)
+                if mode == "tls":
+                    self.assertTrue(values["worker"]["inference"]["caBundle"]["enabled"])
+                    self.assertIn("ingressFrom", values["gateways"][smoke.GATEWAY_NAME]["networkPolicy"])
+                else:
+                    self.assertNotIn("caBundle", values["worker"]["inference"])
+                    self.assertNotIn("ingressFrom", values["gateways"][smoke.GATEWAY_NAME]["networkPolicy"])
+                with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+                    json.dump(values, handle)
+                    handle.flush()
+                    result = subprocess.run([HELM, "template", smoke.RELEASE, str(smoke.CHART),
+                                             "--values", handle.name],
+                                            capture_output=True, text=True, timeout=120, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'name: {smoke.GATEWAY_WORKLOAD}', result.stdout)
+                self.assertIn("name: OPENMETTLE_WORKER_INFERENCE_CONFIG", result.stdout)
+                self.assertIn("name: OPENMETTLE_GATEWAY_DATABASE_URL", result.stdout)
+                if mode == "tls":
+                    self.assertIn(smoke.INFERENCE_CA_DIR, result.stdout)
+                else:
+                    self.assertNotIn(smoke.INFERENCE_CA_DIR, result.stdout)
 
     def test_chart_accepts_enabled_profile_smoke_values(self):
         """The enabled-profile values pass chart schema and render guards and emit PDB, PVC and LOG_* env."""
@@ -2253,8 +2457,9 @@ class HttpAdmissionTest(unittest.TestCase):
 
     def test_smoke_catalog_adds_prompt_bound_to_the_preset_model_only(self):
         catalog = smoke.smoke_catalog(CATALOG_FIXTURE)
-        self.assertEqual(catalog["models"]["a"], {"output_limit": 4096, "prompt_bound": smoke.PROMPT_BOUND})
-        self.assertEqual(catalog["models"]["b"], {})
+        self.assertEqual(catalog["models"]["a"],
+                         {"pin": _PIN_A, "output_limit": 4096, "prompt_bound": smoke.PROMPT_BOUND})
+        self.assertEqual(catalog["models"]["b"], {"pin": _PIN_B})
         self.assertNotIn("prompt_bound", CATALOG_FIXTURE["models"]["a"])  # the fixture is not modified
         for broken in ({**CATALOG_FIXTURE, "presets": {}},
                        {**CATALOG_FIXTURE, "presets": {"study": {"model": "b"}}},
@@ -2477,14 +2682,14 @@ class FixtureTest(unittest.TestCase):
             self.assertEqual(item["metadata"]["labels"][smoke.RUN_LABEL], "0a1b2c3d", item["metadata"]["name"])
 
     def test_test_creates_one_url_secret_per_role(self):
-        self.assertEqual(smoke.DB_LOGINS, ("api", "worker", "migrate", "issuance"))
+        self.assertEqual(smoke.DB_LOGINS, ("api", "worker", "migrate", "issuance", "gateway"))
         for role in smoke.DB_LOGINS:
             secret = self.find("Secret", smoke.SECRET[role])
             self.assertEqual(secret["metadata"]["namespace"], smoke.APP_NAMESPACE)
             url = secret["stringData"]["url"]
             self.assertRegex(url, rf"^postgres://{smoke.DB_ROLE[role]}:{PASSWORDS[role]}@[^/]+/openmettle"
                                   r"\?sslmode=disable$")
-        for login in ("migrate", "issuance"):
+        for login in ("migrate", "issuance", "gateway"):
             holders = [i["metadata"]["name"] for i in self.items if PASSWORDS[login] in json.dumps(i)]
             self.assertEqual(sorted(holders), sorted([smoke.SECRET[login], "postgres-fixture"]), login)
 
@@ -2492,15 +2697,12 @@ class FixtureTest(unittest.TestCase):
         fixture = self.find("Secret", "postgres-fixture")
         self.assertEqual(fixture["metadata"]["namespace"], smoke.DB_NAMESPACE)
         sql = fixture["stringData"]["provision.sql"]
-        # Four disjoint login roles before migration 1; migration 18 refuses without openmettle_issuance
-        # and migration 23 without openmettle_gateway, which no chart process logs in as.
+        # Five disjoint login roles before migration 1: owner, api, issuance, worker and gateway.
         self.assertEqual(sorted(re.findall(r"CREATE ROLE (\w+) ", sql)),
                          ["openmettle_api", "openmettle_gateway", "openmettle_issuance", "openmettle_owner",
                           "openmettle_worker"])
         for role in smoke.DB_LOGINS:
             self.assertIn(f"CREATE ROLE {smoke.DB_ROLE[role]} LOGIN PASSWORD '{PASSWORDS[role]}';", sql)
-        self.assertIn(f"CREATE ROLE {smoke.GATEWAY_ROLE} NOLOGIN;\n", sql)
-        self.assertNotIn("gateway", " ".join(smoke.SECRET.values()) + " ".join(smoke.DB_ROLE.values()))
         self.assertIn("CREATE DATABASE openmettle OWNER openmettle_owner;", sql)
         self.assertNotRegex(sql, r"SUPERUSER|CREATEROLE|CREATEDB|GRANT")
 
@@ -2844,6 +3046,7 @@ class TelemetryContractParityTests(unittest.TestCase):
     def test_allowed_log_fields_include_metric_export_drops_and_match_core(self):
         """Fails if ALLOWED_LOG_FIELDS drifts from core telemetry::FIELDS plus flattened metadata."""
         self.assertIn("dropped_metric_exports", smoke.ALLOWED_LOG_FIELDS)
+        self.assertIn("gateway.request_id", smoke.ALLOWED_LOG_FIELDS)
         core_dir = os.environ.get("OPENMETTLE_CORE_DIR")
         if not core_dir:
             return
@@ -2855,6 +3058,126 @@ class TelemetryContractParityTests(unittest.TestCase):
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
         expected = set(contract["logs"]["allowed_fields"]) | {"timestamp", "level"}
         self.assertEqual(smoke.ALLOWED_LOG_FIELDS, expected)
+
+
+class GatewayAndInferenceHelpersTest(unittest.TestCase):
+    """Unit tests for ADR 0044 gateway, worker.inference, stand-in and settlement smoke helpers."""
+
+    def test_gateway_schema_sql_and_evaluate(self):
+        sql = smoke.gateway_schema_sql()
+        self.assertTrue(sql.startswith("SELECT ") and sql.endswith(";"))
+        self.assertIn("openmettle.gateway_dispatch(uuid,bytea)", sql)
+        self.assertIn("openmettle.gateway_dispatch_scoped(uuid,bytea)", sql)
+        self.assertIn(smoke.GATEWAY_SETTLE_FN, sql)
+        self.assertIn("to_regclass('openmettle.gateway_bindings') IS NULL", sql)
+        good = "|".join("t" if expected else "f" for _, expected in smoke.GATEWAY_SCHEMA_CHECKS)
+        self.assertEqual(smoke.evaluate_gateway_schema(good + "\n"), {
+            "gateway_function_only": True, "superseded_tables_absent": True,
+            "checks": len(smoke.GATEWAY_SCHEMA_CHECKS),
+        })
+        flipped = good.split("|")
+        flipped[3] = "t"
+        with self.assertRaisesRegex(smoke.SmokeFailure, "migration 37 gateway boundary"):
+            smoke.evaluate_gateway_schema("|".join(flipped))
+        with self.assertRaisesRegex(smoke.SmokeFailure, "gateway privilege query returned"):
+            smoke.evaluate_gateway_schema("t|t")
+
+    def test_smoke_inference_document_plain_and_tls(self):
+        catalog = smoke.smoke_catalog(CATALOG_FIXTURE)
+        plain = smoke.smoke_inference_document(catalog, tls=False)
+        tls = smoke.smoke_inference_document(catalog, tls=True)
+        self.assertEqual(plain["version"], 1)
+        self.assertEqual(plain["catalog_file"], smoke.INFERENCE_CATALOG_PATH)
+        self.assertEqual(set(plain["routes"]), set(catalog["models"]))
+        self.assertEqual(set(tls["routes"]), set(catalog["models"]))
+        for model in catalog["models"]:
+            self.assertTrue(plain["routes"][model]["endpoint"].startswith("http://"))
+            self.assertNotIn("trust", plain["routes"][model])
+            self.assertEqual(plain["routes"][model]["private_cidrs"], smoke.CLUSTER_PRIVATE_CIDRS)
+            self.assertTrue(tls["routes"][model]["endpoint"].startswith("https://"))
+            self.assertEqual(tls["routes"][model]["trust"],
+                             {"roots": "bundle", "bundle_path": smoke.INFERENCE_CA_PATH})
+
+    @unittest.skipIf(shutil.which("openssl") is None, "openssl not on PATH")
+    def test_gateway_tls_commands_produce_verifiable_ca_and_leaf_cert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ca_cert, ca_key = root / "ca.crt", root / "ca.key"
+            leaf_csr, leaf_key, leaf_ext, leaf_cert = (
+                root / "leaf.csr", root / "leaf.key", root / "leaf.ext", root / "leaf.crt")
+            ext_body, commands = smoke.gateway_tls_commands(ca_cert, ca_key, leaf_csr, leaf_key, leaf_ext, leaf_cert)
+            leaf_ext.write_text(ext_body, encoding="utf-8")
+            for cmd in commands:
+                subprocess.run(cmd, check=True, capture_output=True)
+            verified = subprocess.run(["openssl", "verify", "-CAfile", str(ca_cert), str(leaf_cert)],
+                                      check=False, capture_output=True, text=True)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            text = subprocess.run(["openssl", "x509", "-in", str(leaf_cert), "-noout", "-text"],
+                                  check=True, capture_output=True, text=True).stdout
+            self.assertIn(f"DNS:{smoke.GATEWAY_TLS_HOST}", text)
+            self.assertIn("CA:FALSE", text)
+            self.assertIn("TLS Web Server Authentication", text)
+
+    def test_standin_and_inference_fixture_manifests(self):
+        standin = smoke.standin_manifests("openmettle-smoke.invalid/openmettle/sglang-standin:smoke-1", "1")["items"]
+        dep = next(i for i in standin if i["kind"] == "Deployment")
+        pod = dep["spec"]["template"]["spec"]
+        self.assertEqual(pod["securityContext"], {"runAsNonRoot": True, "runAsUser": 65532, "runAsGroup": 65532,
+                                                  "seccompProfile": {"type": "RuntimeDefault"}})
+        self.assertEqual(pod["containers"][0]["imagePullPolicy"], "Never")
+        self.assertTrue(pod["containers"][0]["securityContext"]["readOnlyRootFilesystem"])
+        fixtures = smoke.inference_fixture_manifests("PEM", smoke.smoke_catalog(CATALOG_FIXTURE), "1")["items"]
+        names = {(i["kind"], i["metadata"]["name"]) for i in fixtures}
+        self.assertEqual(names, {
+            ("ConfigMap", smoke.INFERENCE_PLAIN_CONFIG_MAP),
+            ("ConfigMap", smoke.INFERENCE_TLS_CONFIG_MAP),
+            ("ConfigMap", smoke.INFERENCE_CA_CONFIG_MAP),
+            ("Ingress", smoke.GATEWAY_TLS_INGRESS),
+        })
+
+    def test_gateway_probe_plan_controls(self):
+        for tls in (False, True):
+            plan = smoke.gateway_probe_plan(tls=tls)
+            by_name = {p["name"]: p for p in plan}
+            for p in plan:
+                if p["expect"] == "deny":
+                    self.assertIn(p["control"], by_name)
+                    self.assertEqual(by_name[p["control"]]["expect"], "connect")
+
+    def test_evaluate_standin_record(self):
+        req_id = "00000000-0000-4000-d000-000000000001"
+        good = {"headers": {"x-request-id": [req_id]}, "body": {"model": smoke.CATALOG_MODEL, "cache_salt": "f" * 64}}
+        self.assertEqual(smoke.evaluate_standin_record(good, req_id),
+                         {"model": smoke.CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": 64})
+        for bad, msg in (
+            ({"headers": {"authorization": ["Bearer x"], "x-request-id": [req_id]}, "body": good["body"]},
+             "leaked Authorization"),
+            ({"headers": {"x-request-id": ["other"]}, "body": good["body"]}, "upstream x-request-id"),
+            ({"headers": good["headers"], "body": {"model": "wrong", "cache_salt": "f" * 64}}, "upstream body model"),
+            ({"headers": good["headers"], "body": {"model": smoke.CATALOG_MODEL, "cache_salt": "BAD"}}, "cache_salt"),
+        ):
+            with self.subTest(msg=msg), self.assertRaisesRegex(smoke.SmokeFailure, msg):
+                smoke.evaluate_standin_record(bad, req_id)
+
+    def test_settled_round_sql_and_evaluate(self):
+        run_id = "00000000-0000-4000-c000-000000000001"
+        req_id = "00000000-0000-4000-d000-000000000001"
+        self.assertIn(run_id, smoke.settled_round_sql(run_id))
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.settled_round_sql("not-a-uuid")
+        self.assertIsNone(smoke.evaluate_settled_round(""))
+        good = f"{req_id}|handed_off|t|t|1|11|7|t|settled|0|18\n"
+        self.assertEqual(smoke.evaluate_settled_round(good),
+                         {"request_id": req_id, "prompt_tokens": 11, "completion_tokens": 7, "settled_units": 18})
+        for bad in (
+            f"{req_id}|reserved|t|t|1|11|7|t|settled|0|18\n",
+            f"{req_id}|handed_off|f|t|1|11|7|t|settled|0|18\n",
+            f"{req_id}|handed_off|t|t|1|11|7|t|held|18|0\n",
+            "bad-uuid|handed_off|t|t|1|11|7|t|settled|0|18\n",
+            good + good,
+        ):
+            with self.subTest(bad=bad[:30]), self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_settled_round(bad)
 
 
 if __name__ == "__main__":

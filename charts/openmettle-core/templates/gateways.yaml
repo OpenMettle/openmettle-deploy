@@ -1,0 +1,25 @@
+{{- /* Per-model openmettle-gateway Deployments and ClusterIP Services (core ADR 0044; opt-in, empty by default). */ -}}
+{{- range $name := keys (default dict .Values.gateways) | sortAlpha }}
+{{- $g := dict }}
+{{- include "openmettle-core.resolveGateway" (dict "name" $name "raw" (index $.Values.gateways $name) "out" $g) }}
+{{- $component := printf "gateway-%s" $name }}
+{{- $context := dict "root" $ "component" $component }}
+---
+{{ include "openmettle-core.deployment" (dict "root" $ "component" $component "role" "gateway" "port" 8082 "values" $g "field" (printf "gateways.%s" $name)) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openmettle-core.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "openmettle-core.selectorLabels" $context | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ int64 $g.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

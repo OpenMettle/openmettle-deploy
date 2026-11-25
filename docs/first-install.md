@@ -1,6 +1,6 @@
 # First install with sign-in
 
-This guide takes an empty single-node Kubernetes cluster and an empty PostgreSQL 18 database to this end state: a person can sign in, call authenticated `/v1` routes, and a run can be admitted. It uses `charts/openmettle-core` at core commit `24808cbf78dd552d751c85c9e37a16d1d66c7ca4` ([`CORE_COMMIT`](../CORE_COMMIT)).
+This guide takes an empty single-node Kubernetes cluster and an empty PostgreSQL 18 database to this end state: a person can sign in, call authenticated `/v1` routes, and a run can be admitted. It uses `charts/openmettle-core` at core commit `11f86638cdfbea938f3ea3230b38c0bf1bfa79a7` ([`CORE_COMMIT`](../CORE_COMMIT)).
 
 **Status.** This path has not yet been run end to end on a real cluster. The kind smoke test ([`tests/kind`](../tests/kind/README.md)) runs most of it on an ephemeral cluster; [How this guide differs from the kind smoke test](#how-this-guide-differs-from-the-kind-smoke-test) lists where they differ. A step marked *unverified* is not exercised by the kind smoke test or by core CI.
 
@@ -99,7 +99,7 @@ Every chart pod satisfies `restricted` (kind smoke check 8). A namespace-wide de
 
 ## 3. PostgreSQL roles, database and URL Secrets
 
-As a PostgreSQL superuser, create one dedicated database and five roles before the first migration. Core's README ("Schema migrations") defines the four login roles. Its rules apply: no role is a superuser or has `CREATEROLE`, `CREATEDB`, `REPLICATION` or `BYPASSRLS`, no role belongs to another role, and you grant nothing yourself. Migration 23 refuses to run without a restricted `openmettle_gateway` role (core ADR 0037). No chart process logs in as that role, so create it without a login (this is what the kind smoke fixture does). Generate the passwords as hex, so they need no URL encoding, and pass them to `psql` from the files:
+As a PostgreSQL superuser, create one dedicated database and five roles before the first migration. Core's README ("Schema migrations") defines the roles. Its rules apply: no role is a superuser or has `CREATEROLE`, `CREATEDB`, `REPLICATION` or `BYPASSRLS`, no role belongs to another role, and you grant nothing yourself. Migration 23 refuses to run without a restricted `openmettle_gateway` role. This baseline guide leaves `gateways: {}` and `worker.inference.enabled: false`, so `openmettle_gateway` can start `NOLOGIN` below; if you also enable `gateways` to connect a model server, create `openmettle_gateway` with `LOGIN PASSWORD` and a `CONNECTION LIMIT`, and store its URL in an `openmettle-gateway-database` Secret referenced by `database.gateway.existingSecret` (see [Inference proxy (`gateways`)](../charts/openmettle-core/README.md#inference-proxy-gateways-and-external-tls-termination)). Generate the passwords as hex, so they need no URL encoding, and pass them to `psql` from the files:
 
 ```sh
 for role in owner api issuance worker; do (umask 077; set -C; openssl rand -hex 24 > "$STAGE/db/$role.password"); done
@@ -166,7 +166,7 @@ The API alone calls the provider, directly and without a proxy (core ADR 0010). 
 
 ## 5. Images
 
-Core publishes no images. Build `api`, `worker`, `migrate` and `admin` from core's `Dockerfile` at the pinned commit, push them to your registry and reference each one by digest. The chart refuses tags.
+Core publishes no images. Build `api`, `worker`, `migrate` and `admin` (plus `gateway` if you plan to enable `gateways`) from core's `Dockerfile` at the pinned commit, push them to your registry and reference each one by digest. The chart refuses tags.
 
 ```sh
 (
@@ -375,7 +375,7 @@ The migrate hook runs `openmettle-migrate` as the owner before Helm creates the 
 | Check | Expected |
 | --- | --- |
 | `kubectl -n openmettle get deploy` | `openmettle-openmettle-core-api` and `-worker` Ready |
-| As owner: `SELECT max(version) FROM openmettle._sqlx_migrations WHERE success;` | `27` |
+| As owner: `SELECT max(version) FROM openmettle._sqlx_migrations WHERE success;` | `37` |
 | As owner: core's marker query in `docs/operator/storage-adoption-and-quota-upgrade.md`, section 2 | `metering_enforced` and `overrides_enforced` true, with both timestamps set. A fresh database starts enforced. `adoption_run_id` is null |
 | `kubectl -n openmettle exec deploy/openmettle-openmettle-core-api -- /usr/local/bin/openmettle-api --check-auth-config /etc/openmettle/auth/auth.json` | `auth configuration valid (local files only)` |
 | `curl -i https://openmettle.example.test/healthz` | `200`, body `ok` |
@@ -423,7 +423,7 @@ With `-q`, success prints nothing and exits 0. A refusal prints `operator change
 
 ### 10.3 Invite the first person
 
-Follow core's [home invitations procedure](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/home-invitations.md). Inspect the provider to get `expected_generation`, which is `0` for a new provider. Then run `"$CORE/docs/operator/home-invitation-create.psql"` with the person's exact issuer and `sub`. `redeem_before_ms` may be at most seven days ahead. Run it in an unrecorded terminal. Success prints two lines: `home invitation created`, then the one-time code. Deliver the code privately, and keep it out of tickets and logs.
+Follow core's [home invitations procedure](https://github.com/OpenMettle/openmettle-core/blob/11f86638cdfbea938f3ea3230b38c0bf1bfa79a7/docs/operator/home-invitations.md). Inspect the provider to get `expected_generation`, which is `0` for a new provider. Then run `"$CORE/docs/operator/home-invitation-create.psql"` with the person's exact issuer and `sub`. `redeem_before_ms` may be at most seven days ahead. Run it in an unrecorded terminal. Success prints two lines: `home invitation created`, then the one-time code. Deliver the code privately, and keep it out of tickets and logs.
 
 ### 10.4 Storage and run quotas
 
@@ -461,7 +461,7 @@ Project uploads also need `project_limit_bytes`. Size the storage values for you
 
 The code travels only in the form body, which the ingress must not log. If `/readyz` ever answers with `Referrer-Policy: no-referrer`, the browser sends `Origin: null` and initiation is refused. A malformed code is refused at once with `login request refused`. A wrong code is refused only after the provider step, with the same message as any other refused sign-in (core `home-invitations.md`).
 
-Redemption creates the user, identity, personal scope and approval. To make this person the first account administrator (optional), follow core's [account administrator procedure](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/account-admin-recovery.md) with `"$CORE/docs/operator/grant-account-admin.psql"`, which prints `account admin grant committed` on success. That procedure needs the internal user UUID. Core names no query for it, so this read-only lookup by the invited issuer and subject is not defined by core:
+Redemption creates the user, identity, personal scope and approval. To make this person the first account administrator (optional), follow core's [account administrator procedure](https://github.com/OpenMettle/openmettle-core/blob/11f86638cdfbea938f3ea3230b38c0bf1bfa79a7/docs/operator/account-admin-recovery.md) with `"$CORE/docs/operator/grant-account-admin.psql"`, which prints `account admin grant committed` on success. That procedure needs the internal user UUID. Core names no query for it, so this read-only lookup by the invited issuer and subject is not defined by core:
 
 ```sql
 SELECT user_id FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject';
@@ -512,7 +512,7 @@ The run stays queued until `queue_timeout_seconds`. The worker then expires it a
 
 ## Running `openmettle-admin`
 
-`openmettle-admin` is core's owner-operated maintenance binary (`$CORE/src/bin/admin.rs`). It reads `OPENMETTLE_ADMIN_DATABASE_URL`, which is the `openmettle_owner` URL, and supports `storage adopt ROOT`, `quota drain-orphans`, `quota activate` and `quota verify [ROOT]`. A fresh install needs none of them. `quota verify` is an optional consistency check, and the others belong to the [upgrade runbook](https://github.com/OpenMettle/openmettle-core/blob/24808cbf78dd552d751c85c9e37a16d1d66c7ca4/docs/operator/storage-adoption-and-quota-upgrade.md). The chart has no admin workload. Run the image as a one-off Job in the release namespace with the owner Secret and no other privileges:
+`openmettle-admin` is core's owner-operated maintenance binary (`$CORE/src/bin/admin.rs`). It reads `OPENMETTLE_ADMIN_DATABASE_URL`, which is the `openmettle_owner` URL, and supports `storage adopt ROOT`, `quota drain-orphans`, `quota activate` and `quota verify [ROOT]`. A fresh install needs none of them. `quota verify` is an optional consistency check, and the others belong to the [upgrade runbook](https://github.com/OpenMettle/openmettle-core/blob/11f86638cdfbea938f3ea3230b38c0bf1bfa79a7/docs/operator/storage-adoption-and-quota-upgrade.md). The chart has no admin workload. Run the image as a one-off Job in the release namespace with the owner Secret and no other privileges:
 
 ```yaml
 apiVersion: batch/v1
@@ -576,8 +576,8 @@ A fresh install must not run these steps. They apply only to an existing databas
 
 ## Not yet possible at this pin
 
-- **An admitted run is never executed.** The packaged `openmettle-worker` runs maintenance sweeps only and exits 78 if run slots are configured. The production executor is V1-07. A queued run waits until it is cancelled or expires.
-- **No model call can happen.** The chart deploys no gateway reconciliation workload (`openmettle_gateway` exists only as a `NOLOGIN` role) and no gateway adapter or model server. The catalog above is synthetic.
+- **In this baseline guide, admitted runs stay queued.** This guide leaves `worker.inference.enabled: false` and `gateways: {}` so the install requires no model server. To execute turns against an OpenAI-compatible plain-HTTP upstream (such as SGLang), enable `gateways` (with `images.gateway`, a `LOGIN` `openmettle_gateway` role and `database.gateway.existingSecret`) and `worker.inference` (with a ConfigMap holding `inference.json` and `catalog.json`, plus `networkPolicy.worker.inference`), as documented in [Worker turn execution](../charts/openmettle-core/README.md#worker-turn-execution-workerinference) and [Inference proxy (`gateways`)](../charts/openmettle-core/README.md#inference-proxy-gateways-and-external-tls-termination).
+- **No model server is deployed by this chart.** GPU/SGLang model-server packaging remains separate under V1-20; `tests/kind/smoke.py` exercises `gateways` and `worker.inference` against a synthetic SGLang stand-in only.
 - **No sign-in page.** The interim same-origin form in [step 11](#11-first-sign-in) is a manual stopgap until openmettle-app is deployed.
 
 ## How this guide differs from the kind smoke test

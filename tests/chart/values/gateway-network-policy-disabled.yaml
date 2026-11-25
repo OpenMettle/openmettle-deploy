@@ -1,0 +1,21 @@
+# Synthetic overlay on minimal.yaml: gateways and worker.inference enabled while NetworkPolicies
+# are disabled (neither networkPolicy.worker.inference.to nor gateways.<name>.networkPolicy.upstream.to
+# is required).
+images:
+  gateway:
+    registry: registry.example.test
+    repository: openmettle/gateway
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+database:
+  gateway:
+    existingSecret: openmettle-gateway-database
+worker:
+  inference:
+    enabled: true
+    configMapName: example-worker-inference
+networkPolicy:
+  enabled: false
+gateways:
+  a:
+    model: model-a
+    upstreamUrl: http://sglang-a:30000

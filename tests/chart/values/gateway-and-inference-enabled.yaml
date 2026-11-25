@@ -1,0 +1,90 @@
+# Synthetic overlay on minimal.yaml: two per-model openmettle-gateway instances (default worker-only
+# ingress), worker.pollMs, worker.inference enabled, database CA and OTLP trace export enabled.
+images:
+  gateway:
+    registry: registry.example.test
+    repository: openmettle/gateway
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+database:
+  gateway:
+    existingSecret: openmettle-gateway-database
+  caBundle:
+    enabled: true
+    configMapName: example-db-ca
+    key: ca.crt
+worker:
+  pollMs: 250
+  inference:
+    enabled: true
+    configMapName: example-worker-inference
+    configKey: inference.json
+    catalogKey: catalog.json
+    settings:
+      runSlots: 6
+      leaseMs: 90000
+      executionTimeoutMs: 240000
+      executingPerActor: 3
+      executingPerScope: 6
+networkPolicy:
+  worker:
+    inference:
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: openmettle-core
+              app.kubernetes.io/instance: openmettle
+              app.kubernetes.io/component: gateway-a
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: openmettle-core
+              app.kubernetes.io/instance: openmettle
+              app.kubernetes.io/component: gateway-b
+      port: 8082
+  telemetry:
+    otlp:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.30/32
+      port: 4318
+telemetry:
+  otlp:
+    enabled: true
+    tracesEndpoint: https://alloy.observability.example.test:4318/v1/traces
+    caBundle:
+      enabled: true
+      configMapName: example-otlp-ca
+      key: ca.crt
+# Keys intentionally unsorted (b before a) to prove deterministic sortAlpha template ordering.
+gateways:
+  b:
+    model: model-b
+    upstreamUrl: http://sglang-b.inference.example.test:30001/
+    replicas: 2
+    settings:
+      cacheMode: per_request
+      upstreamConnectTimeoutMs: 3000
+      upstreamIdleTimeoutMs: 60000
+      dbMaxConnections: 6
+      dbTimeoutMs: 1500
+      shutdownTimeoutMs: 8000
+    terminationGracePeriodSeconds: 20
+    strategy:
+      maxSurge: 1
+      maxUnavailable: 1
+    service:
+      port: 8083
+    networkPolicy:
+      upstream:
+        to:
+          - ipBlock:
+              cidr: 192.0.2.41/32
+        port: 30001
+  a:
+    model: model-a
+    upstreamUrl: http://sglang-a.inference.example.test:30000
+    networkPolicy:
+      upstream:
+        to:
+          - ipBlock:
+              cidr: 192.0.2.40/32
+        port: 30000
