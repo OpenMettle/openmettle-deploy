@@ -1,12 +1,13 @@
 {{/*
 Per-component NetworkPolicy. Every component may reach DNS and the database only; the API may
 also accept connections on its container port from networkPolicy.api.ingressFrom and, when
-auth.enabled is true, reach OIDC provider peers in networkPolicy.api.oidc; api and worker (never
-migrate) may also reach OTLP collector peers in networkPolicy.telemetry.otlp when
-telemetry.otlp.enabled is true.
-Arguments: dict "root" $ "component" "api|worker|migrate" "ingressFrom" <peers> "port" <container
-port> "oidc" <bool> "otlp" <bool> "annotations" <map>. An empty ingressFrom renders no ingress
-rule, which denies all ingress.
+auth.enabled is true, reach OIDC provider peers in networkPolicy.api.oidc; api, worker and gateway
+pods (never migrate) may also reach OTLP collector peers in networkPolicy.telemetry.otlp when
+telemetry.otlp.enabled is true; worker (when worker.inference.enabled) and per-model gateways may
+also carry explicit TCP extraEgress rules (inference endpoint or upstream model server).
+Arguments: dict "root" $ "component" "api|worker|migrate|gateway-<name>" "ingressFrom" <peers>
+"port" <container port> "oidc" <bool> "otlp" <bool> "extraEgress" <list of {to, port}>
+"annotations" <map>. An empty ingressFrom renders no ingress rule, which denies all ingress.
 */}}
 {{- define "openmettle-core.networkPolicy" -}}
 {{- $root := .root -}}
@@ -63,5 +64,12 @@ spec:
       ports:
         - protocol: TCP
           port: {{ int64 $values.telemetry.otlp.port }}
+    {{- end }}
+    {{- range .extraEgress }}
+    - to:
+        {{- toYaml .to | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ int64 .port }}
     {{- end }}
 {{- end -}}

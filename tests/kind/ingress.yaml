@@ -115,3 +115,18 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smoke-traefik
+  namespace: openmettle-smoke-db
+spec:
+  type: ClusterIP
+  selector:
+    app: smoke-traefik
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP

@@ -33,12 +33,14 @@ app.kubernetes.io/managed-by: {{ .root.Release.Service | quote }}
 app.kubernetes.io/part-of: openmettle
 {{- end -}}
 
-{{/* Arguments: dict "root" $ "component" "api|worker|migrate" "serviceAccount" <values> */}}
+{{/* Arguments: dict "root" $ "component" "api|worker|migrate|gateway-<name>" "serviceAccount" <values> ["field" <values path>] */}}
 {{- define "openmettle-core.serviceAccountName" -}}
+{{- $field := default (ternary "migration" .component (eq .component "migrate")) .field -}}
+{{- include "openmettle-core.validate.bool" (dict "field" (printf "%s.serviceAccount.create" $field) "value" .serviceAccount.create) -}}
 {{- if .serviceAccount.create -}}
 {{- default (printf "%s-%s" (include "openmettle-core.fullname" .root) .component) .serviceAccount.name -}}
 {{- else -}}
-{{- required (printf "%s.serviceAccount.name is required when serviceAccount.create is false; components never share the default ServiceAccount" (ternary "migration" .component (eq .component "migrate"))) .serviceAccount.name -}}
+{{- required (printf "%s.serviceAccount.name is required when serviceAccount.create is false; components never share the default ServiceAccount" $field) .serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
 
@@ -105,6 +107,126 @@ never block nested mountpoints under containerd/runc.
 {{- define "openmettle-core.authProviderCaDirectory" -}}/etc/openmettle/auth-ca{{- end -}}
 {{- define "openmettle-core.otlpCaDirectory" -}}/etc/openmettle/otlp-ca{{- end -}}
 {{- define "openmettle-core.otlpCaPath" -}}/etc/openmettle/otlp-ca/ca.crt{{- end -}}
+{{- define "openmettle-core.inferenceConfigDirectory" -}}/etc/openmettle/inference{{- end -}}
+{{- define "openmettle-core.inferenceConfigPath" -}}/etc/openmettle/inference/inference.json{{- end -}}
+{{- define "openmettle-core.inferenceCaDirectory" -}}/etc/openmettle/inference-ca{{- end -}}
+
+{{/*
+Resolve one gateways.<name> entry against per-gateway defaults without Sprig mergeOverwrite quirks
+on 0, false, "" or []. Mutates .out with the resolved dict.
+Arguments: dict "name" <string> "raw" <map> "out" <dict>
+*/}}
+{{- define "openmettle-core.resolveGateway" -}}
+{{- $name := .name -}}
+{{- $raw := .raw -}}
+{{- $out := .out -}}
+{{- if not (kindIs "map" $raw) -}}
+{{- fail (printf "gateways.%s must be a mapping" $name) -}}
+{{- end -}}
+{{- $requests := dict "cpu" "100m" "memory" "64Mi" -}}
+{{- $resources := dict "requests" $requests -}}
+{{- if hasKey $raw "resources" -}}
+{{- $rawRes := index $raw "resources" -}}
+{{- if not (kindIs "map" $rawRes) -}}
+{{- fail (printf "gateways.%s.resources must be a mapping" $name) -}}
+{{- end -}}
+{{- if hasKey $rawRes "requests" -}}
+{{- $rawReq := index $rawRes "requests" -}}
+{{- if not (kindIs "map" $rawReq) -}}
+{{- fail (printf "gateways.%s.resources.requests must be a mapping" $name) -}}
+{{- end -}}
+{{- range $k, $v := $rawReq -}}
+{{- $_ := set $requests $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- if hasKey $rawRes "limits" -}}
+{{- $rawLim := index $rawRes "limits" -}}
+{{- if not (kindIs "map" $rawLim) -}}
+{{- fail (printf "gateways.%s.resources.limits must be a mapping" $name) -}}
+{{- end -}}
+{{- $limits := dict -}}
+{{- range $k, $v := $rawLim -}}
+{{- $_ := set $limits $k $v -}}
+{{- end -}}
+{{- $_ := set $resources "limits" $limits -}}
+{{- end -}}
+{{- end -}}
+{{- $sa := dict "create" true "name" "" "annotations" (dict) -}}
+{{- if hasKey $raw "serviceAccount" -}}
+{{- $rawSa := index $raw "serviceAccount" -}}
+{{- if not (kindIs "map" $rawSa) -}}
+{{- fail (printf "gateways.%s.serviceAccount must be a mapping" $name) -}}
+{{- end -}}
+{{- range $k, $v := $rawSa -}}
+{{- $_ := set $sa $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- include "openmettle-core.validate.bool" (dict "field" (printf "gateways.%s.serviceAccount.create" $name) "value" $sa.create) -}}
+{{- $settings := dict "cacheMode" "scoped" "upstreamConnectTimeoutMs" 5000 "upstreamIdleTimeoutMs" 120000 "dbMaxConnections" 4 "dbTimeoutMs" 2000 "shutdownTimeoutMs" 5000 -}}
+{{- if hasKey $raw "settings" -}}
+{{- $rawSet := index $raw "settings" -}}
+{{- if not (kindIs "map" $rawSet) -}}
+{{- fail (printf "gateways.%s.settings must be a mapping" $name) -}}
+{{- end -}}
+{{- range $k, $v := $rawSet -}}
+{{- $_ := set $settings $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- $strategy := dict "maxSurge" 1 "maxUnavailable" 0 -}}
+{{- if hasKey $raw "strategy" -}}
+{{- $rawStrat := index $raw "strategy" -}}
+{{- if not (kindIs "map" $rawStrat) -}}
+{{- fail (printf "gateways.%s.strategy must be a mapping" $name) -}}
+{{- end -}}
+{{- range $k, $v := $rawStrat -}}
+{{- $_ := set $strategy $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- $service := dict "port" 8082 -}}
+{{- if hasKey $raw "service" -}}
+{{- $rawSvc := index $raw "service" -}}
+{{- if not (kindIs "map" $rawSvc) -}}
+{{- fail (printf "gateways.%s.service must be a mapping" $name) -}}
+{{- end -}}
+{{- range $k, $v := $rawSvc -}}
+{{- $_ := set $service $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- $upstream := dict "to" (list) "port" 30000 -}}
+{{- $np := dict "upstream" $upstream -}}
+{{- if hasKey $raw "networkPolicy" -}}
+{{- $rawNp := index $raw "networkPolicy" -}}
+{{- if not (kindIs "map" $rawNp) -}}
+{{- fail (printf "gateways.%s.networkPolicy must be a mapping" $name) -}}
+{{- end -}}
+{{- if hasKey $rawNp "ingressFrom" -}}
+{{- $_ := set $np "ingressFrom" (index $rawNp "ingressFrom") -}}
+{{- end -}}
+{{- if hasKey $rawNp "upstream" -}}
+{{- $rawUp := index $rawNp "upstream" -}}
+{{- if not (kindIs "map" $rawUp) -}}
+{{- fail (printf "gateways.%s.networkPolicy.upstream must be a mapping" $name) -}}
+{{- end -}}
+{{- range $k, $v := $rawUp -}}
+{{- $_ := set $upstream $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $out "model" (ternary (index $raw "model") "" (hasKey $raw "model")) -}}
+{{- $_ := set $out "upstreamUrl" (ternary (index $raw "upstreamUrl") "" (hasKey $raw "upstreamUrl")) -}}
+{{- $_ := set $out "replicas" (ternary (index $raw "replicas") 1 (hasKey $raw "replicas")) -}}
+{{- $_ := set $out "resources" $resources -}}
+{{- $_ := set $out "serviceAccount" $sa -}}
+{{- $_ := set $out "settings" $settings -}}
+{{- $_ := set $out "terminationGracePeriodSeconds" (ternary (index $raw "terminationGracePeriodSeconds") 15 (hasKey $raw "terminationGracePeriodSeconds")) -}}
+{{- $_ := set $out "strategy" $strategy -}}
+{{- $_ := set $out "service" $service -}}
+{{- $_ := set $out "networkPolicy" $np -}}
+{{- $_ := set $out "podAnnotations" (ternary (index $raw "podAnnotations") (dict) (hasKey $raw "podAnnotations")) -}}
+{{- $_ := set $out "nodeSelector" (ternary (index $raw "nodeSelector") (dict) (hasKey $raw "nodeSelector")) -}}
+{{- $_ := set $out "tolerations" (ternary (index $raw "tolerations") (list) (hasKey $raw "tolerations")) -}}
+{{- $_ := set $out "affinity" (ternary (index $raw "affinity") (dict) (hasKey $raw "affinity")) -}}
+{{- end -}}
 
 {{/* Arguments: the root context. Name of the claim the artifact volume mounts. */}}
 {{- define "openmettle-core.artifactsClaimName" -}}
@@ -113,19 +235,25 @@ never block nested mountpoints under containerd/runc.
 
 {{/*
 Volumes and mounts for one pod. Arguments: dict "root" $ "artifacts" <bool> "auth" <bool> "otlp"
-<bool>. The database CA is mounted into every component (api, worker, migrate) when enabled; the
-artifact volume only where "artifacts" is true (api and worker); auth config, login keys and
-optional provider CA only where "auth" is true (api only); optional OTLP CA bundle only where
-"otlp" is true (api and worker, never migrate). Each helper renders nothing when no volume applies.
+<bool> ["inference" <bool>]. The database CA is mounted into every component (api, worker, migrate,
+gateway) when enabled; the artifact volume only where "artifacts" is true (api and worker); auth
+config, login keys and optional provider CA only where "auth" is true (api only); worker inference
+config, model catalog and optional TLS terminator CA only where "inference" is true (worker only);
+optional OTLP CA bundle only where "otlp" is true (api, worker and gateway, never migrate). Each
+helper renders nothing when no volume applies.
 */}}
 {{- define "openmettle-core.volumes" -}}
+{{- include "openmettle-core.validate.booleans" .root -}}
 {{- $ca := .root.Values.database.caBundle -}}
 {{- $auth := .root.Values.auth -}}
 {{- $otlp := .root.Values.telemetry.otlp -}}
+{{- $inference := default dict .root.Values.worker.inference -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
 {{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
-{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa }}
+{{- $mountInference := and (default false .inference) (default false (get $inference "enabled")) -}}
+{{- $mountInferenceCa := and $mountInference (default false (get (default dict (get $inference "caBundle")) "enabled")) -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference }}
 volumes:
   {{- if .artifacts }}
   - name: artifacts
@@ -159,6 +287,19 @@ volumes:
   {{- if $mountOtlpCa }}
   {{- include "openmettle-core.caBundleVolume" (dict "name" "otlp-ca" "path" "telemetry.otlp.caBundle" "bundle" $otlp.caBundle) | nindent 2 }}
   {{- end }}
+  {{- if $mountInference }}
+  - name: inference-config
+    configMap:
+      name: {{ required "worker.inference.configMapName is required when worker.inference.enabled is true" $inference.configMapName | quote }}
+      items:
+        - key: {{ $inference.configKey | quote }}
+          path: inference.json
+        - key: {{ $inference.catalogKey | quote }}
+          path: catalog.json
+  {{- end }}
+  {{- if $mountInferenceCa }}
+  {{- include "openmettle-core.caBundleVolume" (dict "name" "inference-ca" "path" "worker.inference.caBundle" "bundle" $inference.caBundle) | nindent 2 }}
+  {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -175,10 +316,13 @@ volumes:
 {{- $ca := .root.Values.database.caBundle -}}
 {{- $auth := .root.Values.auth -}}
 {{- $otlp := .root.Values.telemetry.otlp -}}
+{{- $inference := default dict .root.Values.worker.inference -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
 {{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
-{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa }}
+{{- $mountInference := and (default false .inference) (default false (get $inference "enabled")) -}}
+{{- $mountInferenceCa := and $mountInference (default false (get (default dict (get $inference "caBundle")) "enabled")) -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference }}
 volumeMounts:
   {{- if .artifacts }}
   - name: artifacts
@@ -207,6 +351,16 @@ volumeMounts:
     mountPath: {{ include "openmettle-core.otlpCaDirectory" . | quote }}
     readOnly: true
   {{- end }}
+  {{- if $mountInference }}
+  - name: inference-config
+    mountPath: {{ include "openmettle-core.inferenceConfigDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountInferenceCa }}
+  - name: inference-ca
+    mountPath: {{ include "openmettle-core.inferenceCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -220,10 +374,63 @@ securityContext:
       - ALL
 {{- end -}}
 
+{{/*
+Validate every boolean flag before any template branches on it (guards --skip-schema-validation
+regardless of Helm's template rendering order). Argument: the root context.
+*/}}
+{{- define "openmettle-core.validate.booleans" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "migration.enabled" "value" .Values.migration.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "networkPolicy.enabled" "value" .Values.networkPolicy.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "storage.artifacts.enabled" "value" .Values.storage.artifacts.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "ingress.enabled" "value" .Values.ingress.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "api.podDisruptionBudget.enabled" "value" .Values.api.podDisruptionBudget.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "auth.enabled" "value" .Values.auth.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "telemetry.otlp.enabled" "value" .Values.telemetry.otlp.enabled) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "api.serviceAccount.create" "value" .Values.api.serviceAccount.create) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.serviceAccount.create" "value" .Values.worker.serviceAccount.create) -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "migration.serviceAccount.create" "value" .Values.migration.serviceAccount.create) -}}
+{{- if not (kindIs "map" .Values.database.caBundle) -}}
+{{- fail "database.caBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey .Values.database.caBundle "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "database.caBundle.enabled" "value" (index .Values.database.caBundle "enabled")) -}}
+{{- end -}}
+{{- if not (kindIs "map" .Values.auth.providerCaBundle) -}}
+{{- fail "auth.providerCaBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey .Values.auth.providerCaBundle "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "auth.providerCaBundle.enabled" "value" (index .Values.auth.providerCaBundle "enabled")) -}}
+{{- end -}}
+{{- if not (kindIs "map" .Values.telemetry.otlp.caBundle) -}}
+{{- fail "telemetry.otlp.caBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey .Values.telemetry.otlp.caBundle "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "telemetry.otlp.caBundle.enabled" "value" (index .Values.telemetry.otlp.caBundle "enabled")) -}}
+{{- end -}}
+{{- $inference := default dict .Values.worker.inference -}}
+{{- if not (kindIs "map" $inference) -}}
+{{- fail "worker.inference must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $inference "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.inference.enabled" "value" (index $inference "enabled")) -}}
+{{- end -}}
+{{- $infCa := default dict (get $inference "caBundle") -}}
+{{- if not (kindIs "map" $infCa) -}}
+{{- fail "worker.inference.caBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $infCa "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.inference.caBundle.enabled" "value" (index $infCa "enabled")) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Render-time guards that do not depend on schema validation. */}}
 {{- define "openmettle-core.validate" -}}
+{{- include "openmettle-core.validate.booleans" . -}}
 {{- if not (kindIs "invalid" .Values.worker.sweepMs) -}}
 {{- include "openmettle-core.validate.intRange" (dict "field" "worker.sweepMs" "value" .Values.worker.sweepMs "min" 1000 "max" 3600000) -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.worker.pollMs) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.pollMs" "value" .Values.worker.pollMs "min" 100 "max" 60000) -}}
 {{- end -}}
 {{- range $component := list "api" "worker" -}}
 {{- $values := index $.Values $component -}}
@@ -237,6 +444,119 @@ securityContext:
 {{- end -}}
 {{- end -}}
 {{- /*
+Resolve and validate optional per-model openmettle-gateway instances (core ADR 0044) before
+ServiceAccount uniqueness and connection-budget checks so gateways participate in both.
+*/ -}}
+{{- $rawGateways := default dict .Values.gateways -}}
+{{- if not (kindIs "map" $rawGateways) -}}
+{{- fail "gateways must be a mapping of gateway name to configuration" -}}
+{{- end -}}
+{{- $gwNames := keys $rawGateways | sortAlpha -}}
+{{- $resolvedGateways := dict -}}
+{{- $fullname := include "openmettle-core.fullname" . -}}
+{{- $seenModels := dict -}}
+{{- $gwImage := default dict .Values.images.gateway -}}
+{{- $gwDb := default dict .Values.database.gateway -}}
+{{- if gt (len $gwNames) 0 -}}
+{{- if not (get $gwImage "repository") -}}
+{{- fail "images.gateway.repository is required when gateways is non-empty" -}}
+{{- end -}}
+{{- if not (get $gwImage "digest") -}}
+{{- fail "images.gateway.digest is required when gateways is non-empty (sha256:<64 lowercase hex>; tags are not accepted)" -}}
+{{- end -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString (get $gwImage "digest"))) -}}
+{{- fail "images.gateway.digest must be sha256:<64 lowercase hex>; tags are not accepted" -}}
+{{- end -}}
+{{- if or (contains ":" (toString (get $gwImage "repository"))) (contains "@" (toString (get $gwImage "repository"))) -}}
+{{- fail "images.gateway.repository must not contain a tag or digest" -}}
+{{- end -}}
+{{- $gwSecret := toString (default "" (get $gwDb "existingSecret")) -}}
+{{- $gwKey := toString (default "" (get $gwDb "key")) -}}
+{{- if not $gwSecret -}}
+{{- fail "database.gateway.existingSecret is required when gateways is non-empty (an existing Secret holding the openmettle_gateway PostgreSQL URL; core ADR 0044)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $gwKey) -}}
+{{- fail "database.gateway.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
+{{- end -}}
+{{- $dbRoles := list "api" "worker" "migrate" -}}
+{{- if .Values.auth.enabled -}}
+{{- $dbRoles = append $dbRoles "issuance" -}}
+{{- end -}}
+{{- range $role := $dbRoles -}}
+{{- $ref := index $.Values.database $role -}}
+{{- if and (eq $gwSecret (toString $ref.existingSecret)) (eq $gwKey (toString $ref.key)) -}}
+{{- fail (printf "database.gateway must not reuse database.%s (Secret %q, key %q); openmettle-gateway needs its own openmettle_gateway login (core ADR 0044)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
+{{- end -}}
+{{- end -}}
+{{- range $name := $gwNames -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$" $name) -}}
+{{- fail (printf "gateways.%s: name must match ^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$" $name) -}}
+{{- end -}}
+{{- $resourceName := printf "%s-gateway-%s" $fullname $name -}}
+{{- if gt (len $resourceName) 63 -}}
+{{- fail (printf "gateways.%s: rendered resource name %q (%d chars) exceeds Kubernetes' 63-character limit" $name $resourceName (len $resourceName)) -}}
+{{- end -}}
+{{- $g := dict -}}
+{{- include "openmettle-core.resolveGateway" (dict "name" $name "raw" (index $rawGateways $name) "out" $g) -}}
+{{- $_ := set $resolvedGateways $name $g -}}
+{{- if or (not (kindIs "string" $g.model)) (eq (len $g.model) 0) (gt (len $g.model) 128) -}}
+{{- fail (printf "gateways.%s.model must be a non-empty string of at most 128 bytes" $name) -}}
+{{- end -}}
+{{- if hasKey $seenModels $g.model -}}
+{{- fail (printf "gateways.%s.model %q duplicates gateways.%s.model; each gateway instance must serve one distinct model" $name $g.model (get $seenModels $g.model)) -}}
+{{- end -}}
+{{- $_ := set $seenModels $g.model $name -}}
+{{- include "openmettle-core.validate.gatewayUpstreamUrl" (dict "field" (printf "gateways.%s.upstreamUrl" $name) "url" $g.upstreamUrl) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.replicas" $name) "value" $g.replicas "min" 0 "max" 1000000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.terminationGracePeriodSeconds" $name) "value" $g.terminationGracePeriodSeconds "min" 1 "max" 1000000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.strategy.maxSurge" $name) "value" $g.strategy.maxSurge "min" 0 "max" 1000000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.strategy.maxUnavailable" $name) "value" $g.strategy.maxUnavailable "min" 0 "max" 1000000) -}}
+{{- if and (eq (int64 $g.strategy.maxSurge) 0) (eq (int64 $g.strategy.maxUnavailable) 0) -}}
+{{- fail (printf "gateways.%s.strategy.maxSurge and gateways.%s.strategy.maxUnavailable cannot both be 0" $name $name) -}}
+{{- end -}}
+{{- if or (not (kindIs "string" $g.settings.cacheMode)) (not (has $g.settings.cacheMode (list "scoped" "per_request"))) -}}
+{{- fail (printf "gateways.%s.settings.cacheMode must be \"scoped\" or \"per_request\"" $name) -}}
+{{- end -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.settings.upstreamConnectTimeoutMs" $name) "value" $g.settings.upstreamConnectTimeoutMs "min" 1 "max" 30000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.settings.upstreamIdleTimeoutMs" $name) "value" $g.settings.upstreamIdleTimeoutMs "min" 1 "max" 3600000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.settings.dbMaxConnections" $name) "value" $g.settings.dbMaxConnections "min" 1 "max" 64) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.settings.dbTimeoutMs" $name) "value" $g.settings.dbTimeoutMs "min" 1 "max" 30000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.settings.shutdownTimeoutMs" $name) "value" $g.settings.shutdownTimeoutMs "min" 1 "max" 60000) -}}
+{{- if le (mul (int64 $g.terminationGracePeriodSeconds) 1000) (int64 $g.settings.shutdownTimeoutMs) -}}
+{{- fail (printf "gateways.%s.terminationGracePeriodSeconds (%d s) must exceed gateways.%s.settings.shutdownTimeoutMs (%d ms)" $name (int64 $g.terminationGracePeriodSeconds) $name (int64 $g.settings.shutdownTimeoutMs)) -}}
+{{- end -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.service.port" $name) "value" $g.service.port "min" 1 "max" 65535) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "gateways.%s.networkPolicy.upstream.port" $name) "value" $g.networkPolicy.upstream.port "min" 1 "max" 65535) -}}
+{{- if not (kindIs "invalid" $g.networkPolicy.ingressFrom) -}}
+{{- if not (kindIs "slice" $g.networkPolicy.ingressFrom) -}}
+{{- fail (printf "gateways.%s.networkPolicy.ingressFrom must be null or a list of NetworkPolicyPeer objects" $name) -}}
+{{- end -}}
+{{- range $i, $peer := $g.networkPolicy.ingressFrom -}}
+{{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
+{{- fail (printf "gateways.%s.networkPolicy.ingressFrom[%d] must be a non-empty NetworkPolicyPeer object" $name $i) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $.Values.networkPolicy.enabled -}}
+{{- if not $g.networkPolicy.upstream.to -}}
+{{- fail (printf "gateways.%s.networkPolicy.upstream.to must list at least one upstream peer when networkPolicy.enabled is true (an empty list would allow egress to every destination)" $name) -}}
+{{- end -}}
+{{- range $i, $peer := $g.networkPolicy.upstream.to -}}
+{{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
+{{- fail (printf "gateways.%s.networkPolicy.upstream.to[%d] must be a non-empty NetworkPolicyPeer object" $name $i) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if or (get $gwImage "registry") (get $gwImage "repository") (get $gwImage "digest") -}}
+{{- fail "images.gateway.{registry,repository,digest} must be empty when gateways is empty" -}}
+{{- end -}}
+{{- if get $gwDb "existingSecret" -}}
+{{- fail "database.gateway.existingSecret must be empty when gateways is empty; the gateway URL is mounted only when gateways is non-empty (core ADR 0044)" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
 Each component runs as its own ServiceAccount. A shared name would also let the migrate hook's
 delete policy remove another component's ServiceAccount on every install or upgrade.
 */ -}}
@@ -245,9 +565,13 @@ delete policy remove another component's ServiceAccount on every install or upgr
 {{- if .Values.migration.enabled -}}
 {{- $components = append $components (list "migrate" "migration" .Values.migration.serviceAccount) -}}
 {{- end -}}
+{{- range $name := $gwNames -}}
+{{- $g := index $resolvedGateways $name -}}
+{{- $components = append $components (list (printf "gateway-%s" $name) (printf "gateways.%s" $name) $g.serviceAccount) -}}
+{{- end -}}
 {{- range $entry := $components -}}
 {{- $key := index $entry 1 -}}
-{{- $name := include "openmettle-core.serviceAccountName" (dict "root" $ "component" (index $entry 0) "serviceAccount" (index $entry 2)) -}}
+{{- $name := include "openmettle-core.serviceAccountName" (dict "root" $ "component" (index $entry 0) "field" $key "serviceAccount" (index $entry 2)) -}}
 {{- if eq $name "default" -}}
 {{- fail (printf "%s.serviceAccount.name must not be \"default\"; each component needs its own ServiceAccount" $key) -}}
 {{- end -}}
@@ -281,7 +605,9 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- if not .Values.networkPolicy.dns.to -}}
 {{- fail "networkPolicy.dns.to must list at least one DNS peer when networkPolicy.enabled is true (an empty list would allow egress to every destination on port 53)" -}}
 {{- end -}}
-{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
+{{- $npWorker := default dict .Values.networkPolicy.worker -}}
+{{- $npInference := default (dict "to" (list) "port" 8082) (get $npWorker "inference") -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.worker.inference.to" "peers" $npInference.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
 {{- range $i, $peer := $entry.peers -}}
 {{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
 {{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
@@ -410,9 +736,63 @@ and are not counted; see the chart README. With auth, each API pod also opens it
 {{- end -}}
 {{- $api := mul (add $.Values.api.replicas $.Values.api.strategy.maxSurge) $apiPool -}}
 {{- $worker := mul (add $.Values.worker.replicas $.Values.worker.strategy.maxSurge) $.Values.worker.settings.dbMaxConnections -}}
-{{- $total := add $api $worker 1 -}}
+{{- $gateways := 0 -}}
+{{- range $name := $gwNames -}}
+{{- $g := index $resolvedGateways $name -}}
+{{- $gateways = add $gateways (mul (add $g.replicas $g.strategy.maxSurge) $g.settings.dbMaxConnections) -}}
+{{- end -}}
+{{- $total := add $api $worker $gateways 1 -}}
 {{- if gt (int64 $total) (int64 .) -}}
-{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker)) -}}
+{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d + gateways %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker) (int64 $gateways)) -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Worker turn execution against openmettle-gateway (core ADRs 0033, 0043 and 0044). Mounted into the
+worker pod only; never into api, gateway or migrate pods.
+*/ -}}
+{{- $npWorkerAll := default dict .Values.networkPolicy.worker -}}
+{{- $npInferenceAll := default (dict "to" (list) "port" 8082) (get $npWorkerAll "inference") -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "networkPolicy.worker.inference.port" "value" $npInferenceAll.port "min" 1 "max" 65535) -}}
+{{- $inference := default dict .Values.worker.inference -}}
+{{- $infEnabled := default false (get $inference "enabled") -}}
+{{- $infCa := default dict (get $inference "caBundle") -}}
+{{- $infCaEnabled := default false (get $infCa "enabled") -}}
+{{- if $infEnabled -}}
+{{- if not (get $inference "configMapName") -}}
+{{- fail "worker.inference.configMapName is required when worker.inference.enabled is true (an existing ConfigMap holding inference.json and catalog.json)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" "worker.inference.configKey" "key" $inference.configKey) -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" "worker.inference.catalogKey" "key" $inference.catalogKey) -}}
+{{- if eq (toString $inference.catalogKey) (toString $inference.configKey) -}}
+{{- fail "worker.inference.catalogKey must differ from worker.inference.configKey; the model catalog is a separate file named by catalog_file in inference.json" -}}
+{{- end -}}
+{{- $infSettings := default dict (get $inference "settings") -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.inference.settings.runSlots" "value" $infSettings.runSlots "min" 1 "max" 256) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.inference.settings.leaseMs" "value" $infSettings.leaseMs "min" 30000 "max" 600000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.inference.settings.executionTimeoutMs" "value" $infSettings.executionTimeoutMs "min" 60000 "max" 86400000) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.inference.settings.executingPerActor" "value" $infSettings.executingPerActor "min" 1 "max" 1024) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "worker.inference.settings.executingPerScope" "value" $infSettings.executingPerScope "min" 1 "max" 1024) -}}
+{{- $minLease := mul 6 (int64 .Values.worker.settings.dbTimeoutMs) -}}
+{{- if lt (int64 $infSettings.leaseMs) $minLease -}}
+{{- fail (printf "worker.inference.settings.leaseMs (%d ms) must cover six worker.settings.dbTimeoutMs (%d ms)" (int64 $infSettings.leaseMs) (int64 $minLease)) -}}
+{{- end -}}
+{{- $minExec := mul 2 (int64 $infSettings.leaseMs) -}}
+{{- if lt (int64 $infSettings.executionTimeoutMs) $minExec -}}
+{{- fail (printf "worker.inference.settings.executionTimeoutMs (%d ms) must cover two worker.inference.settings.leaseMs (%d ms)" (int64 $infSettings.executionTimeoutMs) (int64 $minExec)) -}}
+{{- end -}}
+{{- include "openmettle-core.validate.caBundle" (dict "path" "worker.inference.caBundle" "bundle" $infCa) -}}
+{{- if and .Values.networkPolicy.enabled (not $npInferenceAll.to) -}}
+{{- fail "networkPolicy.worker.inference.to must list at least one inference gateway or TLS-terminator peer when worker.inference.enabled and networkPolicy.enabled are true (an empty list would block inference or allow egress to every destination)" -}}
+{{- end -}}
+{{- else -}}
+{{- if get $inference "configMapName" -}}
+{{- fail "worker.inference.configMapName must be empty when worker.inference.enabled is false" -}}
+{{- end -}}
+{{- if $infCaEnabled -}}
+{{- fail "worker.inference.caBundle.enabled cannot be true when worker.inference.enabled is false" -}}
+{{- end -}}
+{{- if $npInferenceAll.to -}}
+{{- fail "networkPolicy.worker.inference.to must be empty when worker.inference.enabled is false; remove inference egress peers or enable worker.inference" -}}
 {{- end -}}
 {{- end -}}
 {{- /*
@@ -549,6 +929,13 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- end -}}
 {{- end -}}
 
+{{/* Arguments: dict "field" <path> "value" <val> */}}
+{{- define "openmettle-core.validate.bool" -}}
+{{- if not (kindIs "bool" .value) -}}
+{{- fail (printf "%s must be a boolean (true or false)" .field) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Arguments: dict "field" <path> "key" <value> */}}
 {{- define "openmettle-core.validate.configMapKey" -}}
 {{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" (toString .key))) (eq (toString .key) ".") (hasPrefix ".." (toString .key)) -}}
@@ -558,7 +945,15 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 
 {{/* Arguments: dict "path" <prefix> "bundle" <map> */}}
 {{- define "openmettle-core.validate.caBundle" -}}
-{{- if .bundle.enabled -}}
+{{- if not (kindIs "map" .bundle) -}}
+{{- fail (printf "%s must be a mapping" .path) -}}
+{{- end -}}
+{{- $enabled := false -}}
+{{- if hasKey .bundle "enabled" -}}
+{{- $enabled = index .bundle "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" (printf "%s.enabled" .path) "value" $enabled) -}}
+{{- end -}}
+{{- if $enabled -}}
 {{- if not .bundle.configMapName -}}
 {{- fail (printf "%s.configMapName is required when %s.enabled is true (an existing ConfigMap holding the PEM CA bundle)" .path .path) -}}
 {{- end -}}
@@ -597,6 +992,78 @@ Arguments: dict "field" "telemetry.otlp.<name>" "endpoint" <string>
 {{- $endpointPort := int64 (atoi (index $authorityParts 1)) -}}
 {{- if or (lt $endpointPort 1) (gt $endpointPort 65535) (eq $endpointPort 443) -}}
 {{- fail (printf "%s port (%d) must be 1-65535 and omit the default port 443" $field $endpointPort) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate one gateway upstream origin URL (core src/gateway_proxy.rs origin()).
+Arguments: dict "field" "gateways.<name>.upstreamUrl" "url" <string>
+*/}}
+{{- define "openmettle-core.validate.gatewayUpstreamUrl" -}}
+{{- $field := .field -}}
+{{- $url := .url -}}
+{{- if or (not (kindIs "string" $url)) (eq (len $url) 0) -}}
+{{- fail (printf "%s is required (canonical http://host[:port] origin)" $field) -}}
+{{- end -}}
+{{- if not (hasPrefix "http://" $url) -}}
+{{- fail (printf "%s must use http:// (canonical http://host[:port] origin)" $field) -}}
+{{- end -}}
+{{- $pattern := "^http://(([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\\.?)|(\\[[0-9a-fA-F:.]+\\]))(:[1-9][0-9]{0,4})?/?$" -}}
+{{- if or (gt (len $url) 2048) (not (regexMatch $pattern $url)) -}}
+{{- fail (printf "%s must be a canonical http://host[:port] origin with at most a / path (no https://, userinfo, non-root path, query or fragment)" $field) -}}
+{{- end -}}
+{{- $authority := trimSuffix "/" (trimPrefix "http://" $url) -}}
+{{- $portStr := "" -}}
+{{- if hasPrefix "[" $authority -}}
+{{- $parts := splitList "]" (trimPrefix "[" $authority) -}}
+{{- $ipv6 := index $parts 0 -}}
+{{- $afterBracket := index $parts 1 -}}
+{{- $halves := splitList "::" $ipv6 -}}
+{{- if or (not (contains ":" $ipv6)) (gt (len $halves) 2) -}}
+{{- fail (printf "%s must be a canonical http://host[:port] origin with a valid RFC 4291 IPv6 literal" $field) -}}
+{{- end -}}
+{{- $compressed := eq (len $halves) 2 -}}
+{{- $left := ternary (splitList ":" (index $halves 0)) (list) (ne (index $halves 0) "") -}}
+{{- $right := list -}}
+{{- if $compressed -}}
+{{- $right = ternary (splitList ":" (index $halves 1)) (list) (ne (index $halves 1) "") -}}
+{{- end -}}
+{{- $v4Pattern := "^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$" -}}
+{{- $groups := 0 -}}
+{{- range $i, $seg := $left -}}
+{{- $isLastOverall := and (not $compressed) (eq $i (sub (len $left) 1)) -}}
+{{- if and $isLastOverall (regexMatch $v4Pattern $seg) -}}
+{{- $groups = add $groups 2 -}}
+{{- else if regexMatch "^[0-9a-fA-F]{1,4}$" $seg -}}
+{{- $groups = add $groups 1 -}}
+{{- else -}}
+{{- fail (printf "%s must be a canonical http://host[:port] origin with a valid RFC 4291 IPv6 literal" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- range $i, $seg := $right -}}
+{{- $isLastOverall := eq $i (sub (len $right) 1) -}}
+{{- if and $isLastOverall (regexMatch $v4Pattern $seg) -}}
+{{- $groups = add $groups 2 -}}
+{{- else if regexMatch "^[0-9a-fA-F]{1,4}$" $seg -}}
+{{- $groups = add $groups 1 -}}
+{{- else -}}
+{{- fail (printf "%s must be a canonical http://host[:port] origin with a valid RFC 4291 IPv6 literal" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (and (not $compressed) (ne (int64 $groups) 8)) (and $compressed (gt (int64 $groups) 7)) -}}
+{{- fail (printf "%s must be a canonical http://host[:port] origin with a valid RFC 4291 IPv6 literal" $field) -}}
+{{- end -}}
+{{- if hasPrefix ":" $afterBracket -}}
+{{- $portStr = trimPrefix ":" $afterBracket -}}
+{{- end -}}
+{{- else if contains ":" $authority -}}
+{{- $portStr = index (splitList ":" $authority) 1 -}}
+{{- end -}}
+{{- if $portStr -}}
+{{- $port := int64 (atoi $portStr) -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail (printf "%s port (%d) must be between 1 and 65535" $field $port) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

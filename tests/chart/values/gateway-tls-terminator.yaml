@@ -1,0 +1,47 @@
+# Synthetic overlay on minimal.yaml: openmettle-gateway fronted by an external TLS terminator
+# (ingressFrom override), worker.inference.caBundle mounted at /etc/openmettle/inference-ca/ca.crt,
+# and worker inference egress restricted to the terminator on TCP 8443.
+images:
+  gateway:
+    registry: registry.example.test
+    repository: openmettle/gateway
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+database:
+  gateway:
+    existingSecret: openmettle-gateway-database
+worker:
+  inference:
+    enabled: true
+    configMapName: example-worker-inference-tls
+    caBundle:
+      enabled: true
+      configMapName: example-inference-ca
+      key: gateway-ca.pem
+networkPolicy:
+  worker:
+    inference:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: example-ingress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      port: 8443
+gateways:
+  a:
+    model: model-a
+    upstreamUrl: http://[2001:db8::10]:30000
+    networkPolicy:
+      ingressFrom:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: example-ingress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      upstream:
+        to:
+          - ipBlock:
+              cidr: 2001:db8::10/128
+        port: 30000

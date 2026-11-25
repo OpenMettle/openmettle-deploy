@@ -5,6 +5,10 @@ images:
   pullSecrets: [example-pull-secret]
   api:
     registry: registry.example.test:5000
+  gateway:
+    registry: registry.example.test:5000
+    repository: openmettle/gateway
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 database:
   api:
     key: api-url
@@ -15,6 +19,9 @@ database:
   issuance:
     existingSecret: openmettle-issuance-database
     key: issuance-url
+  gateway:
+    existingSecret: openmettle-gateway-database
+    key: gateway-url
   connectionBudget: 40
   caBundle:
     enabled: true
@@ -47,6 +54,22 @@ api:
               matchLabels: {app.kubernetes.io/component: api}
 worker:
   sweepMs: 30000
+  pollMs: 500
+  inference:
+    enabled: true
+    configMapName: example-worker-inference
+    configKey: worker-inference.json
+    catalogKey: worker-catalog.json
+    settings:
+      runSlots: 8
+      leaseMs: 60000
+      executionTimeoutMs: 180000
+      executingPerActor: 3
+      executingPerScope: 6
+    caBundle:
+      enabled: true
+      configMapName: example-inference-ca
+      key: inference-ca.pem
   replicas: 3
   resources:
     requests: {cpu: 150m, memory: 96Mi}
@@ -101,6 +124,16 @@ networkPolicy:
               app.kubernetes.io/name: example-oidc
         - ipBlock:
             cidr: 198.51.100.50/32
+      port: 8443
+  worker:
+    inference:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: example-ingress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: example-gateway-tls
       port: 8443
   dns:
     to:
@@ -171,3 +204,52 @@ telemetry:
       enabled: true
       configMapName: example-otlp-ca
       key: collector-ca.pem
+# Reserved synthetic per-model openmettle-gateway instance (ADR 0044; 1-char name keeps
+# <fullname>-gateway-a <= 63 chars even at the 52-char fullname cap).
+gateways:
+  a:
+    model: model-a
+    upstreamUrl: http://sglang-a.inference.example.test:30000
+    replicas: 2
+    resources:
+      requests: {cpu: 150m, memory: 96Mi}
+      limits: {cpu: "1", memory: 256Mi, ephemeral-storage: 64Mi}
+    serviceAccount:
+      create: true
+      name: example-gateway-a
+      annotations: {example.test/role: gateway}
+    settings:
+      cacheMode: per_request
+      upstreamConnectTimeoutMs: 4000
+      upstreamIdleTimeoutMs: 90000
+      dbMaxConnections: 3
+      dbTimeoutMs: 1500
+      shutdownTimeoutMs: 7000
+    terminationGracePeriodSeconds: 20
+    strategy: {maxSurge: 1, maxUnavailable: 0}
+    service: {port: 8084}
+    networkPolicy:
+      ingressFrom:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: example-ingress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: example-gateway-tls
+      upstream:
+        to:
+          - ipBlock:
+              cidr: 198.51.100.70/32
+        port: 30000
+    podAnnotations: {example.test/note: gateway}
+    nodeSelector: {kubernetes.io/os: linux}
+    tolerations:
+      - {key: example.test/dedicated, operator: Equal, value: gateway, effect: NoSchedule}
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app.kubernetes.io/component: gateway-a}

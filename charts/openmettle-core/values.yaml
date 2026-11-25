@@ -19,6 +19,11 @@ images:
     registry: ""
     repository: ""
     digest: ""
+  # Required (repository and digest) while gateways is non-empty; must stay empty while gateways is {}.
+  gateway:
+    registry: ""
+    repository: ""
+    digest: ""
 
 database:
   # Existing Secrets holding a full postgres:// URL, including an explicit sslmode.
@@ -40,14 +45,22 @@ database:
   issuance:
     existingSecret: ""
     key: url
+  # Gateway proxy URL (a login role of openmettle_gateway, core ADR 0044), mounted into
+  # openmettle-gateway pods only. Required while gateways is non-empty and refused while it is empty.
+  # Must not reuse the Secret key of api, worker, migrate or (when auth.enabled) issuance.
+  gateway:
+    existingSecret: ""
+    key: url
   # Optional PostgreSQL connections available to this release. When set, rendering fails if
   # (api.replicas + api.maxSurge) * (api.dbMaxConnections + api.issuanceDbMaxConnections if auth.enabled)
-  #   + (worker.replicas + worker.maxSurge) * worker.dbMaxConnections + 1 (migrator) exceeds it.
+  #   + (worker.replicas + worker.maxSurge) * worker.dbMaxConnections
+  #   + sum_gateways((g.replicas + g.maxSurge) * g.dbMaxConnections) + 1 (migrator) exceeds it.
   connectionBudget: null
   # Optional CA bundle for verifying PostgreSQL server certificates. When enabled, one key of an
   # existing ConfigMap (the chart never creates ConfigMaps or Secrets) is mounted read-only at
-  # /etc/openmettle/db-ca/ca.crt in api, worker and migrate pods. No environment variable is set:
-  # reference the file in each URL: ?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt
+  # /etc/openmettle/db-ca/ca.crt in api, worker, migrate and (when configured) gateway pods. No
+  # environment variable is set: reference the file in each URL:
+  # ?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt
   caBundle:
     enabled: false
     configMapName: ""
@@ -96,6 +109,32 @@ worker:
   replicas: 1
   # Optional maintenance sweep interval in milliseconds (core ADR 0033), 1000–3600000.
   sweepMs: null
+  # Optional run-claim polling interval in milliseconds (core ADR 0033), 100–60000.
+  pollMs: null
+  # Optional turn execution against openmettle-gateway (core ADRs 0033, 0043 and 0044).
+  # Off by default: when false, no inference config, CA bundle or run-claim settings are rendered,
+  # and the worker runs maintenance sweeps only.
+  inference:
+    enabled: false
+    # Existing ConfigMap holding the inference document (configKey) and model catalog (catalogKey),
+    # projected read-only at /etc/openmettle/inference/{inference.json,catalog.json} on worker only.
+    # Required while enabled is true; must stay empty while enabled is false.
+    configMapName: ""
+    configKey: inference.json
+    catalogKey: catalog.json
+    # OPENMETTLE_WORKER_* turn-execution settings (core src/lib.rs); rendered only while enabled.
+    settings:
+      runSlots: 4
+      leaseMs: 60000
+      executionTimeoutMs: 300000
+      executingPerActor: 2
+      executingPerScope: 4
+    # Optional CA bundle for verifying private/cluster-CA TLS terminators in front of
+    # openmettle-gateway. Mounted read-only at /etc/openmettle/inference-ca/ca.crt on worker only.
+    caBundle:
+      enabled: false
+      configMapName: ""
+      key: ca.crt
   resources:
     requests:
       cpu: 100m
@@ -154,6 +193,13 @@ networkPolicy:
       # false so unused egress is never opened.
       to: []
       port: 443
+  worker:
+    inference:
+      # Required when worker.inference.enabled and networkPolicy.enabled are true: inference
+      # gateway or external TLS-terminator peers that worker (and never api, gateway or migrate)
+      # may reach on `port` (default 8082). Must stay empty while worker.inference.enabled is false.
+      to: []
+      port: 8082
   dns:
     # Peers that every component may query on UDP and TCP 53. The default matches the CoreDNS pods
     # of kubeadm (kind) and K3s. Rendering fails if this is empty while enabled.
@@ -172,8 +218,9 @@ networkPolicy:
   telemetry:
     otlp:
       # Required when telemetry.otlp.enabled and networkPolicy.enabled are true: OTLP collector
-      # peers that api and worker (never migrate) may reach on TCP `port` (default 4318).
-      # Must stay empty while telemetry.otlp.enabled is false so unused egress is never opened.
+      # peers that api, worker and (when configured) gateway pods (never migrate) may reach on TCP
+      # `port` (default 4318). Must stay empty while telemetry.otlp.enabled is false so unused egress
+      # is never opened.
       to: []
       port: 4318
 
@@ -247,26 +294,54 @@ telemetry:
     format: null
     level: null
   otlp:
-    # Optional OTLP/HTTP protobuf trace and/or metrics export for api and worker only
-    # (core ADRs 0026 and 0028). Off by default: when false, no OTLP_* env vars, CA mounts or
-    # collector egress are rendered. openmettle-migrate is stderr-only and never receives OTLP
-    # settings, CA mounts or egress.
+    # Optional OTLP/HTTP protobuf trace and/or metrics export for api, worker and (when configured)
+    # gateway pods (never migrate; core ADRs 0026 and 0028). Off by default: when false, no OTLP_*
+    # env vars, CA mounts or collector egress are rendered. openmettle-migrate is stderr-only and
+    # never receives OTLP settings, CA mounts or egress.
     enabled: false
     # At least one of tracesEndpoint or metricsEndpoint is required when enabled (both must stay
     # empty while disabled): canonical HTTPS URL with a DNS host (no http://, no IP literal,
     # numeric/hex final host label, credentials, query, fragment or default port :443).
-    # Non-empty values render OPENMETTLE_{API,WORKER}_OTLP_{TRACES,METRICS}_ENDPOINT respectively.
+    # Non-empty values render OPENMETTLE_{API,WORKER,GATEWAY}_OTLP_{TRACES,METRICS}_ENDPOINT.
     tracesEndpoint: ""
     metricsEndpoint: ""
     # Optional list of up to 32 unique canonical private CIDR strings (RFC 1918, CGNAT or ULA)
-    # joined with commas into OPENMETTLE_{API,WORKER}_OTLP_PRIVATE_RANGES when non-empty.
+    # joined with commas into OPENMETTLE_{API,WORKER,GATEWAY}_OTLP_PRIVATE_RANGES when non-empty.
     # Must stay empty while telemetry.otlp.enabled is false.
     privateRanges: []
     # Optional CA bundle for verifying private/cluster-CA OTLP collectors (e.g. in-cluster Alloy).
     # Existing ConfigMap key mounted read-only at sibling directory /etc/openmettle/otlp-ca/ca.crt
-    # in api and worker pods only (never migrate), setting OPENMETTLE_{API,WORKER}_OTLP_CA_FILE.
+    # in api, worker and gateway pods only (never migrate), setting OPENMETTLE_*_OTLP_CA_FILE.
     # The chart never creates ConfigMaps or Secrets. Must stay disabled when telemetry.otlp.enabled is false.
     caBundle:
       enabled: false
       configMapName: ""
       key: ca.crt
+
+# Optional per-model openmettle-gateway instances (core ADR 0044), keyed by DNS-1123 instance name
+# (<name> matching ^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$; <fullname>-gateway-<name> <= 63 chars).
+# Empty by default: when empty, no gateway Deployment, Service, ServiceAccount or NetworkPolicy is
+# rendered, and images.gateway and database.gateway.existingSecret must stay empty.
+# Each entry requires `model` (1-128 bytes, distinct across gateways) and `upstreamUrl` (canonical
+# http://host[:port] origin), and defaults to:
+#   replicas: 1
+#   resources: {requests: {cpu: 100m, memory: 64Mi}}
+#   serviceAccount: {create: true, name: "", annotations: {}}
+#   settings:
+#     cacheMode: scoped
+#     upstreamConnectTimeoutMs: 5000
+#     upstreamIdleTimeoutMs: 120000
+#     dbMaxConnections: 4
+#     dbTimeoutMs: 2000
+#     shutdownTimeoutMs: 5000
+#   terminationGracePeriodSeconds: 15
+#   strategy: {maxSurge: 1, maxUnavailable: 0}
+#   service: {port: 8082}
+#   networkPolicy:
+#     ingressFrom: null              # null: this release's worker pods only; list: explicit peers
+#     upstream: {to: [], port: 30000}
+#   podAnnotations: {}
+#   nodeSelector: {}
+#   tolerations: []
+#   affinity: {}
+gateways: {}

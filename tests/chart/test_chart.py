@@ -36,9 +36,21 @@ MATRIX = {
     "telemetry-otlp-enabled": ("telemetry-otlp-enabled.yaml",),
     "telemetry-otlp-metrics-only": ("telemetry-otlp-metrics-only.yaml",),
     "telemetry-network-policy-disabled": ("telemetry-network-policy-disabled.yaml",),
+    "gateway-and-inference-enabled": ("gateway-and-inference-enabled.yaml",),
+    "gateway-tls-terminator": ("gateway-tls-terminator.yaml",),
+    "gateway-network-policy-disabled": ("gateway-network-policy-disabled.yaml",),
 }
-PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_"}
-PORT = {"api": 8080, "worker": 8081}
+PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_",
+          "gateway": "OPENMETTLE_GATEWAY_"}
+PORT = {"api": 8080, "worker": 8081, "gateway": 8082}
+INFERENCE_CONFIG_DIR = "/etc/openmettle/inference"
+INFERENCE_CONFIG_PATH = "/etc/openmettle/inference/inference.json"
+INFERENCE_CA_DIR = "/etc/openmettle/inference-ca"
+INFERENCE_VOLUMES = {"inference-config", "inference-ca"}
+
+
+def role_kind(role):
+    return "gateway" if role.startswith("gateway-") else role
 ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job", "NetworkPolicy", "PersistentVolumeClaim", "Ingress",
                  "PodDisruptionBudget"}
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
@@ -189,17 +201,21 @@ class PodPolicyTest(Rendered):
                     self.assertNotIn("hostPort", port)
 
     def test_only_known_volumes(self):
-        """Fails if a pod gains an unknown volume, auth volumes appear outside api, otlp-ca appears on migrate, or a mount lacks a matching volume."""
+        """Fails if a pod gains an unknown volume, auth volumes appear outside api, inference volumes appear outside worker, otlp-ca appears on migrate, or a mount lacks a matching volume."""
         for _, role, pod in self.each_pod():
             vols = {v["name"]: v for v in pod.get("volumes", [])}
-            self.assertLessEqual(set(vols), {"artifacts", "db-ca", "otlp-ca"} | AUTH_VOLUMES)
+            self.assertLessEqual(set(vols), {"artifacts", "db-ca", "otlp-ca"} | AUTH_VOLUMES | INFERENCE_VOLUMES)
             if role != "api":
                 self.assertFalse(AUTH_VOLUMES & set(vols), f"{role} must never mount auth volumes")
+            if role != "worker":
+                self.assertFalse(INFERENCE_VOLUMES & set(vols), f"{role} must never mount inference volumes")
+            if role_kind(role) == "gateway":
+                self.assertNotIn("artifacts", vols, f"{role} must never mount artifacts")
             if role == "migrate":
                 self.assertNotIn("otlp-ca", vols, "migrate must never mount otlp-ca")
             if "artifacts" in vols:
                 self.assertEqual(set(vols["artifacts"]), {"name", "persistentVolumeClaim"})
-            for cm_vol in ("db-ca", "auth-config", "auth-provider-ca", "otlp-ca"):
+            for cm_vol in ("db-ca", "auth-config", "auth-provider-ca", "otlp-ca", "inference-config", "inference-ca"):
                 if cm_vol in vols:
                     self.assertEqual(set(vols[cm_vol]), {"name", "configMap"})
             if "auth-login-keys" in vols:
@@ -228,13 +244,14 @@ class PodPolicyTest(Rendered):
     def test_environment_is_explicit_and_prefixed(self):
         """Fails on envFrom, an env name outside the component's own prefix, or a literal DATABASE_URL."""
         for _, role, pod in self.each_pod():
+            kind = role_kind(role)
             for container in containers(pod):
                 self.assertNotIn("envFrom", container)
                 env = container.get("env", [])
                 self.assertTrue(env)
                 for entry in env:
-                    self.assertTrue(entry["name"].startswith(PREFIX[role]), entry["name"])
-                url = env_map(container)[PREFIX[role] + "DATABASE_URL"]
+                    self.assertTrue(entry["name"].startswith(PREFIX[kind]), entry["name"])
+                url = env_map(container)[PREFIX[kind] + "DATABASE_URL"]
                 self.assertNotIn("value", url)
                 self.assertEqual(set(url["valueFrom"]), {"secretKeyRef"})
                 self.assertEqual(set(url["valueFrom"]["secretKeyRef"]), {"name", "key"})
@@ -244,8 +261,9 @@ class PodPolicyTest(Rendered):
         for _, role, pod in self.each_pod():
             if role == "migrate":
                 continue
+            kind = role_kind(role)
             env = env_map(pod["containers"][0])
-            self.assertEqual(env[PREFIX[role] + "BIND"].get("value"), f"0.0.0.0:{PORT[role]}")
+            self.assertEqual(env[PREFIX[kind] + "BIND"].get("value"), f"0.0.0.0:{PORT[kind]}")
 
     def test_images_are_digest_only(self):
         """Fails if the image helper appends a tag or drops the digest."""
@@ -354,9 +372,10 @@ class ReleasePolicyTest(Rendered):
         for name, docs in self.renders.items():
             with self.subTest(values=name):
                 for role, pod in pods(docs):
-                    ref = env_map(pod["containers"][0])[PREFIX[role] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]
+                    kind = role_kind(role)
+                    ref = env_map(pod["containers"][0])[PREFIX[kind] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]
                     expected = {"api": "openmettle-api-database", "worker": "openmettle-worker-database",
-                                "migrate": "openmettle-owner-database"}[role]
+                                "migrate": "openmettle-owner-database", "gateway": "openmettle-gateway-database"}[kind]
                     self.assertEqual(ref["name"], expected)
                 rendered = yaml.safe_dump_all(d for d in docs if d["kind"] != "Job")
                 self.assertNotIn("openmettle-owner-database", rendered)
@@ -367,15 +386,23 @@ class ReleasePolicyTest(Rendered):
         expected = {
             "api": {"DB_MAX_CONNECTIONS": "6", "DB_TIMEOUT_MS": "2500", "SHUTDOWN_TIMEOUT_MS": "8000",
                     "ISSUANCE_DB_MAX_CONNECTIONS": "3"},
-            "worker": {"DB_MAX_CONNECTIONS": "2", "DB_TIMEOUT_MS": "1000", "SHUTDOWN_TIMEOUT_MS": "3000"},
+            "worker": {"DB_MAX_CONNECTIONS": "2", "DB_TIMEOUT_MS": "1000", "SHUTDOWN_TIMEOUT_MS": "3000",
+                       "SWEEP_MS": "30000", "POLL_MS": "500", "INFERENCE_CONFIG": INFERENCE_CONFIG_PATH,
+                       "RUN_SLOTS": "8", "LEASE_MS": "60000", "EXECUTION_TIMEOUT_MS": "180000",
+                       "EXECUTING_PER_ACTOR": "3", "EXECUTING_PER_SCOPE": "6"},
             "migrate": {"CONNECT_TIMEOUT_MS": "10000", "LOCK_TIMEOUT_MS": "30000", "STATEMENT_TIMEOUT_MS": "600000"},
+            "gateway-a": {"DB_MAX_CONNECTIONS": "3", "DB_TIMEOUT_MS": "1500", "SHUTDOWN_TIMEOUT_MS": "7000",
+                          "MODEL": "model-a", "UPSTREAM_URL": "http://sglang-a.inference.example.test:30000",
+                          "CACHE_MODE": "per_request", "UPSTREAM_CONNECT_TIMEOUT_MS": "4000",
+                          "UPSTREAM_IDLE_TIMEOUT_MS": "90000"},
         }
-        keys = {"api": "api-url", "worker": "worker-url", "migrate": "owner-url"}
+        keys = {"api": "api-url", "worker": "worker-url", "migrate": "owner-url", "gateway-a": "gateway-url"}
         for role, pod in pods(docs):
+            kind = role_kind(role)
             env = env_map(pod["containers"][0])
             for key, value in expected[role].items():
-                self.assertEqual(env[PREFIX[role] + key]["value"], value)
-            self.assertEqual(env[PREFIX[role] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]["key"], keys[role])
+                self.assertEqual(env[PREFIX[kind] + key]["value"], value)
+            self.assertEqual(env[PREFIX[kind] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]["key"], keys[role])
         api = env_map(find(docs, "Deployment", "-api")["spec"]["template"]["spec"]["containers"][0])
         self.assertEqual(api[ISSUANCE_URL]["valueFrom"]["secretKeyRef"]["key"], "issuance-url")
 
@@ -494,9 +521,10 @@ class MigrationHookTest(Rendered):
 
 
 class NetworkPolicyTest(Rendered):
-    """Design §5: a chart-scoped deny-all plus DNS and database egress, and API ingress from configured peers."""
+    """Design §5: a chart-scoped deny-all plus DNS and database egress, and API/gateway ingress from configured peers."""
 
-    ENABLED = ("minimal", "all-keys", "migration-disabled", "auth-enabled", "telemetry-otlp-enabled")
+    ENABLED = ("minimal", "all-keys", "migration-disabled", "auth-enabled", "telemetry-otlp-enabled",
+               "gateway-and-inference-enabled", "gateway-tls-terminator")
 
     def policies(self, name):
         return [d for d in self.renders[name] if d["kind"] == "NetworkPolicy"]
@@ -542,17 +570,24 @@ class NetworkPolicyTest(Rendered):
              "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-alloy"}}},
             {"ipBlock": {"cidr": "198.51.100.60/32"}},
         ]
+        all_keys_worker_inf = [
+            {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-ingress"}},
+             "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-gateway-tls"}}},
+        ]
         expected = {
-            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None, None),
-            "auth-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, ([{"ipBlock": {"cidr": "192.0.2.20/32"}}], 443), None),
+            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None, None, None, {}),
+            "auth-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, ([{"ipBlock": {"cidr": "192.0.2.20/32"}}], 443),
+                             None, None, {}),
             "telemetry-otlp-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, None,
-                                       ([{"ipBlock": {"cidr": "192.0.2.30/32"}}], 4318)),
+                                       ([{"ipBlock": {"cidr": "192.0.2.30/32"}}], 4318), None, {}),
             "all-keys": ([{"ipBlock": {"cidr": "192.0.2.10/32"}},
                           {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-dns"}}}],
                          [{"ipBlock": {"cidr": "198.51.100.0/24"}}, {"ipBlock": {"cidr": "2001:db8::/64"}}],
-                         5433, (all_keys_oidc, 8443), (all_keys_otlp, 4319)),
+                         5433, (all_keys_oidc, 8443), (all_keys_otlp, 4319),
+                         (all_keys_worker_inf, 8443),
+                         {"gateway-a": ([{"ipBlock": {"cidr": "198.51.100.70/32"}}], 30000)}),
         }
-        for name, (dns, database, port, api_oidc, otlp) in expected.items():
+        for name, (dns, database, port, api_oidc, otlp, worker_inf, gw_upstreams) in expected.items():
             roles = []
             for role, labels in pod_labels(self.renders[name]):
                 roles.append(role)
@@ -563,24 +598,44 @@ class NetworkPolicyTest(Rendered):
                     if role == "api" and api_oidc is not None:
                         oidc_peers, oidc_port = api_oidc
                         rules.append({"to": oidc_peers, "ports": [{"protocol": "TCP", "port": oidc_port}]})
-                    if role in ("api", "worker") and otlp is not None:
+                    if role != "migrate" and otlp is not None:
                         otlp_peers, otlp_port = otlp
                         rules.append({"to": otlp_peers, "ports": [{"protocol": "TCP", "port": otlp_port}]})
+                    if role == "worker" and worker_inf is not None:
+                        inf_peers, inf_port = worker_inf
+                        rules.append({"to": inf_peers, "ports": [{"protocol": "TCP", "port": inf_port}]})
+                    if role in gw_upstreams:
+                        up_peers, up_port = gw_upstreams[role]
+                        rules.append({"to": up_peers, "ports": [{"protocol": "TCP", "port": up_port}]})
                     self.assertEqual(egress, rules)
-            self.assertEqual(sorted(roles), ["api", "migrate", "worker"])
+            self.assertEqual(sorted(roles), sorted(["api", "migrate", "worker", *gw_upstreams]))
 
     def test_ingress_only_to_api_from_configured_peers(self):
-        """Fails if a worker or migrate pod accepts ingress, or API ingress is open, widened or on another port."""
+        """Fails if a worker or migrate pod accepts ingress, or API/gateway ingress is open, widened or on another port."""
         peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-ingress"}},
                   "podSelector": {"matchExpressions": [{"key": "app.kubernetes.io/name", "operator": "In",
                                                         "values": ["example-ingress-controller"]}]}},
                  {"ipBlock": {"cidr": "192.0.2.0/24", "except": ["192.0.2.128/25"]}}]
+        all_keys_gw_peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-ingress"}},
+                              "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-gateway-tls"}}}]
+        tls_gw_peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-ingress"}},
+                         "podSelector": {"matchLabels": {"app.kubernetes.io/name": "traefik"}}}]
+        worker_peer = [{"podSelector": {"matchLabels": {
+            "app.kubernetes.io/name": "openmettle-core",
+            "app.kubernetes.io/instance": RELEASE,
+            "app.kubernetes.io/component": "worker",
+        }}}]
         for name in self.ENABLED:
             for role, labels in pod_labels(self.renders[name]):
                 with self.subTest(values=name, component=role):
                     _, ingress, _ = effective_policy(self.renders[name], labels)
                     if name == "all-keys" and role == "api":
                         self.assertEqual(ingress, [{"from": peers, "ports": [{"protocol": "TCP", "port": 8080}]}])
+                    elif role_kind(role) == "gateway":
+                        expected_from = (all_keys_gw_peers if name == "all-keys"
+                                         else tls_gw_peers if name == "gateway-tls-terminator"
+                                         else worker_peer)
+                        self.assertEqual(ingress, [{"from": expected_from, "ports": [{"protocol": "TCP", "port": 8082}]}])
                     else:
                         self.assertEqual(ingress, [], "ingressFrom defaults to empty: no peer may connect")
 
@@ -638,9 +693,10 @@ class NetworkPolicyTest(Rendered):
         self.assertEqual({d["kind"] for d in docs}, {"Deployment", "Service", "ServiceAccount", "Job"})
 
     def test_chart_defaults(self):
-        """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database, API or OTLP peers."""
+        """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database, API, worker or OTLP peers."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))["networkPolicy"]
         self.assertEqual(defaults, {"enabled": True, "api": {"ingressFrom": [], "oidc": {"to": [], "port": 443}},
+                                    "worker": {"inference": {"to": [], "port": 8082}},
                                     "dns": {"to": DEFAULT_DNS_PEERS}, "database": {"to": [], "port": 5432},
                                     "telemetry": {"otlp": {"to": [], "port": 4318}}})
 
@@ -649,6 +705,7 @@ class NetworkPolicyTest(Rendered):
         names = [d["metadata"]["name"] for d in render(("all-keys.yaml",), release="r" * 53)]
         self.assertIn("r" * 52 + "-deny-all", names)
         self.assertIn("r" * 52 + "-artifacts", names)
+        self.assertIn("r" * 52 + "-gateway-a", names)
         self.assertLessEqual(max(map(len, names)), 63, names)
 
 
@@ -706,6 +763,25 @@ class OptionalDefaultsTest(Rendered):
             },
         })
         self.assertEqual(defaults["networkPolicy"]["telemetry"], {"otlp": {"to": [], "port": 4318}})
+        self.assertEqual(defaults["networkPolicy"]["worker"], {"inference": {"to": [], "port": 8082}})
+        self.assertEqual(defaults["images"]["gateway"], {"registry": "", "repository": "", "digest": ""})
+        self.assertEqual(defaults["database"]["gateway"], {"existingSecret": "", "key": "url"})
+        self.assertIsNone(defaults["worker"]["pollMs"])
+        self.assertEqual(defaults["worker"]["inference"], {
+            "enabled": False,
+            "configMapName": "",
+            "configKey": "inference.json",
+            "catalogKey": "catalog.json",
+            "settings": {
+                "runSlots": 4,
+                "leaseMs": 60000,
+                "executionTimeoutMs": 300000,
+                "executingPerActor": 2,
+                "executingPerScope": 4,
+            },
+            "caBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
+        })
+        self.assertEqual(defaults["gateways"], {})
 
     def test_defaults_render_no_optional_resource_volume_or_env(self):
         """Fails if a default render gains a PVC, Ingress, PDB, volume, mount, fsGroup or environment variable."""
@@ -726,7 +802,7 @@ class DatabaseCaTest(Rendered):
     """database.caBundle mounts one existing ConfigMap key read-only into every component."""
 
     def test_mounted_read_only_into_every_component(self):
-        """Fails if api, worker or migrate lacks the CA volume, the mount is writable or the file name changes."""
+        """Fails if api, worker, migrate or gateway lacks the CA volume, the mount is writable or the file name changes."""
         roles = []
         for role, pod in pods(self.renders["all-keys"]):
             roles.append(role)
@@ -734,7 +810,7 @@ class DatabaseCaTest(Rendered):
                 self.assertEqual(volumes(pod)["db-ca"], {"name": "db-ca", "configMap": {
                     "name": "example-db-ca", "items": [{"key": "root-ca.pem", "path": "ca.crt"}]}})
                 self.assertEqual(mounts(pod)["db-ca"], {"name": "db-ca", "mountPath": DB_CA_DIRECTORY, "readOnly": True})
-        self.assertEqual(sorted(roles), ["api", "migrate", "worker"])
+        self.assertEqual(sorted(roles), ["api", "gateway-a", "migrate", "worker"])
 
     def test_no_environment_variable(self):
         """Fails if the CA adds an environment variable (core ADR 0002: no shared PG* defaults; use sslrootcert in the URL)."""
@@ -782,26 +858,27 @@ class ArtifactStorageTest(Rendered):
         self.assertEqual(find(docs, "PersistentVolumeClaim", "-artifacts")["spec"]["storageClassName"], "")
 
     def test_artifacts_dir_env_follows_the_mount(self):
-        """Fails if ARTIFACTS_DIR is missing or wrong where the volume mounts, set where it does not, or reaches migrate."""
+        """Fails if ARTIFACTS_DIR is missing or wrong where the volume mounts, set where it does not, or reaches migrate or gateway."""
         enabled = {"all-keys", "storage-existing-claim"}
         for name, docs in self.renders.items():
             for role, pod in pods(docs):
                 with self.subTest(values=name, component=role):
+                    kind = role_kind(role)
                     env = env_map(pod["containers"][0])
-                    self.assertEqual("artifacts" in volumes(pod), name in enabled and role != "migrate")
+                    self.assertEqual("artifacts" in volumes(pod), name in enabled and kind in ("api", "worker"))
                     if "artifacts" in volumes(pod):
-                        self.assertEqual(env[PREFIX[role] + "ARTIFACTS_DIR"],
-                                         {"name": PREFIX[role] + "ARTIFACTS_DIR", "value": ARTIFACTS_PATH})
+                        self.assertEqual(env[PREFIX[kind] + "ARTIFACTS_DIR"],
+                                         {"name": PREFIX[kind] + "ARTIFACTS_DIR", "value": ARTIFACTS_PATH})
                     else:
                         self.assertFalse([key for key in env if "ARTIFACTS" in key])
 
     def test_mounted_read_write_into_api_and_worker_only(self):
-        """Fails if the migrate pod mounts artifacts, the mount is read-only or moves, or the claim name is wrong."""
+        """Fails if migrate or gateway mounts artifacts, the mount is read-only or moves, or the claim name is wrong."""
         expected = {"all-keys": f"{RELEASE}-openmettle-core-artifacts", "storage-existing-claim": "example-artifacts"}
         for name, claim in expected.items():
             for role, pod in pods(self.renders[name]):
                 with self.subTest(values=name, component=role):
-                    if role == "migrate":
+                    if role_kind(role) not in ("api", "worker"):
                         self.assertNotIn("artifacts", volumes(pod))
                         continue
                     self.assertEqual(volumes(pod)["artifacts"], {"name": "artifacts",
@@ -1025,14 +1102,15 @@ class IssuanceTest(Rendered):
         self.assertEqual(sorted(with_auth), sorted(self.EXPECTED))
 
     def test_worker_and_migrate_never_reference_the_issuance_secret(self):
-        """Fails if a worker or migrate pod (or any object but the API Deployment) names the issuance Secret."""
+        """Fails if a worker, gateway or migrate pod (or any object but the API Deployment) names the issuance Secret."""
         for name in self.EXPECTED:
             docs = self.renders[name]
             with self.subTest(values=name):
                 others = yaml.safe_dump_all(d for d in docs if not (d["kind"] == "Deployment" and component(d) == "api"))
                 self.assertNotIn(ISSUANCE_SECRET, others)
                 self.assertNotIn("ISSUANCE", others)
-                self.assertEqual(sorted(role for role, _ in pods(docs)), ["api", "migrate", "worker"])
+                expected_roles = ["api", "gateway-a", "migrate", "worker"] if name == "all-keys" else ["api", "migrate", "worker"]
+                self.assertEqual(sorted(role for role, _ in pods(docs)), expected_roles)
 
     def test_pool_size_bounds_reach_the_api(self):
         """Fails if a valid issuanceDbMaxConnections is clamped, rejected or rendered as a number."""
@@ -1069,16 +1147,17 @@ class TelemetryTest(Rendered):
         }
         for name, (fmt, level) in cases.items():
             for role, pod in pods(self.renders[name]):
+                kind = role_kind(role)
                 with self.subTest(values=name, component=role):
                     env = env_map(pod["containers"][0])
                     if fmt is None:
-                        self.assertNotIn(PREFIX[role] + "LOG_FORMAT", env)
+                        self.assertNotIn(PREFIX[kind] + "LOG_FORMAT", env)
                     else:
-                        self.assertEqual(env[PREFIX[role] + "LOG_FORMAT"], {"name": PREFIX[role] + "LOG_FORMAT", "value": fmt})
+                        self.assertEqual(env[PREFIX[kind] + "LOG_FORMAT"], {"name": PREFIX[kind] + "LOG_FORMAT", "value": fmt})
                     if level is None:
-                        self.assertNotIn(PREFIX[role] + "LOG_LEVEL", env)
+                        self.assertNotIn(PREFIX[kind] + "LOG_LEVEL", env)
                     else:
-                        self.assertEqual(env[PREFIX[role] + "LOG_LEVEL"], {"name": PREFIX[role] + "LOG_LEVEL", "value": level})
+                        self.assertEqual(env[PREFIX[kind] + "LOG_LEVEL"], {"name": PREFIX[kind] + "LOG_LEVEL", "value": level})
         # Independent format-only and level-only overrides, across every valid enum value.
         for fmt in ("json", "text"):
             docs = render(set_values=[f"telemetry.logging.format={fmt}"])
@@ -1116,34 +1195,36 @@ class TelemetryTest(Rendered):
             ),
         }
         for name, (traces_ep, metrics_ep, ranges, ca) in cases.items():
-            for role in ("api", "worker"):
+            roles = [role for role, _ in pods(self.renders[name]) if role != "migrate"]
+            for role in roles:
+                kind = role_kind(role)
                 with self.subTest(values=name, component=role):
                     pod = find(self.renders[name], "Deployment", f"-{role}")["spec"]["template"]["spec"]
                     container = pod["containers"][0]
                     env = env_map(container)
                     if traces_ep is None:
-                        self.assertNotIn(PREFIX[role] + "OTLP_TRACES_ENDPOINT", env)
+                        self.assertNotIn(PREFIX[kind] + "OTLP_TRACES_ENDPOINT", env)
                     else:
-                        self.assertEqual(env[PREFIX[role] + "OTLP_TRACES_ENDPOINT"],
-                                         {"name": PREFIX[role] + "OTLP_TRACES_ENDPOINT", "value": traces_ep})
+                        self.assertEqual(env[PREFIX[kind] + "OTLP_TRACES_ENDPOINT"],
+                                         {"name": PREFIX[kind] + "OTLP_TRACES_ENDPOINT", "value": traces_ep})
                     if metrics_ep is None:
-                        self.assertNotIn(PREFIX[role] + "OTLP_METRICS_ENDPOINT", env)
+                        self.assertNotIn(PREFIX[kind] + "OTLP_METRICS_ENDPOINT", env)
                     else:
-                        self.assertEqual(env[PREFIX[role] + "OTLP_METRICS_ENDPOINT"],
-                                         {"name": PREFIX[role] + "OTLP_METRICS_ENDPOINT", "value": metrics_ep})
+                        self.assertEqual(env[PREFIX[kind] + "OTLP_METRICS_ENDPOINT"],
+                                         {"name": PREFIX[kind] + "OTLP_METRICS_ENDPOINT", "value": metrics_ep})
                     if ranges is None:
-                        self.assertNotIn(PREFIX[role] + "OTLP_PRIVATE_RANGES", env)
+                        self.assertNotIn(PREFIX[kind] + "OTLP_PRIVATE_RANGES", env)
                     else:
-                        self.assertEqual(env[PREFIX[role] + "OTLP_PRIVATE_RANGES"],
-                                         {"name": PREFIX[role] + "OTLP_PRIVATE_RANGES", "value": ranges})
+                        self.assertEqual(env[PREFIX[kind] + "OTLP_PRIVATE_RANGES"],
+                                         {"name": PREFIX[kind] + "OTLP_PRIVATE_RANGES", "value": ranges})
                     if ca is None:
-                        self.assertNotIn(PREFIX[role] + "OTLP_CA_FILE", env)
+                        self.assertNotIn(PREFIX[kind] + "OTLP_CA_FILE", env)
                         self.assertNotIn("otlp-ca", volumes(pod))
                         self.assertNotIn("otlp-ca", mounts(pod))
                     else:
                         ca_cm, ca_key = ca
-                        self.assertEqual(env[PREFIX[role] + "OTLP_CA_FILE"],
-                                         {"name": PREFIX[role] + "OTLP_CA_FILE", "value": OTLP_CA_PATH})
+                        self.assertEqual(env[PREFIX[kind] + "OTLP_CA_FILE"],
+                                         {"name": PREFIX[kind] + "OTLP_CA_FILE", "value": OTLP_CA_PATH})
                         self.assertEqual(volumes(pod)["otlp-ca"], {"name": "otlp-ca", "configMap": {
                             "name": ca_cm, "items": [{"key": ca_key, "path": "ca.crt"}]}})
                         self.assertEqual(mounts(pod)["otlp-ca"],
@@ -1984,6 +2065,252 @@ class NegativeCaseTest(unittest.TestCase):
          [SCHEMA, "additional properties 'protocol' not allowed"]),
         ("migration has no telemetry", ["migration.telemetry.enabled=true"], [],
          [SCHEMA, "additional properties 'telemetry' not allowed"]),
+        # Worker inference (core ADRs 0033, 0043 and 0044).
+        ("worker inference enabled without configMapName", ["worker.inference.enabled=true"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [SCHEMA, "/worker/inference/configMapName"]),
+        ("worker inference enabled without configMapName without schema", ["worker.inference.enabled=true"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["worker.inference.configMapName is required when worker.inference.enabled is true"]),
+        ("worker inference configMapName while disabled", ["worker.inference.configMapName=inf-cm"], [],
+         [SCHEMA, "/worker/inference/configMapName"]),
+        ("worker inference configMapName while disabled without schema", ["worker.inference.configMapName=inf-cm"],
+         [SKIP], ["worker.inference.configMapName must be empty when worker.inference.enabled is false"]),
+        ("worker inference catalogKey equals configKey",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm",
+          "worker.inference.catalogKey=inference.json"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["worker.inference.catalogKey must differ from worker.inference.configKey"]),
+        ("worker inference catalogKey dot-dot without schema",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm",
+          "worker.inference.catalogKey=.."],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["worker.inference.catalogKey must be a ConfigMap key"]),
+        ("worker inference leaseMs below 6 * dbTimeoutMs",
+         ["worker.settings.dbTimeoutMs=6000", "worker.inference.enabled=true",
+          "worker.inference.configMapName=inf-cm", "worker.inference.settings.leaseMs=35999"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["worker.inference.settings.leaseMs (35999 ms) must cover six worker.settings.dbTimeoutMs (36000 ms)"]),
+        ("worker inference executionTimeoutMs below 2 * leaseMs",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm",
+          "worker.inference.settings.leaseMs=60000", "worker.inference.settings.executionTimeoutMs=119999"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["worker.inference.settings.executionTimeoutMs (119999 ms) must cover two worker.inference.settings.leaseMs (120000 ms)"]),
+        ("worker inference caBundle enabled while inference disabled",
+         ["worker.inference.caBundle.enabled=true", "worker.inference.caBundle.configMapName=inf-ca"], [],
+         [SCHEMA, "/worker/inference/caBundle/enabled"]),
+        ("worker inference caBundle enabled while inference disabled without schema",
+         ["worker.inference.caBundle.enabled=true", "worker.inference.caBundle.configMapName=inf-ca"], [SKIP],
+         ["worker.inference.caBundle.enabled cannot be true when worker.inference.enabled is false"]),
+        ("worker inference caBundle without configMapName",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm",
+          "worker.inference.caBundle.enabled=true"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [SCHEMA, "/worker/inference/caBundle/configMapName"]),
+        ("worker inference enabled without egress peers",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm"], [],
+         ["networkPolicy.worker.inference.to must list at least one inference gateway or TLS-terminator peer"]),
+        ("worker inference egress peers while disabled", [],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["networkPolicy.worker.inference.to must be empty when worker.inference.enabled is false"]),
+        ("worker inference egress peers while inference and networkPolicy disabled", ["networkPolicy.enabled=false"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["networkPolicy.worker.inference.to must be empty when worker.inference.enabled is false"]),
+        ("worker inference empty egress peer without schema",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm"],
+         ["--set-json", "networkPolicy.worker.inference.to=[{}]", SKIP],
+         ["networkPolicy.worker.inference.to[0] must be a non-empty NetworkPolicyPeer object"]),
+        # Per-model gateways (core ADR 0044).
+        ("gateway image set while gateways empty", ["images.gateway.repository=openmettle/gateway"], [],
+         [SCHEMA, "/images/gateway/repository"]),
+        ("gateway image set while gateways empty without schema",
+         ["images.gateway.registry=registry.example.test"], [SKIP],
+         ["images.gateway.{registry,repository,digest} must be empty when gateways is empty"]),
+        ("gateway database Secret while gateways empty",
+         ["database.gateway.existingSecret=openmettle-gateway-database"], [],
+         [SCHEMA, "/database/gateway/existingSecret"]),
+        ("gateway database Secret while gateways empty without schema",
+         ["database.gateway.existingSecret=openmettle-gateway-database"], [SKIP],
+         ["database.gateway.existingSecret must be empty when gateways is empty"]),
+        ("gateways non-empty without image or database Secret",
+         ["gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [SCHEMA, "/images/gateway", "/database/gateway"]),
+        ("gateways non-empty without image without schema",
+         ["gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "database.gateway.existingSecret=openmettle-gateway-database"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["images.gateway.repository is required when gateways is non-empty"]),
+        ("gateways non-empty without database Secret without schema",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["database.gateway.existingSecret is required when gateways is non-empty"]),
+        *[(f"gateway db reuses {role}{suffix}",
+           ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+            f"database.gateway.existingSecret={secret}", "gateways.a.model=a",
+            "gateways.a.upstreamUrl=http://sglang:30000"],
+           ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', *extra],
+           [f'database.gateway must not reuse database.{role} (Secret "{secret}", key "url")'])
+          for role, secret in (("api", "openmettle-api-database"), ("worker", "openmettle-worker-database"),
+                               ("migrate", "openmettle-owner-database"))
+          for suffix, extra in (("", []), (" without schema", [SKIP]))],
+        ("gateway db reuses issuance Secret",
+         [*AUTH, ISSUANCE, "images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          f"database.gateway.existingSecret={ISSUANCE_SECRET}", "gateways.a.model=a",
+          "gateways.a.upstreamUrl=http://sglang:30000"],
+         [*OIDC_PEER, "--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [f'database.gateway must not reuse database.issuance (Secret "{ISSUANCE_SECRET}", key "url")']),
+        ("gateway invalid map name",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.Bad_Name.model=a", "gateways.Bad_Name.upstreamUrl=http://sglang:30000"],
+         ["--set-json", 'gateways.Bad_Name.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [SCHEMA, "invalid propertyName 'Bad_Name'"]),
+        ("gateway invalid map name without schema",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.Bad_Name.model=a", "gateways.Bad_Name.upstreamUrl=http://sglang:30000"],
+         ["--set-json", 'gateways.Bad_Name.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["gateways.Bad_Name: name must match"]),
+        ("gateway duplicate model across instances",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=dup", "gateways.a.upstreamUrl=http://sglang-a:30000",
+          "gateways.b.model=dup", "gateways.b.upstreamUrl=http://sglang-b:30000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]',
+          "--set-json", 'gateways.b.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.41/32"}}]'],
+         ['gateways.b.model "dup" duplicates gateways.a.model']),
+        ("gateway upstreamUrl https refused",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=https://sglang:30000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [SCHEMA, "/gateways/a/upstreamUrl"]),
+        ("gateway upstreamUrl https refused without schema",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=https://sglang:30000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["gateways.a.upstreamUrl must use http://"]),
+        *[(f"gateway upstreamUrl bad ({label}){suffix}",
+           ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+            "database.gateway.existingSecret=openmettle-gateway-database",
+            "gateways.a.model=a", f"gateways.a.upstreamUrl={url}"],
+           ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', *extra],
+           fragments)
+          for label, url in (("path", "http://sglang:30000/v1"), ("query", "http://sglang:30000/?a=1"),
+                             ("fragment", "http://sglang:30000/#x"), ("userinfo", "http://u@sglang:30000"),
+                             ("port 0", "http://sglang:0"), ("double slash", "http://sglang:30000//"),
+                             ("short ipv6", "http://[1:2:3]:30000"),
+                             ("too many ipv6 groups", "http://[1:2:3:4:5:6:7:8:9]:30000"),
+                             ("double :: ipv6", "http://[2001::db8::1]:30000"),
+                             ("ipv6 with zone", "http://[::1%eth0]:30000"),
+                             ("ipv4 in brackets", "http://[127.0.0.1]:30000"),
+                             ("ipv6 8 groups with ::", "http://[1:2:3:4:5:6:7::8]:30000"),
+                             ("ipv6 bad v4 octet", "http://[::ffff:256.0.0.1]:30000"),
+                             ("ipv6 leading zero v4", "http://[::ffff:01.0.0.1]:30000"),
+                             ("double dot host", "http://sglang..local:30000"),
+                             ("leading dot host", "http://.sglang:30000"),
+                             ("double trailing dot", "http://sglang.local..:30000"),
+                             ("empty port", "http://sglang:"))
+          for suffix, extra, fragments in (("", [], [SCHEMA_ERROR, "/gateways/a/upstreamUrl"]),
+                                           (" without schema", [SKIP], ["gateways.a.upstreamUrl must be a canonical"]))],
+        *[(f"gateway model exceeds 128 UTF-8 bytes{suffix}",
+           ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+            "database.gateway.existingSecret=openmettle-gateway-database",
+            "gateways.a.model=" + ("é" * 65), "gateways.a.upstreamUrl=http://sglang:30000"],
+           ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', *extra],
+           ["gateways.a.model must be a non-empty string of at most 128 bytes"])
+          for suffix, extra in (("", []), (" without schema", [SKIP]))],
+        *[(f"string boolean {flag} refused without schema", [],
+           ["--set-string", f"{flag}=false", SKIP],
+           [f"{flag} must be a boolean (true or false)"])
+          for flag in ("migration.enabled", "networkPolicy.enabled", "storage.artifacts.enabled",
+                       "ingress.enabled", "api.podDisruptionBudget.enabled", "auth.enabled",
+                       "telemetry.otlp.enabled", "api.serviceAccount.create", "worker.serviceAccount.create",
+                       "migration.serviceAccount.create", "database.caBundle.enabled",
+                       "auth.providerCaBundle.enabled", "telemetry.otlp.caBundle.enabled",
+                       "worker.inference.enabled", "worker.inference.caBundle.enabled")],
+        ("string boolean worker.inference.caBundle.enabled refused when inference enabled without schema",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm"],
+         ["--set-string", "worker.inference.caBundle.enabled=false",
+          "--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["worker.inference.caBundle.enabled must be a boolean (true or false)"]),
+        ("string boolean gateways.a.serviceAccount.create refused without schema",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000"],
+         ["--set-string", "gateways.a.serviceAccount.create=false",
+          "--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]', SKIP],
+         ["gateways.a.serviceAccount.create must be a boolean (true or false)"]),
+        ("gateway upstreamUrl port above 65535",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:70000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["gateways.a.upstreamUrl port (70000) must be between 1 and 65535"]),
+        ("gateway invalid cacheMode",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "gateways.a.settings.cacheMode=global"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [SCHEMA, "/gateways/a/settings/cacheMode"]),
+        ("gateway grace equal to shutdown",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "gateways.a.terminationGracePeriodSeconds=5"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["gateways.a.terminationGracePeriodSeconds (5 s) must exceed gateways.a.settings.shutdownTimeoutMs (5000 ms)"]),
+        ("gateway strategy both zero",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "gateways.a.strategy.maxSurge=0", "gateways.a.strategy.maxUnavailable=0"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["gateways.a.strategy.maxSurge and gateways.a.strategy.maxUnavailable cannot both be 0"]),
+        ("gateway missing upstream egress peers",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000"], [],
+         ["gateways.a.networkPolicy.upstream.to must list at least one upstream peer"]),
+        ("gateway empty ingressFrom peer without schema",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]',
+          "--set-json", "gateways.a.networkPolicy.ingressFrom=[{}]", SKIP],
+         ["gateways.a.networkPolicy.ingressFrom[0] must be a non-empty NetworkPolicyPeer object"]),
+        ("gateway serviceAccount named default",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "gateways.a.serviceAccount.name=default"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ['gateways.a.serviceAccount.name must not be "default"']),
+        ("gateway serviceAccount shares worker name",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          f"gateways.a.serviceAccount.name={FULL}-worker"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         [f'worker and gateways.a resolve to the same ServiceAccount "{FULL}-worker"']),
+        ("gateway serviceAccount create=false without name",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "gateways.a.serviceAccount.create=false"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["gateways.a.serviceAccount.name is required when serviceAccount.create is false"]),
+        ("connection budget counts gateway surge replicas",
+         ["images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+          "database.gateway.existingSecret=openmettle-gateway-database",
+          "gateways.a.model=a", "gateways.a.upstreamUrl=http://sglang:30000",
+          "database.connectionBudget=24"],
+         ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["database.connectionBudget (24) is below the release's peak of 25 connections", "gateways 8"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -2075,8 +2402,10 @@ class BoundsTest(unittest.TestCase):
         ("api.settings.issuanceDbMaxConnections", 1, 64, []),
         ("api.service.port", 1, 65535, []),
         ("worker.sweepMs", 1000, 3600000, []),
+        ("worker.pollMs", 100, 60000, []),
         ("networkPolicy.database.port", 1, 65535, []),
         ("networkPolicy.api.oidc.port", 1, 65535, []),
+        ("networkPolicy.worker.inference.port", 1, 65535, []),
         ("networkPolicy.telemetry.otlp.port", 1, 65535, []),
         ("migration.settings.connectTimeoutMs", 1, 60000, MIGRATION_ROOM),
         ("migration.settings.lockTimeoutMs", 1, 600000, MIGRATION_ROOM),
@@ -2109,6 +2438,24 @@ class BoundsTest(unittest.TestCase):
                                if entry["name"].endswith("_SWEEP_MS")]
                     expected = [{"name": "OPENMETTLE_WORKER_SWEEP_MS", "value": value}]
                     self.assertEqual(entries, expected if role == "worker" and value != "null" else [])
+
+    def test_poll_interval_reaches_only_worker_and_rejects_invalid_values(self):
+        for value in ("null", "100", "60000"):
+            docs = render(set_values=[f"worker.pollMs={value}"])
+            for role, pod in pods(docs):
+                with self.subTest(value=value, role=role):
+                    entries = [entry for c in containers(pod) for entry in c["env"]
+                               if entry["name"].endswith("_POLL_MS")]
+                    expected = [{"name": "OPENMETTLE_WORKER_POLL_MS", "value": value}]
+                    self.assertEqual(entries, expected if role == "worker" and value != "null" else [])
+        for extra in (["--set-string", "worker.pollMs=500"], ["--set-json", "worker.pollMs=500.5"]):
+            result = helm_template(extra=extra)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("/worker/pollMs", result.stderr)
+        for value in (False, 500.5, "500", 99, 60001):
+            result = helm_template(extra=[SKIP, "--set-json", f"worker.pollMs={json.dumps(value)}"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertRegex(result.stderr, r"worker\.pollMs.*must be an integer between 100 and 60000")
 
     def test_limits_render_and_values_beyond_fail_schema(self):
         """Fails if a schema minimum or maximum is removed, loosened or tightened."""
@@ -2187,6 +2534,276 @@ class YamlScalarTest(unittest.TestCase):
         for key in ("LOG_FORMAT", "LOG_LEVEL"):
             self.assertIsInstance(env_map(migrate_pod["containers"][0])[PREFIX["migrate"] + key]["value"], str)
 
+    def test_gateway_and_inference_names_and_keys_are_strings(self):
+        """Fails if ambiguous gateway/inference names, models, Secret keys or ConfigMap keys render unquoted."""
+        result = helm_template(
+            release="123",
+            extra=[
+                "--set", "images.gateway.repository=openmettle/gateway",
+                "--set", f"images.gateway.digest={DIGEST}",
+                "--set-string", "database.gateway.existingSecret=789",
+                "--set-string", "database.gateway.key=null",
+                "--set", "worker.inference.enabled=true",
+                "--set-string", "worker.inference.configMapName=456",
+                "--set-string", "worker.inference.configKey=true",
+                "--set-string", "worker.inference.catalogKey=false",
+                "--set", "worker.inference.caBundle.enabled=true",
+                "--set-string", "worker.inference.caBundle.configMapName=999",
+                "--set-string", "worker.inference.caBundle.key=null",
+                "--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]',
+                "--set-json", 'gateways={"123":{"model":"true","upstreamUrl":"http://sglang:30000","serviceAccount":{"name":"false"},"networkPolicy":{"upstream":{"to":[{"ipBlock":{"cidr":"192.0.2.41/32"}}]}}}}',
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        worker_pod = find(docs, "Deployment", "-worker")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(worker_pod)["inference-config"]["configMap"], {
+            "name": "456",
+            "items": [{"key": "true", "path": "inference.json"}, {"key": "false", "path": "catalog.json"}],
+        })
+        self.assertEqual(volumes(worker_pod)["inference-ca"]["configMap"], {
+            "name": "999", "items": [{"key": "null", "path": "ca.crt"}],
+        })
+        gw_pod = find(docs, "Deployment", "-gateway-123")["spec"]["template"]["spec"]
+        self.assertEqual(gw_pod["serviceAccountName"], "false")
+        gw_env = env_map(gw_pod["containers"][0])
+        self.assertEqual(gw_env["OPENMETTLE_GATEWAY_MODEL"]["value"], "true")
+        self.assertEqual(gw_env["OPENMETTLE_GATEWAY_DATABASE_URL"]["valueFrom"]["secretKeyRef"],
+                         {"name": "789", "key": "null"})
+        gw_np = find(docs, "NetworkPolicy", "-gateway-123")["spec"]
+        self.assertEqual(gw_np["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"], "123")
+
+
+class WorkerInferenceTest(Rendered):
+    """worker.inference mounts inference config, catalog and optional CA into worker only (core ADRs 0033, 0043, 0044)."""
+
+    def test_worker_inference_env_volumes_and_isolation(self):
+        """Fails if worker.inference env/volumes drift or leak onto api, gateway or migrate."""
+        for name, has_ca in (("gateway-and-inference-enabled", False),
+                             ("gateway-tls-terminator", True),
+                             ("all-keys", True)):
+            docs = self.renders[name]
+            with self.subTest(values=name):
+                worker = find(docs, "Deployment", "-worker")["spec"]["template"]["spec"]
+                env = env_map(worker["containers"][0])
+                self.assertEqual(env["OPENMETTLE_WORKER_INFERENCE_CONFIG"]["value"], INFERENCE_CONFIG_PATH)
+                for key in ("RUN_SLOTS", "LEASE_MS", "EXECUTION_TIMEOUT_MS", "EXECUTING_PER_ACTOR", "EXECUTING_PER_SCOPE"):
+                    self.assertIn("OPENMETTLE_WORKER_" + key, env)
+                self.assertEqual(mounts(worker)["inference-config"],
+                                 {"name": "inference-config", "mountPath": INFERENCE_CONFIG_DIR, "readOnly": True})
+                items = volumes(worker)["inference-config"]["configMap"]["items"]
+                self.assertEqual([i["path"] for i in items], ["inference.json", "catalog.json"])
+                if has_ca:
+                    self.assertEqual(mounts(worker)["inference-ca"],
+                                     {"name": "inference-ca", "mountPath": INFERENCE_CA_DIR, "readOnly": True})
+                else:
+                    self.assertNotIn("inference-ca", volumes(worker))
+                    self.assertNotIn("inference-ca", mounts(worker))
+                # No fsGroup unless artifacts is also enabled.
+                if name != "all-keys":
+                    self.assertNotIn("fsGroup", worker["securityContext"])
+                # Strict isolation: no inference env or volumes outside worker.
+                for role, pod in pods(docs):
+                    if role == "worker":
+                        continue
+                    other_env = env_map(pod["containers"][0])
+                    self.assertFalse([k for k in other_env if any(
+                        tok in k for tok in ("INFERENCE", "RUN_SLOTS", "LEASE_MS", "EXECUTION_TIMEOUT", "EXECUTING_PER"))])
+                    self.assertFalse(INFERENCE_VOLUMES & set(volumes(pod)), role)
+
+    def test_lease_and_execution_boundaries_render(self):
+        """Fails if exact 6 * dbTimeoutMs or 2 * leaseMs boundaries are rejected."""
+        base = ["worker.settings.dbTimeoutMs=5000", "worker.inference.enabled=true",
+                "worker.inference.configMapName=inf-cm", "worker.inference.settings.leaseMs=30000",
+                "worker.inference.settings.executionTimeoutMs=60000"]
+        peer = ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]']
+        for extra in (peer, [*peer, SKIP]):
+            result = helm_template(set_values=base, extra=extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class GatewayTest(Rendered):
+    """Opt-in per-model openmettle-gateway Deployments, Services, ServiceAccounts and NetworkPolicies (core ADR 0044)."""
+
+    def test_deterministic_multi_gateway_order_and_defaults(self):
+        """Fails if multiple gateways are not rendered in deterministic sortAlpha order or defaults drift."""
+        docs = self.renders["gateway-and-inference-enabled"]
+        gw_deployments = [d for d in docs if d["kind"] == "Deployment" and component(d).startswith("gateway-")]
+        self.assertEqual([component(d) for d in gw_deployments], ["gateway-a", "gateway-b"])
+        gw_services = [d for d in docs if d["kind"] == "Service" and component(d).startswith("gateway-")]
+        self.assertEqual([component(d) for d in gw_services], ["gateway-a", "gateway-b"])
+        # gateway-a uses chart defaults; gateway-b overrides every per-gateway setting.
+        a_dep, b_dep = gw_deployments
+        self.assertEqual(a_dep["spec"]["replicas"], 1)
+        self.assertEqual(b_dep["spec"]["replicas"], 2)
+        a_pod = a_dep["spec"]["template"]["spec"]
+        a_c = a_pod["containers"][0]
+        a_env = env_map(a_c)
+        self.assertEqual(a_c["name"], "gateway")
+        self.assertEqual(a_c["readinessProbe"]["timeoutSeconds"], 3)
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_MODEL"]["value"], "model-a")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_UPSTREAM_URL"]["value"], "http://sglang-a.inference.example.test:30000")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_CACHE_MODE"]["value"], "scoped")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_MS"]["value"], "5000")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_UPSTREAM_IDLE_TIMEOUT_MS"]["value"], "120000")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_DB_MAX_CONNECTIONS"]["value"], "4")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_DB_TIMEOUT_MS"]["value"], "2000")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS"]["value"], "5000")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_OTLP_TRACES_ENDPOINT"]["value"],
+                         "https://alloy.observability.example.test:4318/v1/traces")
+        self.assertEqual(a_env["OPENMETTLE_GATEWAY_OTLP_CA_FILE"]["value"], OTLP_CA_PATH)
+        self.assertEqual(set(volumes(a_pod)), {"db-ca", "otlp-ca"})
+        self.assertNotIn("fsGroup", a_pod["securityContext"])
+        b_c = b_dep["spec"]["template"]["spec"]["containers"][0]
+        b_env = env_map(b_c)
+        self.assertEqual(b_c["readinessProbe"]["timeoutSeconds"], 3)
+        self.assertEqual(b_env["OPENMETTLE_GATEWAY_CACHE_MODE"]["value"], "per_request")
+        self.assertEqual(b_env["OPENMETTLE_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_MS"]["value"], "3000")
+        self.assertEqual(b_env["OPENMETTLE_GATEWAY_UPSTREAM_IDLE_TIMEOUT_MS"]["value"], "60000")
+        self.assertEqual(gw_services[0]["spec"]["type"], "ClusterIP")
+        self.assertEqual(gw_services[0]["spec"]["ports"][0]["port"], 8082)
+        self.assertEqual(gw_services[1]["spec"]["ports"][0]["port"], 8083)
+
+    def test_zero_false_and_empty_list_overrides_preserved(self):
+        """Fails if per-gateway default merging drops 0, false or [] overrides."""
+        result = helm_template(
+            set_values=[
+                "images.gateway.repository=openmettle/gateway",
+                f"images.gateway.digest={DIGEST}",
+                "database.gateway.existingSecret=openmettle-gateway-database",
+                "database.connectionBudget=21",
+                "gateways.a.model=a",
+                "gateways.a.upstreamUrl=http://[::1]:30000/",
+                "gateways.a.replicas=0",
+                "gateways.a.serviceAccount.create=false",
+                "gateways.a.serviceAccount.name=preexisting-gw-sa",
+            ],
+            extra=[
+                "--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"2001:db8::1/128"}}]',
+                "--set-json", "gateways.a.networkPolicy.ingressFrom=[]",
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        dep = find(docs, "Deployment", "-gateway-a")
+        self.assertEqual(dep["spec"]["replicas"], 0)
+        self.assertEqual(dep["spec"]["template"]["spec"]["serviceAccountName"], "preexisting-gw-sa")
+        self.assertFalse([d for d in docs if d["kind"] == "ServiceAccount" and component(d) == "gateway-a"])
+        np = find(docs, "NetworkPolicy", "-gateway-a")["spec"]
+        self.assertNotIn("ingress", np, "explicit ingressFrom: [] must deny all ingress")
+
+    def test_resource_name_63_char_limit_enforced(self):
+        """Fails if <fullname>-gateway-<name> exceeding 63 characters renders instead of failing."""
+        # release 'r'*53 -> fullname 'r'*52; 'r'*52 + '-gateway-ab' = 63 (OK); '-gateway-abc' = 64 (FAIL)
+        ok = helm_template(
+            release="r" * 53,
+            set_values=[
+                "images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+                "database.gateway.existingSecret=openmettle-gateway-database",
+                "gateways.ab.model=a", "gateways.ab.upstreamUrl=http://sglang:30000",
+            ],
+            extra=["--set-json", 'gateways.ab.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+        )
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        bad = helm_template(
+            release="r" * 53,
+            set_values=[
+                "images.gateway.repository=openmettle/gateway", f"images.gateway.digest={DIGEST}",
+                "database.gateway.existingSecret=openmettle-gateway-database",
+                "gateways.abc.model=a", "gateways.abc.upstreamUrl=http://sglang:30000",
+            ],
+            extra=["--set-json", 'gateways.abc.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+        )
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("exceeds Kubernetes' 63-character limit", bad.stderr)
+
+    def test_gateway_network_policy_disabled_renders_no_policies(self):
+        """Fails if gateway-network-policy-disabled still renders any NetworkPolicy."""
+        docs = self.renders["gateway-network-policy-disabled"]
+        self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
+        self.assertEqual(find(docs, "Deployment", "-gateway-a")["spec"]["replicas"], 1)
+
+    def test_database_gateway_same_secret_different_key_renders(self):
+        """Fails if database.gateway sharing a Secret with another role under a distinct key is rejected."""
+        result = helm_template(
+            set_values=[
+                "images.gateway.repository=openmettle/gateway",
+                f"images.gateway.digest={DIGEST}",
+                "database.gateway.existingSecret=openmettle-api-database",
+                "database.gateway.key=gateway-url",
+                "gateways.a.model=a",
+                "gateways.a.upstreamUrl=http://sglang:30000",
+            ],
+            extra=["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        gw_env = env_map(find(docs, "Deployment", "-gateway-a")["spec"]["template"]["spec"]["containers"][0])
+        self.assertEqual(gw_env["OPENMETTLE_GATEWAY_DATABASE_URL"]["valueFrom"]["secretKeyRef"],
+                         {"name": "openmettle-api-database", "key": "gateway-url"})
+
+    def test_upstream_url_trailing_dot_and_ipv6_accepted(self):
+        """Fails if trailing-dot DNS or valid RFC 4291 IPv6 upstreamUrl forms are rejected."""
+        urls = (
+            "http://sglang.models.svc.cluster.local.:30000",
+            "http://[2001:db8::1]:30000",
+            "http://[::1]:30000",
+            "http://[::ffff:127.0.0.1]:30000",
+            "http://[::]:30000/",
+            "http://[2001:db8:0:0:0:0:2:1]:30000",
+        )
+        for url in urls:
+            for extra in ([], [SKIP]):
+                with self.subTest(url=url, skip=bool(extra)):
+                    result = helm_template(
+                        set_values=[
+                            "images.gateway.repository=openmettle/gateway",
+                            f"images.gateway.digest={DIGEST}",
+                            "database.gateway.existingSecret=openmettle-gateway-database",
+                            "gateways.a.model=a",
+                            f"gateways.a.upstreamUrl={url}",
+                        ],
+                        extra=["--set-json",
+                               'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]',
+                               *extra],
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+                    gw_env = env_map(find(docs, "Deployment", "-gateway-a")["spec"]["template"]["spec"]["containers"][0])
+                    self.assertEqual(gw_env["OPENMETTLE_GATEWAY_UPSTREAM_URL"]["value"], url)
+
+    def test_model_dollar_escaping_and_utf8_byte_limit(self):
+        """Fails if literal $ in model is not escaped as $$ for Kubernetes EnvVar or 128-byte UTF-8 model fails."""
+        base = [
+            "images.gateway.repository=openmettle/gateway",
+            f"images.gateway.digest={DIGEST}",
+            "database.gateway.existingSecret=openmettle-gateway-database",
+            "gateways.a.upstreamUrl=http://sglang:30000",
+        ]
+        peer = ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]']
+        for raw, expected in (("study$$v2", "study$$$$v2"),
+                              ("a$(OPENMETTLE_GATEWAY_BIND)", "a$$(OPENMETTLE_GATEWAY_BIND)"),
+                              ("é" * 64, "é" * 64)):
+            for extra in (peer, [*peer, SKIP]):
+                with self.subTest(model=raw[:20], skip=SKIP in extra):
+                    result = helm_template(set_values=base, extra=["--set-string", f"gateways.a.model={raw}", *extra])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+                    gw_env = env_map(find(docs, "Deployment", "-gateway-a")["spec"]["template"]["spec"]["containers"][0])
+                    self.assertEqual(gw_env["OPENMETTLE_GATEWAY_MODEL"]["value"], expected)
+        # Uniqueness is still checked on the raw model string.
+        dup = helm_template(
+            set_values=[*base, "gateways.b.upstreamUrl=http://sglang-b:30000"],
+            extra=[
+                "--set-string", "gateways.a.model=study$$v2",
+                "--set-string", "gateways.b.model=study$$v2",
+                *peer,
+                "--set-json", 'gateways.b.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.41/32"}}]',
+            ],
+        )
+        self.assertNotEqual(dup.returncode, 0)
+        self.assertIn('gateways.b.model "study$$v2" duplicates gateways.a.model', dup.stderr)
+
 
 class ContractDriftTest(unittest.TestCase):
     """Chart defaults against core runtime/process-contract.json at the pinned commit (tests/fixtures)."""
@@ -2195,13 +2812,16 @@ class ContractDriftTest(unittest.TestCase):
     def setUpClass(cls):
         cls.contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         cls.docs = render()
+        cls.gateway_docs = render(("gateway-and-inference-enabled.yaml",))
 
     def test_defaults_match_process_contract(self):
         """Fails if a port, probe path, request or automount default diverges from the core contract."""
-        for role in ("api", "worker"):
+        for role, docs, suffix in (("api", self.docs, "-api"),
+                                   ("worker", self.docs, "-worker"),
+                                   ("gateway", self.gateway_docs, "-gateway-a")):
             expected = self.contract[role]
             with self.subTest(component=role):
-                pod = find(self.docs, "Deployment", f"-{role}")["spec"]["template"]["spec"]
+                pod = find(docs, "Deployment", suffix)["spec"]["template"]["spec"]
                 container = pod["containers"][0]
                 self.assertEqual(container["name"], expected["imageTarget"])
                 self.assertEqual([p["containerPort"] for p in container["ports"]], [expected["port"]])
@@ -2209,22 +2829,23 @@ class ContractDriftTest(unittest.TestCase):
                 self.assertEqual(container["readinessProbe"]["httpGet"]["path"], expected["readinessPath"])
                 self.assertEqual(container["resources"]["requests"], expected["requests"])
                 self.assertIs(pod["automountServiceAccountToken"], expected["automountServiceAccountToken"])
-                account = find(self.docs, "ServiceAccount", f"-{role}")
+                account = find(docs, "ServiceAccount", suffix)
                 self.assertIs(account["automountServiceAccountToken"], expected["automountServiceAccountToken"])
                 self.assertTrue(all(e["name"].startswith(expected["configurationPrefix"]) for e in container["env"]))
 
     def test_contract_service_account_names_are_accepted(self):
         """Fails if serviceAccount.name stops overriding the generated name (contract names are opt-in)."""
         overrides = [f"{role}.serviceAccount.name={self.contract[role]['serviceAccountName']}" for role in ("api", "worker")]
-        docs = render(set_values=overrides)
-        for role in ("api", "worker"):
-            pod = find(docs, "Deployment", f"-{role}")["spec"]["template"]["spec"]
+        overrides.append(f"gateways.a.serviceAccount.name={self.contract['gateway']['serviceAccountName']}")
+        docs = render(("gateway-and-inference-enabled.yaml",), set_values=overrides)
+        for role, suffix in (("api", "-api"), ("worker", "-worker"), ("gateway", "-gateway-a")):
+            pod = find(docs, "Deployment", suffix)["spec"]["template"]["spec"]
             self.assertEqual(pod["serviceAccountName"], self.contract[role]["serviceAccountName"])
 
     def test_contract_has_no_unreviewed_fields(self):
         """Fails if a re-pinned contract adds fields the chart does not yet assert."""
-        self.assertEqual(set(self.contract), {"status", "api", "worker"})
-        for role in ("api", "worker"):
+        self.assertEqual(set(self.contract), {"status", "api", "worker", "gateway"})
+        for role in ("api", "worker", "gateway"):
             self.assertEqual(set(self.contract[role]), {
                 "imageTarget", "configurationPrefix", "port", "serviceAccountName",
                 "automountServiceAccountToken", "requests", "livenessPath", "readinessPath",
