@@ -156,6 +156,29 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "replace-adoption-run"):
             restore_drill.parse_failed_rebind(stdout, "no barrier here\n", res_id)
 
+    def test_parses_labelled_cancelled_runs_count_ignoring_setval_output(self):
+        self.assertEqual(restore_drill.parse_cancelled_runs_count("100\ncancelled_runs=2\n"), 2)
+        self.assertEqual(restore_drill.parse_cancelled_runs_count("  cancelled_runs=0  \n"), 0)
+        for bad_out in ("100\n2\n", "100\n", "cancelled_runs=2\ncancelled_runs=2\n", ""):
+            with self.assertRaisesRegex(restore_drill.DrillFailure, "cancelled_runs"):
+                restore_drill.parse_cancelled_runs_count(bad_out)
+
+    def test_verify_trailing_epoch_probe_failure_requires_pg_guard_diagnostic(self):
+        restore_drill.verify_trailing_epoch_probe_failure(
+            3,
+            "ERROR:  login_provider_revisions epoch 41 did not advance past previous maximum 100",
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "epoch guard diagnostic"):
+            restore_drill.verify_trailing_epoch_probe_failure(
+                0,
+                "ERROR:  login_provider_revisions epoch 41 did not advance past previous maximum 100",
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "epoch guard diagnostic"):
+            restore_drill.verify_trailing_epoch_probe_failure(
+                1,
+                "error: unable to upgrade connection: container not found",
+            )
+
 
 class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
     def test_quota_verify_requires_all_seven_counters_zero(self):
@@ -292,6 +315,7 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         lost_sha = hashlib.sha256(lost_bytes).hexdigest()
 
         barrier = "55555555-5555-4555-8555-555555555555"
+        media = tmp / "media"
         script = restore_drill.build_step4c_reconcile_lines(
             selected_journal=str(tmp / "post.export"),
             artifacts_mount=str(artifacts),
@@ -302,6 +326,7 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
                 (rec_rev, rec_res, len(rec_bytes), rec_sha),
                 (lost_rev, lost_res, len(lost_bytes), lost_sha),
             ],
+            recovery_media_dir=str(media),
         )
         env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
         res = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
@@ -317,6 +342,16 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn(f"storage declare-lost {artifacts} --revision {lost_rev}", calls)
         self.assertIn(f"storage rebind {artifacts} --replace-adoption-run {barrier}", calls)
 
+        # Negative test: if any encrypted backup archive copy remains reachable under `recovery_media_dir`,
+        # `storage declare-lost` MUST be refused before executing.
+        (artifacts / "revisions" / rec_res).unlink()
+        log_file.write_text("", encoding="utf-8")
+        (media / "backup-20261127T090000Z-66666666-6666-4666-8666-666666666666").mkdir(parents=True)
+        res_avail = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
+        self.assertNotEqual(res_avail.returncode, 0)
+        self.assertIn("remains available", res_avail.stderr)
+        self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+
     def test_owner_and_worker_reconcile_sql_follow_core_sequence_and_role_boundaries(self):
         owner_sql = restore_drill.pre_worker_owner_reconcile_sql(
             restore_drill.DRILL_OPERATOR_ID,
@@ -331,6 +366,7 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("SET last_event_sequence = last_event_sequence + 1", owner_sql)
         self.assertIn("access_generation = access_generation + 1", owner_sql)
         self.assertNotIn("quota_release_terminal_runs", owner_sql)
+        self.assertIn("SELECT 'cancelled_runs=' || count(*)", owner_sql)
         self.assertIn("DO $restore$", owner_sql)
         self.assertIn("$restore$;", owner_sql)
         self.assertNotIn("$$", owner_sql)
@@ -373,11 +409,18 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         unpacked = tmp / "unpacked"
         unpacked.mkdir()
         (unpacked / "manifest.json").write_text("{}", encoding="utf-8")
+        retained_journal = tmp / "post-backup-journal.export"
+        retained_journal.write_text("openmettle.deletion_journal.export/1\n", encoding="utf-8")
+        retained_journal.chmod(0o400)
         script_pinned = restore_drill.build_step5e_script(
-            restore_drill.DRILL_OPERATOR_ID, run_id, has_artifacts=True, unpacked_dir=str(unpacked)
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            has_artifacts=True,
+            unpacked_dir=str(unpacked),
+            retained_journal=str(retained_journal),
         )
 
-        # Case 1: quota verify exits 0 with pending gateway 1 -> Job MUST fail and preserve unpacked!
+        # Case 1: quota verify exits 0 with pending gateway 1 -> Job MUST fail and preserve unpacked & journal!
         write_stub(
             "false",
             "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
@@ -386,8 +429,9 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         res_drift = subprocess.run(["/bin/sh", "-c", script_pinned], env=env_base, capture_output=True, text=True)
         self.assertNotEqual(res_drift.returncode, 0)
         self.assertTrue((unpacked / "manifest.json").exists(), "staging prematurely scrubbed despite pending gateway 1")
+        self.assertTrue(retained_journal.exists(), "retained journal prematurely scrubbed despite pending gateway 1")
 
-        # Case 2: maintenance_active still true -> Job MUST fail and preserve unpacked!
+        # Case 2: maintenance_active still true -> Job MUST fail and preserve unpacked & journal!
         write_stub(
             "true",
             "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
@@ -396,8 +440,9 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         res_maint = subprocess.run(["/bin/sh", "-c", script_pinned], env=env_base, capture_output=True, text=True)
         self.assertNotEqual(res_maint.returncode, 0)
         self.assertTrue((unpacked / "manifest.json").exists(), "staging prematurely scrubbed despite maintenance_active=true")
+        self.assertTrue(retained_journal.exists(), "retained journal prematurely scrubbed despite maintenance_active=true")
 
-        # Case 3: maintenance_active=false and all 7 counters=0 -> Job exits 0 and scrubs unpacked!
+        # Case 3: maintenance_active=false and all 7 counters=0 -> Job exits 0 and scrubs unpacked + retained journal!
         write_stub(
             "false",
             "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
@@ -406,15 +451,23 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         res_ok = subprocess.run(["/bin/sh", "-c", script_pinned], env=env_base, capture_output=True, text=True)
         self.assertEqual(res_ok.returncode, 0, res_ok.stderr)
         self.assertFalse(unpacked.exists(), "staging was not scrubbed after clean release and zero drift")
+        self.assertFalse(retained_journal.exists(), "retained journal was not scrubbed after clean release and zero drift")
         self.assertIn(smoke.ARTIFACTS_MOUNT_PATH, (tmp / "qv-args").read_text(encoding="utf-8"))
 
         # Case 4: storage-disabled (has_artifacts=False) omits root path argument!
         unpacked.mkdir()
+        retained_journal.write_text("openmettle.deletion_journal.export/1\n", encoding="utf-8")
+        retained_journal.chmod(0o400)
         script_no_art = restore_drill.build_step5e_script(
-            restore_drill.DRILL_OPERATOR_ID, run_id, has_artifacts=False, unpacked_dir=str(unpacked)
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            has_artifacts=False,
+            unpacked_dir=str(unpacked),
+            retained_journal=str(retained_journal),
         )
         res_no_art = subprocess.run(["/bin/sh", "-c", script_no_art], env=env_base, capture_output=True, text=True)
         self.assertEqual(res_no_art.returncode, 0, res_no_art.stderr)
+        self.assertFalse(retained_journal.exists())
         self.assertEqual((tmp / "qv-args").read_text(encoding="utf-8").strip(), "quota verify")
 
     def test_runbook_step3_pg_restore_failure_is_not_masked_and_cleans_pgpassfile(self):
@@ -599,8 +652,10 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         cat_path.write_text(json.dumps(test_smoke.CATALOG_FIXTURE), encoding="utf-8")
         self.commands: list[list[str]] = []
         self.applied_manifests: list[dict] = []
+        self.media_lifecycle: list[str] = []
         self.fail_on_target_migrate = False
         self.job_failed_on_pre_worker_sql = False
+        self.transport_fail_on_epoch_probe = False
         self.shared_artifact_readers: list[str] = []
 
     def _make_core(self):
@@ -715,8 +770,13 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 self.applied_manifests.append(doc)
                 if doc.get("kind") == "Job":
                     self._last_job = doc["metadata"]["name"]
+                    if self._last_job == "openmettle-drill-reconcile-admin":
+                        self.media_lifecycle.append("applied-reconcile-admin")
                     if self.fail_on_target_migrate and self._last_job == "openmettle-drill-migrate":
                         return self._res(1, "", f"fatal migrate error password={self._leak_secret}")
+                return self._res(0, "")
+            if "delete" in argv and "pvc" in argv and restore_drill.TARGET_RECOVERY_MEDIA_CLAIM in argv:
+                self.media_lifecycle.append("deleted-media-pvc")
                 return self._res(0, "")
             if "get" in argv and "job" in argv and argv[-1] == "--output=json":
                 job_name = argv[argv.index("job") + 1]
@@ -820,7 +880,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "VAULT_AFTER_BEGIN\nconnections 2, encrypted 1\nkey_id vault-k2 1\nVAULT_AFTER_END\n",
             )
         if name == "openmettle-drill-pre-worker-sql":
-            return self._res(0, "2\n")
+            return self._res(0, "100\ncancelled_runs=2\n")
         if name == "openmettle-drill-worker-quota-release":
             return self._res(0, "1\n")
         if name == "openmettle-drill-release-maintenance":
@@ -875,6 +935,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     f"99999999-9999-4999-8999-999999999997|99999999-9999-4999-8999-999999999997||37|{'4' * 64}\n",
                 )
             if "DO $provider_epoch$" in stdin_text and "setval" not in stdin_text:
+                if self.transport_fail_on_epoch_probe:
+                    return self._res(1, "", "error: unable to upgrade connection")
                 return self._res(
                     3,
                     "",
@@ -1150,6 +1212,41 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertTrue(any("coverage-gap" in n for n in check_names))
         self.assertTrue(any(cmd[:3] == ["kind", "delete", "cluster"] for cmd in self.commands))
         self.assertTrue(any(cmd[:4] == ["docker", "image", "rm", "--force"] for cmd in self.commands))
+        self.assertTrue(
+            any(
+                cmd[0] == "kubectl"
+                and "--namespace" in cmd
+                and restore_drill.TARGET_APP_NS in cmd
+                and "delete" in cmd
+                and "pvc" in cmd
+                and restore_drill.TARGET_RECOVERY_MEDIA_CLAIM in cmd
+                and "--wait=true" in cmd
+                for cmd in self.commands
+            )
+        )
+        self.assertEqual(self.media_lifecycle, ["deleted-media-pvc", "applied-reconcile-admin"])
+        reconcile_job = next(
+            d for d in self.applied_manifests
+            if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-reconcile-admin"
+        )
+        reconcile_pod = reconcile_job["spec"]["template"]["spec"]
+        self.assertFalse(
+            any(
+                v.get("persistentVolumeClaim", {}).get("claimName") == restore_drill.TARGET_RECOVERY_MEDIA_CLAIM
+                for v in reconcile_pod.get("volumes", ())
+            )
+        )
+        self.assertIn(
+            restore_drill.RETAINED_JOURNAL_PATH,
+            reconcile_pod["containers"][0]["command"][-1],
+        )
+
+    def test_trailing_epoch_probe_rejects_unrelated_transport_failure(self):
+        self.transport_fail_on_epoch_probe = True
+        rc, summary = self._run_drill()
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["result"], "failed")
+        self.assertIn("epoch guard diagnostic", summary["error"])
 
     def test_failed_job_reports_redacted_pod_logs_without_waiting_for_complete_timeout(self):
         self.job_failed_on_pre_worker_sql = True

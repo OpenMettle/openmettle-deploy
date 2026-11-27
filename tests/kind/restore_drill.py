@@ -57,6 +57,7 @@ TARGET_RECOVERY_SCRATCH_CLAIM = "openmettle-target-recovery-scratch"
 RECOVERY_MEDIA_DIR = "/var/backups/openmettle"
 RECOVERY_SCRATCH_DIR = "/var/recovery"
 UNPACKED_DIR = f"{RECOVERY_SCRATCH_DIR}/unpacked"
+RETAINED_JOURNAL_PATH = f"{RECOVERY_SCRATCH_DIR}/post-backup-journal.export"
 
 VAULT_KEY_ID_1 = "vault-k1"
 VAULT_KEY_FILE_1 = "vault-k1.key"
@@ -257,6 +258,39 @@ def parse_restore_lock_run_id(output: str) -> str:
     if not match:
         raise DrillFailure(f"restore lock stdout did not report restore_run UUID: {output!r}")
     return match.group(1)
+
+
+def parse_cancelled_runs_count(sql_out: str) -> int:
+    """Extract the unique `cancelled_runs=<n>` line emitted by `pre_worker_owner_reconcile_sql`,
+    ignoring unrelated bare numeric rows such as `SELECT setval(...)`."""
+    matches = [
+        m.group(1)
+        for ln in sql_out.splitlines()
+        if (m := re.fullmatch(r"cancelled_runs=(\d+)", ln.strip())) is not None
+    ]
+    if len(matches) != 1:
+        raise DrillFailure(f"expected single cancelled_runs=<n> line, got {sql_out!r}")
+    return int(matches[0])
+
+
+def verify_trailing_epoch_probe_failure(
+    returncode: int,
+    stderr: str,
+    *,
+    expected_new_epoch: int = 41,
+    expected_prev_max: int = 100,
+) -> None:
+    """Require the unrepaired ADR 0012 trailing-sequence probe to fail specifically with the
+    PostgreSQL epoch-guard exception rather than an unrelated exec/transport error."""
+    expected_diag = (
+        f"login_provider_revisions epoch {expected_new_epoch} "
+        f"did not advance past previous maximum {expected_prev_max}"
+    )
+    if returncode == 0 or expected_diag not in stderr:
+        raise DrillFailure(
+            "trailing login_provider_revisions sequence probe did not fail with expected "
+            f"epoch guard diagnostic ({expected_diag!r}): rc={returncode}, stderr={stderr!r}"
+        )
 
 
 def accept_coverage_gap_args(
@@ -604,7 +638,7 @@ BEGIN
 END
 $restore$;
 
-SELECT count(*)
+SELECT 'cancelled_runs=' || count(*)
   FROM openmettle.runs
  WHERE state = 'cancelled'
    AND cancel_reason = 'revoked';
@@ -626,6 +660,18 @@ SELECT openmettle.quota_release_terminal_runs(
 """
 
 
+def _validate_posix_abs_path(label: str, path: str) -> str:
+    """Reject empty, relative, or shell-metacharacter paths interpolated into `/bin/sh` scripts."""
+    if (
+        not path
+        or not path.startswith("/")
+        or path == "/"
+        or any(c in path for c in ('"', "'", "$", "`", "\\", "\n", "\r", "*", "?", "[", "\0"))
+    ):
+        raise DrillFailure(f"invalid {label} path: {path!r}")
+    return path
+
+
 def build_step4c_reconcile_lines(
     *,
     selected_journal: str,
@@ -634,13 +680,19 @@ def build_step4c_reconcile_lines(
     operator_id: str,
     barrier_uuid: str,
     failed_revisions: list[tuple[str, str, int, str]],
+    recovery_media_dir: str = RECOVERY_MEDIA_DIR,
 ) -> str:
     """Build Step 4c + 4d commands for pinned artifact volumes:
     1) replay --db-only first,
     2) verify staging copies by byte length + SHA-256 and restore any intact payload (`chmod 0600`)
        BEFORE ever invoking `storage declare-lost`,
-    3) reserve `storage declare-lost` strictly for revisions absent/corrupt in all recovery copies,
+    3) verify no archive media remains available and reserve `storage declare-lost` strictly for
+       revisions absent/corrupt in all recovery copies,
     4) resume `storage rebind --replace-adoption-run` -> `restore replay` -> `quota verify`."""
+    _validate_posix_abs_path("selected_journal", selected_journal)
+    _validate_posix_abs_path("artifacts_mount", artifacts_mount)
+    _validate_posix_abs_path("unpacked_dir", unpacked_dir)
+    _validate_posix_abs_path("recovery_media_dir", recovery_media_dir)
     if not (smoke.UUID.fullmatch(operator_id) and smoke.UUID.fullmatch(barrier_uuid)):
         raise DrillFailure("invalid operator_id or barrier_uuid in build_step4c_reconcile_lines")
     lines = [f'openmettle-admin restore replay --db-only "{selected_journal}"']
@@ -668,6 +720,12 @@ def build_step4c_reconcile_lines(
             "  fi\n"
             "fi\n"
             'if [ "$recovered" -eq 0 ]; then\n'
+            f'  for archive_cand in "{recovery_media_dir}"/backup-*; do\n'
+            '    if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then\n'
+            '      echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2\n'
+            "      exit 1\n"
+            "    fi\n"
+            "  done\n"
             f'  openmettle-admin storage declare-lost "{artifacts_mount}" '
             f'--revision "{rev_id}" --operator-id "{operator_id}" '
             f'--request-key "drill-lost-{rev_id}" '
@@ -690,10 +748,14 @@ def build_step5e_script(
     has_artifacts: bool,
     artifacts_mount: str = smoke.ARTIFACTS_MOUNT_PATH,
     unpacked_dir: str = UNPACKED_DIR,
+    retained_journal: str = RETAINED_JOURNAL_PATH,
 ) -> str:
-    """Build the Step 5e shell script so `unpacked_dir` is scrubbed ONLY after
-    `backup release-maintenance` succeeds, `backup status` reports `"maintenance_active": false`,
+    """Build the Step 5e shell script so `unpacked_dir` and `retained_journal` are scrubbed ONLY
+    after `backup release-maintenance` succeeds, `backup status` reports `"maintenance_active": false`,
     and `quota verify` reports zero across all seven drift counters."""
+    _validate_posix_abs_path("artifacts_mount", artifacts_mount)
+    _validate_posix_abs_path("unpacked_dir", unpacked_dir)
+    _validate_posix_abs_path("retained_journal", retained_journal)
     for label, val in (("operator_id", operator_id), ("restore_run_id", restore_run_id)):
         if not smoke.UUID.fullmatch(val):
             raise DrillFailure(f"invalid {label} UUID: {val!r}")
@@ -713,7 +775,7 @@ def build_step5e_script(
         f'quota_out="$({qv_cmd})"\n'
         'printf "QUOTA_VERIFY_BEGIN\\n%s\\nQUOTA_VERIFY_END\\n" "$quota_out"\n'
         f'printf "%s\\n" "$quota_out" | grep -Fxq \'{zero_line}\'\n'
-        f'rm -rf "{unpacked_dir}"\n'
+        f'rm -rf "{unpacked_dir}" "{retained_journal}"\n'
     )
 
 
@@ -2333,12 +2395,14 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             ],
         )
         unpack_script = (
-            f'rm -rf "{UNPACKED_DIR}"\n'
+            f'rm -rf "{UNPACKED_DIR}" "{RETAINED_JOURNAL_PATH}"\n'
             f'OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
             f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}"\n'
             f'OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
             f'openmettle-admin backup unpack --backup-dir "{backup_dir}" --output-dir "{UNPACKED_DIR}" '
             f'--backup-keys-config "{good_bk_cfg}"\n'
+            f'cp -- "{RECOVERY_MEDIA_DIR}/post-backup-journal.export" "{RETAINED_JOURNAL_PATH}"\n'
+            f'chmod 0400 "{RETAINED_JOURNAL_PATH}"\n'
             f'printf "MANIFEST_JSON_BEGIN\\n"\ncat "{UNPACKED_DIR}/manifest.json"\nprintf "\\nMANIFEST_JSON_END\\n"\n'
         )
         unpack_job = {
@@ -2383,6 +2447,21 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     "expected pinned artifact_volume.volume_id in drill manifest")
         self.passed("backup preflight verified, negative tamper/key checks refused, and archive unpacked",
                     **manifest_summary)
+
+        # Model loss of access to the encrypted recovery archive after unpack completes, while
+        # keeping the independently retained selected journal on target scratch. Deleting the two
+        # completed preflight/unpack Jobs releases `kubernetes.io/pvc-protection` on media PVC.
+        self.verify_identity()
+        self.kube(
+            "--namespace", TARGET_APP_NS, "delete", "job",
+            "openmettle-drill-preflight-neg", "openmettle-drill-verify-unpack",
+            "--wait=true", timeout=120,
+        )
+        self.verify_identity()
+        self.kube(
+            "--namespace", TARGET_APP_NS, "delete", "pvc",
+            TARGET_RECOVERY_MEDIA_CLAIM, "--wait=true", timeout=120,
+        )
 
         # Exercise the uncertified coverage-gap flow on an isolated scratch database before scrubbing unpacked files.
         self.exercise_uncertified_coverage_gap()
@@ -2488,7 +2567,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         lost_rev_id = primary_state["art_to_lose"]["revision_id"]
         lost_meta = primary_state["rev_meta"][lost_rev_id]
         lost_res_id = lost_meta["reservation_id"]
-        selected_journal = f"{RECOVERY_MEDIA_DIR}/post-backup-journal.export"
+        selected_journal = RETAINED_JOURNAL_PATH
 
         step4a_script = f'printf "LOCK_STDOUT_BEGIN\\n"; openmettle-admin {lock_argv}; printf "LOCK_STDOUT_END\\n"\n'
         if has_artifacts:
@@ -2597,14 +2676,12 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
                                 *s4b_key_mounts,
-                                {"name": "media", "mountPath": RECOVERY_MEDIA_DIR, "readOnly": True},
                                 {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR, "readOnly": True},
                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH},
                             ],
                         }],
                         "volumes": [
                             *s4b_key_vols,
-                            {"name": "media", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_MEDIA_CLAIM, "readOnly": True}},
                             {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM, "readOnly": True}},
                             {"name": "artifacts", "persistentVolumeClaim": {"claimName": TARGET_ARTIFACTS_CLAIM}},
                         ],
@@ -2652,10 +2729,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             input=unrepaired_probe_sql,
             check=False,
         )
-        self.expect(
-            unrepaired_probe.returncode != 0,
-            "trailing login_provider_revisions sequence unexpectedly committed without advancing epoch",
-        )
+        verify_trailing_epoch_probe_failure(unrepaired_probe.returncode, unrepaired_probe.stderr)
         post_rollback_row = self.psql_superuser(
             TARGET_DB_NS,
             f"SELECT (SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id = '{USER_A_IDS['provider']}'::uuid),"
@@ -2710,8 +2784,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             },
         }
         sql_out, _ = self.run_job(TARGET_APP_NS, owner_sql_job)
-        cancelled_lines = [ln.strip() for ln in sql_out.splitlines() if ln.strip().isdigit()]
-        self.expect(cancelled_lines == ["2"],
+        cancelled_count = parse_cancelled_runs_count(sql_out)
+        self.expect(cancelled_count == 2,
                     f"expected 2 parked waiting runs cancelled cleanly, got {sql_out!r}")
 
         # Step 5d.2: Release eligible terminal-run quota holds as openmettle_worker (`SECRET['worker']`).
