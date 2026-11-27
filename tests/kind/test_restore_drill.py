@@ -1468,6 +1468,8 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("catalog_file", step6)
         self.assertIn("admission_limits", step6)
         self.assertIn('code: "provisioning"', step6)
+        self.assertIn("GET /v1/runs/{run_id}/approvals", step6)
+        self.assertIn('{"items": []}', step6)
 
         m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
         self.assertIsNotNone(m_sh)
