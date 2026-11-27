@@ -67,14 +67,17 @@ REVOKE ALL ON SCHEMA public FROM PUBLIC;
 
 ## Step 3 — Restore PostgreSQL dump and run `openmettle-migrate`
 
-1. Restore `/var/recovery/unpacked/pg.dump` as `openmettle_owner` using PostgreSQL 18 `pg_restore` from the publisher-pinned `postgresClient` image. Supply credentials exclusively through a `0600` `PGPASSFILE` on a `Memory` `emptyDir` with libpq `\` and `:` escaping — never on the command line:
+1. Restore `/var/recovery/unpacked/pg.dump` as `openmettle_owner` using PostgreSQL 18 `pg_restore` from the publisher-pinned `postgresClient` image. Mount the isolated target PostgreSQL CA bundle (`database.caBundle`, e.g. `/etc/openmettle/pg-ca/ca.crt`), enforce server identity verification (`PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/pg-ca/ca.crt`, `PGGSSENCMODE=disable`; `PGSSLMODE=disable` is confined strictly to the synthetic `dev`-classified `kind` fixture), and supply credentials exclusively through a `0600` `PGPASSFILE` on a `Memory` `emptyDir` with libpq `\` and `:` escaping — never on the command line:
 
 ```sh
 umask 077
 export PGPASSFILE=/tmp/pgpass
+export PGSSLMODE=verify-full
+export PGSSLROOTCERT=/etc/openmettle/pg-ca/ca.crt
+export PGGSSENCMODE=disable
 esc() { printf '%s' "$1" | sed 's/[\\:]/\\&/g'; }
 printf '%s:%s:openmettle:openmettle_owner:%s\n' \
-  "$(esc "$PGHOST")" "$(esc "$PGPORT")" "$(esc "$OWNER_PASSWORD")" > "$PGPASSFILE"
+  "$(esc "$PGHOST")" "$(esc "${PGPORT:-5432}")" "$(esc "$OWNER_PASSWORD")" > "$PGPASSFILE"
 chmod 0600 "$PGPASSFILE"
 
 pg_restore \
@@ -82,7 +85,7 @@ pg_restore \
   --no-owner \
   --exit-on-error \
   --host="$PGHOST" \
-  --port="$PGPORT" \
+  --port="${PGPORT:-5432}" \
   --username=openmettle_owner \
   --dbname=openmettle \
   /var/recovery/unpacked/pg.dump
@@ -96,14 +99,15 @@ rm -f "$PGPASSFILE"
 
 ## Step 4 — Lock restore gate, rebind artifact volume, and replay deletion journal
 
-### 4a. Choose `SELECTED_JOURNAL` and lock `restore_reconciliation_gate`
+### 4a. Bind `OPENMETTLE_ADMIN_DATABASE_URL`, choose `SELECTED_JOURNAL`, and lock `restore_reconciliation_gate`
 
-Carry a single verified journal export file (`SELECTED_JOURNAL` — either a newer off-host `openmettle-admin journal export` file from the same installation `origin`, or `/var/recovery/unpacked/deletion-journal.bin`) through both `restore lock` and `restore replay`:
+`openmettle-admin` database subcommands read `OPENMETTLE_ADMIN_DATABASE_URL` (separate from `OPENMETTLE_MIGRATE_DATABASE_URL`). Bind `OPENMETTLE_ADMIN_DATABASE_URL` in the recovery Job from the isolated target's `openmettle_owner` Secret (`database.migrate.existingSecret`, key `url`) for Steps 4a–4d, 5c, 5e, and 6, and carry a single verified journal export file (`SELECTED_JOURNAL` — either a newer off-host `openmettle-admin journal export` file from the same installation `origin`, or `/var/recovery/unpacked/deletion-journal.bin`) through both `restore lock` and `restore replay`:
 
 - **When to pass `--export-complete`:** Pass `--export-complete` on `restore lock` **only** when `SELECTED_JOURNAL`'s `(seq, digest)` matches an independently recorded final `(journal_seq, chain_digest)` watermark captured *after* all primary writes, purges, and external-connection revocations stopped (for example, a clean maintenance-window backup with zero post-backup primary writes before loss, or a fresh `openmettle-admin journal export` taken from an intact stopped/fenced primary). Never pass `--export-complete` merely because an external export has a higher `seq` than the backup.
 - **When post-export primary activity cannot be ruled out:** Whenever writes, purges, or connection revocations could have occurred on primary *after* `SELECTED_JOURNAL` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock`, record the printed `restore_run <RESTORE_RUN_UUID>`, and run audited break-glass acceptance before opening the gate (per `ADR 0045`, `restore accept-coverage-gap` also conservatively transitions `authorized` external connections to `reauth_required`, clears encrypted tokens, and deactivates active connection shares):
 
 ```sh
+# OPENMETTLE_ADMIN_DATABASE_URL bound from isolated target database.migrate.existingSecret (key: url)
 openmettle-admin restore accept-coverage-gap \
   --restore-run "$RESTORE_RUN_UUID" \
   --operator-id "$OPERATOR_UUID" \
@@ -114,6 +118,7 @@ openmettle-admin restore accept-coverage-gap \
 Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`), lock the gate, and record the printed `restore_run <RESTORE_RUN_UUID>` (also used in Step 5e):
 
 ```sh
+# OPENMETTLE_ADMIN_DATABASE_URL bound from isolated target database.migrate.existingSecret (key: url).
 # Include --export-complete ONLY when (REQUIRED_SEQ, REQUIRED_DIGEST_HEX) is certified complete after primary quiescence.
 openmettle-admin restore lock \
   --required-origin "$ORIGIN_US" \
@@ -138,29 +143,63 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
 ```
 
 - **If `storage rebind` exits `0` (`failed 0`):** proceed directly to Step 4d.
-- **If `storage rebind` exits `1` (`storage rebind incomplete`):** stderr prints `--replace-adoption-run <BARRIER_UUID>` and stdout lists every `failed <reservation_id>: missing revision` (or size/digest mismatch). Follow Step 4c in exact order.
+- **If `storage rebind` exits `1` (`storage rebind incomplete`):** stderr prints `--replace-adoption-run <BARRIER_UUID>` and stdout lists every `failed <reservation_id>: <reason>` (`missing revision`, `size_or_digest_mismatch`, etc.). Follow Step 4c in exact order — **do not run `storage declare-lost` before checking whether the revision was purged after the backup or can be restored intact from staging or another backup**.
 
-### 4c. Handling missing or unrecoverable artifact payloads (`storage declare-lost`)
+### 4c. Resolving incomplete `storage rebind` barriers and declaring truly unrecoverable payloads lost
 
-Never declare a revision lost before replaying post-backup database journal records: a file missing from disk may already have been purged after the backup (`ADR 0041` / `docs/operator/restore-artifact-volume.md`):
+`storage declare-lost` is permanent and destructive: it unlinks leftover bytes, transitions the revision to `lost` (`410 Gone`), and appends an irreversible `artifact_revision.lost` entry to `openmettle.deletion_journal` (`ADR 0040`, `ADR 0041`, `docs/operator/restore-artifact-volume.md`). Execute the checks below in order under the held `BARRIER_UUID`:
 
-```sh
-# 1. Catch up the database deletion journal first while keeping the restore gate closed.
-openmettle-admin restore replay --db-only "$SELECTED_JOURNAL"
+1. **Catch up post-backup database deletions first** while keeping `restore_reconciliation_gate` closed:
 
-# 2. Look up failing revision IDs still in 'active' or 'retained' state by reservation_id, then
-#    record an audited loss declaration (transitions state -> 'lost' / HTTP 410 Gone, decrements
-#    active_bytes or retained_bytes, and appends artifact_revision.lost to deletion_journal).
-openmettle-admin storage declare-lost /var/lib/openmettle/artifacts \
-  --revision "$MISSING_REVISION_UUID" \
-  --operator-id "$OPERATOR_UUID" \
-  --request-key "restore-lost-$MISSING_REVISION_UUID" \
-  --reason "payload missing from recovery media during isolated restore"
+   ```sh
+   openmettle-admin restore replay --db-only "$SELECTED_JOURNAL"
+   ```
 
-# 3. Complete volume rebind under the held adoption barrier.
-openmettle-admin storage rebind /var/lib/openmettle/artifacts \
-  --replace-adoption-run "$BARRIER_UUID"
-```
+   Inspect each failing `reservation_id` against `openmettle.artifact_revisions` and `openmettle.deletion_journal`:
+
+   ```sql
+   SELECT r.id AS revision_id,
+          r.state,
+          r.size_bytes,
+          encode(r.content_digest, 'hex') AS sha256,
+          EXISTS (
+              SELECT 1
+                FROM openmettle.deletion_journal dj
+               WHERE dj.entity_id = r.id
+                 AND dj.event_kind = 'artifact_revision.purged'
+          ) AS already_purged
+     FROM openmettle.artifact_revisions r
+    WHERE r.reservation_id = '<RESERVATION_UUID>'::uuid;
+   ```
+
+   If `already_purged = true`, **do not** run `storage declare-lost` — step 4 below (`storage rebind --replace-adoption-run "$BARRIER_UUID"`) completes that already-journaled purge cleanly.
+
+2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. Verify any candidate payload's byte length and SHA-256 against `(size_bytes, sha256)` from step 1; if intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
+
+   ```sh
+   cand="/var/recovery/unpacked/artifacts/revisions/$RESERVATION_UUID"
+   if [ -f "$cand" ] && [ "$(sha256sum "$cand" | awk '{print $1}')" = "$EXPECTED_SHA256" ]; then
+     cp -a -- "$cand" "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
+     chmod 0600 "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
+   fi
+   ```
+
+3. **Reserve `storage declare-lost` strictly for `active` or `retained` revisions confirmed unrecoverable** across `/var/recovery/unpacked/artifacts` and all backups from the recovery point:
+
+   ```sh
+   openmettle-admin storage declare-lost /var/lib/openmettle/artifacts \
+     --revision "$UNRECOVERABLE_REVISION_UUID" \
+     --operator-id "$OPERATOR_UUID" \
+     --request-key "restore-lost-$UNRECOVERABLE_REVISION_UUID" \
+     --reason "payload verified absent or corrupt across all recovery copies"
+   ```
+
+4. **Resume and complete `storage rebind` under the held adoption barrier:**
+
+   ```sh
+   openmettle-admin storage rebind /var/lib/openmettle/artifacts \
+     --replace-adoption-run "$BARRIER_UUID"
+   ```
 
 ### 4d. Full `restore replay` and `quota verify`
 
@@ -189,35 +228,39 @@ Complete every item below **before** releasing maintenance, starting `openmettle
 
 ### 5a. Invalidate all restored sessions and pending OIDC logins (`ADR 0013`)
 
-Enumerate **every** provider in `openmettle.login_providers` (not only those in the current `auth.json`). Preserve retired providers (`latest revision IS NULL`), reapply any post-backup provider retirements via `ADR 0013`'s `retire` protocol (`access_generation + 1` and a `NULL` revision tombstone epoch), and for every remaining active provider advance `access_generation` and append a fresh non-retirement epoch in one `openmettle_owner` transaction:
+Enumerate **every** provider in `openmettle.login_providers` (not only those in the current `auth.json`). Preserve retired providers (`latest revision IS NULL`), reapply any post-backup provider retirements via `ADR 0013`'s `retire` protocol (`access_generation + 1` and a `NULL` revision tombstone epoch), and for every remaining active provider append a fresh non-retirement epoch and advance `access_generation` in one `openmettle_owner` transaction (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT`, and `PGGSSENCMODE=disable`):
 
 ```sql
 BEGIN;
 LOCK TABLE openmettle.login_providers IN SHARE ROW EXCLUSIVE MODE;
-WITH active_providers AS (
-    SELECT p.id, r.revision
-      FROM openmettle.login_providers p
-      JOIN LATERAL (
-          SELECT revision
-            FROM openmettle.login_provider_revisions lpr
-           WHERE lpr.provider_id = p.id
-           ORDER BY lpr.epoch DESC
-           LIMIT 1
-      ) r ON r.revision IS NOT NULL
-),
-bumped AS (
-    UPDATE openmettle.login_providers p
-       SET access_generation = p.access_generation + 1,
-           changed_by = 'operator:<operator-uuid>',
-           change_reason = 'isolated restore session invalidation'
-      FROM active_providers ap
-     WHERE p.id = ap.id
- RETURNING p.id
-)
 INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
-SELECT ap.id, ap.revision
-  FROM active_providers ap
-  JOIN bumped b ON b.id = ap.id;
+SELECT p.id, r.revision
+  FROM openmettle.login_providers p
+  JOIN LATERAL (
+      SELECT revision
+        FROM openmettle.login_provider_revisions lpr
+       WHERE lpr.provider_id = p.id
+       ORDER BY lpr.epoch DESC
+       LIMIT 1
+  ) r ON r.revision IS NOT NULL;
+
+UPDATE openmettle.login_providers p
+   SET access_generation = p.access_generation + 1,
+       changed_at = clock_timestamp(),
+       changed_by = 'operator:<operator-uuid>',
+       change_reason = 'isolated restore session invalidation'
+  FROM (
+      SELECT p2.id
+        FROM openmettle.login_providers p2
+        JOIN LATERAL (
+            SELECT revision
+              FROM openmettle.login_provider_revisions lpr
+             WHERE lpr.provider_id = p2.id
+             ORDER BY lpr.epoch DESC
+             LIMIT 1
+        ) r ON r.revision IS NOT NULL
+  ) active
+ WHERE p.id = active.id;
 COMMIT;
 ```
 
@@ -232,7 +275,7 @@ Bumping provider generation fences pre-restore cookies/bearers and pending login
 
 ### 5c. Verify and rotate credential vault keys (`ADR 0045`)
 
-With the target vault keyring staged read-only at `/etc/openmettle/vault-keys`:
+With the target vault keyring staged read-only at `/etc/openmettle/vault-keys` and `OPENMETTLE_ADMIN_DATABASE_URL` set to the target `openmettle_owner` URL:
 
 ```sh
 openmettle-admin vault status
@@ -249,7 +292,7 @@ openmettle-admin vault rotate \
 
 Coordinated backup capture drains `executing` worker leases before `pg_dump`, while runs parked in `waiting` (such as pending human approvals in `openmettle.run_approvals` or revision-`0` two-phase external write `intent` rows in `openmettle.operations`) and `queued` runs remain non-terminal in the snapshot.
 
-1. **As `openmettle_owner`**, cancel non-terminal runs first (which fires `AFTER UPDATE OF state` trigger `openmettle.resolve_terminal_write_intents()`, transitioning every revision-`0` write `intent` to `outcome = 'outcome_unknown', revision = 1` and allocating `unresolved-write:<operation_id>` via `runs.last_event_sequence`), and then in a second statement allocate contiguous `run-terminal` events through `runs.last_event_sequence`:
+1. **As `openmettle_owner`** (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT`, and `PGGSSENCMODE=disable`), cancel non-terminal runs first (which fires `AFTER UPDATE OF state` trigger `openmettle.resolve_terminal_write_intents()`, transitioning every revision-`0` write `intent` to `outcome = 'outcome_unknown', revision = 1` and allocating `unresolved-write:<operation_id>` via `runs.last_event_sequence`), and then in a second statement allocate contiguous `run-terminal` events through `runs.last_event_sequence`:
 
 ```sql
 BEGIN;
@@ -274,8 +317,9 @@ DO $$
 DECLARE
     rec RECORD;
     seq bigint;
-    payload bytea := convert_to('{"reason":"revoked"}', 'UTF8');
+    payload constant bytea := convert_to('{"reason":"revoked"}', 'UTF8');
     ident bytea;
+    field bytea;
 BEGIN
     FOR rec IN
         SELECT r.id, r.scope_id
@@ -288,21 +332,26 @@ BEGIN
                   AND e.append_key = 'run-terminal'
            )
          ORDER BY r.id
-           FOR UPDATE
+           FOR UPDATE OF r
     LOOP
+        ident := convert_to('openmettle/event/1', 'UTF8') || decode('00', 'hex');
+        FOREACH field IN ARRAY ARRAY[
+            convert_to(rec.scope_id::text, 'UTF8'),
+            convert_to(rec.id::text, 'UTF8'),
+            convert_to('run-terminal', 'UTF8'),
+            convert_to('openmettle.run-cancelled', 'UTF8'),
+            int4send(1),
+            payload
+        ]
+        LOOP
+            ident := ident || int8send(octet_length(field)::bigint) || field;
+        END LOOP;
+
         UPDATE openmettle.runs
            SET last_event_sequence = last_event_sequence + 1
          WHERE scope_id = rec.scope_id
            AND id = rec.id
      RETURNING last_event_sequence INTO STRICT seq;
-
-        ident := decode('6f70656e6d6574746c652f6576656e742f3100', 'hex')
-            || int8send(octet_length(rec.scope_id::text)::bigint) || convert_to(rec.scope_id::text, 'UTF8')
-            || int8send(octet_length(rec.id::text)::bigint) || convert_to(rec.id::text, 'UTF8')
-            || int8send(octet_length('run-terminal')::bigint) || convert_to('run-terminal', 'UTF8')
-            || int8send(octet_length('openmettle.run-cancelled')::bigint) || convert_to('openmettle.run-cancelled', 'UTF8')
-            || int8send(4::bigint) || int4send(1)
-            || int8send(octet_length(payload)::bigint) || payload;
 
         INSERT INTO openmettle.run_events (
             scope_id, run_id, sequence, append_key, format, format_version, payload, identity, digest
@@ -315,7 +364,7 @@ $$;
 COMMIT;
 ```
 
-2. **As `openmettle_worker`** (`openmettle.quota_release_terminal_runs(uuid[])` enforces `session_user` membership in `openmettle_api` or `openmettle_worker` and automatically retains holds on runs with `intent` / `outcome_unknown` operations), unwind held run-level quota reservations on eligible terminal runs:
+2. **As `openmettle_worker`** (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT`, and `PGGSSENCMODE=disable`; `openmettle.quota_release_terminal_runs(uuid[])` enforces `session_user` membership in `openmettle_api` or `openmettle_worker` and automatically retains holds on runs with `intent` / `outcome_unknown` operations), unwind held run-level quota reservations on eligible terminal runs:
 
 ```sql
 SELECT openmettle.quota_release_terminal_runs(
@@ -328,21 +377,28 @@ SELECT openmettle.quota_release_terminal_runs(
 );
 ```
 
-### 5e. Release snapshot maintenance gate, verify `maintenance_active = false`, re-verify accounting, and scrub staging
+### 5e. Release snapshot maintenance gate, assert `maintenance_active == false` and zero drift, then scrub staging
 
-Run `backup release-maintenance` **last** (after Steps 5a–5d complete), binding `--request-key` to `RESTORE_RUN_UUID` so a repeated recovery against a backup carrying an earlier recovery's `authorization_audit` row never short-circuits as an idempotent replay, verify `"maintenance_active": false` via `openmettle-admin backup status`, re-verify zero drift, and remove plaintext staging:
+Run `backup release-maintenance` **last** (after Steps 5a–5d complete), binding `--request-key` to `RESTORE_RUN_UUID` so a repeated recovery against a backup carrying an earlier recovery's `authorization_audit` row never short-circuits as an idempotent replay. Do **not** scrub `/var/recovery/unpacked` or proceed to Step 6 workload startup unless `backup release-maintenance` exits `0`, `openmettle-admin backup status` literally reports `"maintenance_active": false`, and `openmettle-admin quota verify` exits `0` with all seven mismatch counters equal to `0`:
 
 ```sh
+set -eu
 openmettle-admin backup release-maintenance \
   --operator-id "$OPERATOR_UUID" \
   --request-key "restore-release-maintenance-$RESTORE_RUN_UUID" \
   --reason "isolated restore pre-worker reconciliation complete" \
   --abort-active-run
 
-openmettle-admin backup status
+status_json="$(openmettle-admin backup status)"
+printf '%s\n' "$status_json"
+printf '%s\n' "$status_json" | grep -Eq '"maintenance_active"[[:space:]]*:[[:space:]]*false'
 
 # Include /var/lib/openmettle/artifacts when manifest.artifact_volume.volume_id is non-null:
-openmettle-admin quota verify /var/lib/openmettle/artifacts
+quota_out="$(openmettle-admin quota verify /var/lib/openmettle/artifacts)"
+printf '%s\n' "$quota_out"
+printf '%s\n' "$quota_out" | grep -Fxq \
+  'storage mismatches 0, budget mismatches 0, settlement mismatches 0, pending gateway 0, file mismatches 0, quarantined 0, unsettled payloads 0'
+
 rm -rf /var/recovery/unpacked
 ```
 

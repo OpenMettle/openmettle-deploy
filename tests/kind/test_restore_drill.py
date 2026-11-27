@@ -79,6 +79,8 @@ class JournalAndRebindParserTest(unittest.TestCase):
         sql = restore_drill.stopped_primary_watermark_sql()
         self.assertIn("SELECT journal_seq, encode(chain_digest, 'hex')", sql)
         self.assertIn("FROM openmettle.deletion_journal_head", sql)
+        checks_yml = (smoke.ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
+        self.assertIn("migrations/0028_retention_purge_journal.sql", checks_yml)
         if CORE_DIR:
             mig28 = (Path(CORE_DIR) / "migrations" / "0028_retention_purge_journal.sql").read_text(encoding="utf-8")
             self.assertIn("CREATE TABLE openmettle.deletion_journal_head", mig28)
@@ -322,6 +324,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.commands: list[list[str]] = []
         self.applied_manifests: list[dict] = []
         self.fail_on_target_migrate = False
+        self.job_failed_on_pre_worker_sql = False
+        self.shared_artifact_readers: list[str] = []
 
     def _make_core(self):
         outer = self
@@ -438,6 +442,15 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     if self.fail_on_target_migrate and self._last_job == "openmettle-drill-migrate":
                         return self._res(1, "", f"fatal migrate error password={self._leak_secret}")
                 return self._res(0, "")
+            if "get" in argv and "job" in argv and argv[-1] == "--output=json":
+                job_name = argv[argv.index("job") + 1]
+                if self.job_failed_on_pre_worker_sql and job_name == "openmettle-drill-pre-worker-sql":
+                    return self._res(0, json.dumps({
+                        "status": {"conditions": [{"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}]}
+                    }))
+                return self._res(0, json.dumps({
+                    "status": {"conditions": [{"type": "Complete", "status": "True"}]}
+                }))
             if "logs" in argv:
                 return self._job_logs(argv)
             if "get" in argv and "pods" in argv:
@@ -701,6 +714,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if "99999999-9999-4999-8999-999999999991/content" in path:
                 return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-personal-keep-bytes\n"
             if "99999999-9999-4999-8999-999999999992/content" in path:
+                self.shared_artifact_readers.append(raw_cookie)
                 return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-project-shared-bytes\n"
             if "99999999-9999-4999-8999-999999999995/content" in path:
                 return 410, prob_hdrs, json.dumps({"status": 410, "code": "payload_lost"}).encode()
@@ -744,9 +758,11 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             sid, cookie, sh = orig_cred(raw)
             session_counter["n"] += 1
             # 1..4 are pre-restore sessions (a,b,c,d); 5..8 are post-restore sessions (a2,b2,c2,d2),
-            # where 7 is disabled user_c and 8 is active non-member user_d.
+            # where 5 is owner user_a, 6 is Viewer user_b, 7 is disabled user_c, and 8 is non-member user_d.
             if session_counter["n"] in (1, 2, 3, 4, 7):
                 outer._stale_or_disabled_cookies = (*getattr(outer, "_stale_or_disabled_cookies", ()), cookie)
+            elif session_counter["n"] == 5:
+                outer._cookie_a2 = cookie
             elif session_counter["n"] == 6:
                 outer._cookie_b2 = cookie
             elif session_counter["n"] == 8:
@@ -787,11 +803,30 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertFalse(any(i["kind"] == "Deployment" for i in self.applied_manifests[0]["items"]))
         self.assertTrue(any(i["kind"] == "NetworkPolicy" for i in self.applied_manifests[0]["items"]))
         self.assertTrue(any(i["kind"] == "Deployment" for i in self.applied_manifests[1]["items"]))
+        # Shared project artifact must be downloaded and verified by BOTH owner (cookie_a2) and Viewer (cookie_b2):
+        self.assertEqual(self.shared_artifact_readers, [self._cookie_a2, self._cookie_b2])
+        # Runbook invariants: recoverable payload check before declare-lost, OPENMETTLE_ADMIN_DATABASE_URL,
+        # PGSSLMODE=verify-full + PGSSLROOTCERT + PGGSSENCMODE=disable, and Step 5e set -eu + maintenance_active==false gate.
+        runbook = (smoke.ROOT / "docs" / "restore-drill.md").read_text(encoding="utf-8")
+        self.assertIn("OPENMETTLE_ADMIN_DATABASE_URL", runbook)
+        self.assertIn("PGSSLMODE=verify-full", runbook)
+        self.assertIn("PGSSLROOTCERT=", runbook)
+        self.assertIn("PGGSSENCMODE=disable", runbook)
+        self.assertIn("sha256sum", runbook)
+        self.assertIn('"maintenance_active"[[:space:]]*:[[:space:]]*false', runbook)
         # Verify uncertified coverage-gap scenario was also exercised:
         check_names = [c["name"] for c in summary["checks"]]
         self.assertTrue(any("coverage-gap" in n for n in check_names))
         self.assertTrue(any(cmd[:3] == ["kind", "delete", "cluster"] for cmd in self.commands))
         self.assertTrue(any(cmd[:4] == ["docker", "image", "rm", "--force"] for cmd in self.commands))
+
+    def test_failed_job_reports_redacted_pod_logs_without_waiting_for_complete_timeout(self):
+        self.job_failed_on_pre_worker_sql = True
+        rc, summary = self._run_drill()
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["result"], "failed")
+        self.assertIn("Job openmettle-restore-target/openmettle-drill-pre-worker-sql Failed (BackoffLimitExceeded)", summary["error"])
+        self.assertNotIn(self._leak_secret, json.dumps(summary))
 
     def test_failure_redacts_credentials_and_still_cleans_up_cluster_and_images(self):
         self.fail_on_target_migrate = True

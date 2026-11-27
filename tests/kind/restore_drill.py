@@ -454,30 +454,33 @@ UPDATE openmettle.local_identity_approvals
 """
     return f"""\
 LOCK TABLE openmettle.login_providers IN SHARE ROW EXCLUSIVE MODE;
-WITH active_providers AS (
-    SELECT p.id, r.revision
-      FROM openmettle.login_providers p
-      JOIN LATERAL (
-          SELECT revision
-            FROM openmettle.login_provider_revisions lpr
-           WHERE lpr.provider_id = p.id
-           ORDER BY lpr.epoch DESC
-           LIMIT 1
-      ) r ON r.revision IS NOT NULL
-),
-bumped AS (
-    UPDATE openmettle.login_providers p
-       SET access_generation = p.access_generation + 1,
-           changed_by = 'operator:{operator_id}',
-           change_reason = 'isolated restore session invalidation'
-      FROM active_providers ap
-     WHERE p.id = ap.id
- RETURNING p.id
-)
 INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
-SELECT ap.id, ap.revision
-  FROM active_providers ap
-  JOIN bumped b ON b.id = ap.id;
+SELECT p.id, r.revision
+  FROM openmettle.login_providers p
+  JOIN LATERAL (
+      SELECT revision
+        FROM openmettle.login_provider_revisions lpr
+       WHERE lpr.provider_id = p.id
+       ORDER BY lpr.epoch DESC
+       LIMIT 1
+  ) r ON r.revision IS NOT NULL;
+UPDATE openmettle.login_providers p
+   SET access_generation = p.access_generation + 1,
+       changed_at = clock_timestamp(),
+       changed_by = 'operator:{operator_id}',
+       change_reason = 'isolated restore session invalidation'
+  FROM (
+      SELECT p2.id
+        FROM openmettle.login_providers p2
+        JOIN LATERAL (
+            SELECT revision
+              FROM openmettle.login_provider_revisions lpr
+             WHERE lpr.provider_id = p2.id
+             ORDER BY lpr.epoch DESC
+             LIMIT 1
+        ) r ON r.revision IS NOT NULL
+  ) active
+ WHERE p.id = active.id;
 
 {revocations_sql}UPDATE openmettle.runs r
    SET state = 'cancelled',
@@ -500,8 +503,9 @@ DO $$
 DECLARE
     rec RECORD;
     seq bigint;
-    payload bytea := convert_to('{{"reason":"revoked"}}', 'UTF8');
+    payload constant bytea := convert_to('{{"reason":"revoked"}}', 'UTF8');
     ident bytea;
+    field bytea;
 BEGIN
     FOR rec IN
         SELECT r.id, r.scope_id
@@ -514,21 +518,26 @@ BEGIN
                   AND e.append_key = 'run-terminal'
            )
          ORDER BY r.id
-           FOR UPDATE
+           FOR UPDATE OF r
     LOOP
+        ident := convert_to('openmettle/event/1', 'UTF8') || decode('00', 'hex');
+        FOREACH field IN ARRAY ARRAY[
+            convert_to(rec.scope_id::text, 'UTF8'),
+            convert_to(rec.id::text, 'UTF8'),
+            convert_to('run-terminal', 'UTF8'),
+            convert_to('openmettle.run-cancelled', 'UTF8'),
+            int4send(1),
+            payload
+        ]
+        LOOP
+            ident := ident || int8send(octet_length(field)::bigint) || field;
+        END LOOP;
+
         UPDATE openmettle.runs
            SET last_event_sequence = last_event_sequence + 1
          WHERE scope_id = rec.scope_id
            AND id = rec.id
      RETURNING last_event_sequence INTO STRICT seq;
-
-        ident := decode('6f70656e6d6574746c652f6576656e742f3100', 'hex')
-            || int8send(octet_length(rec.scope_id::text)::bigint) || convert_to(rec.scope_id::text, 'UTF8')
-            || int8send(octet_length(rec.id::text)::bigint) || convert_to(rec.id::text, 'UTF8')
-            || int8send(octet_length('run-terminal')::bigint) || convert_to('run-terminal', 'UTF8')
-            || int8send(octet_length('openmettle.run-cancelled')::bigint) || convert_to('openmettle.run-cancelled', 'UTF8')
-            || int8send(4::bigint) || int4send(1)
-            || int8send(octet_length(payload)::bigint) || payload;
 
         INSERT INTO openmettle.run_events (
             scope_id, run_id, sequence, append_key, format, format_version, payload, identity, digest
@@ -1408,22 +1417,40 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
     def run_job(self, namespace: str, manifest: dict, *, expect_success: bool = True, timeout: int = 180) -> tuple[str, str]:
         name = manifest["metadata"]["name"]
+        container_name = manifest["spec"]["template"]["spec"]["containers"][0]["name"]
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(manifest))
         try:
-            if expect_success:
-                self.kube("--namespace", namespace, "wait", "--for=condition=complete",
-                          f"job/{name}", f"--timeout={timeout}s", timeout=timeout + 30)
-            else:
-                self.kube("--namespace", namespace, "wait", "--for=condition=failed",
-                          f"job/{name}", f"--timeout={timeout}s", timeout=timeout + 30)
-            pods = self.kube_json("--namespace", namespace, "get", "pods", "--selector", f"job-name={name}")["items"]
+            deadline = time.monotonic() + timeout
+            terminal: str | None = None
+            reason = ""
+            while time.monotonic() < deadline:
+                job_doc = self.kube_json("--namespace", namespace, "get", "job", name)
+                for cond in job_doc.get("status", {}).get("conditions") or ():
+                    if cond.get("status") == "True" and cond.get("type") in ("Complete", "Failed"):
+                        terminal = cond["type"]
+                        reason = cond.get("reason") or ""
+                        break
+                if terminal is not None:
+                    break
+                time.sleep(1.0)
+            pods = self.kube_json("--namespace", namespace, "get", "pods", "--selector", f"job-name={name}").get("items", [])
+            stdout, stderr, pod_diag = "", "", ""
+            if pods:
+                pod = pods[0]
+                pod_name = pod["metadata"]["name"]
+                logs = self.kube("--namespace", namespace, "logs", pod_name, "--container", container_name,
+                                 check=False, timeout=60)
+                stdout, stderr = logs.stdout, logs.stderr
+                pod_diag = json.dumps(pod.get("status", {}).get("containerStatuses") or pod.get("status", {}).get("phase"))
+            expected_cond = "Complete" if expect_success else "Failed"
+            if terminal != expected_cond:
+                combined = "\n".join(p for p in (stdout.strip(), stderr.strip(), pod_diag) if p)
+                redacted = smoke.redacted_tail(combined, self.secrets_to_redact, smoke.STDERR_TAIL)
+                state_desc = f"{terminal} ({reason})" if terminal else f"timed out after {timeout}s"
+                raise DrillFailure(f"Job {namespace}/{name} {state_desc}" + (f": {redacted}" if redacted else ""))
             self.expect(len(pods) == 1, f"expected one pod for Job {name}, found {len(pods)}")
-            pod_name = pods[0]["metadata"]["name"]
-            container_name = manifest["spec"]["template"]["spec"]["containers"][0]["name"]
-            logs = self.kube("--namespace", namespace, "logs", pod_name, "--container", container_name,
-                             check=False, timeout=60)
-            return logs.stdout, logs.stderr
+            return stdout, stderr
         finally:
             self.verify_identity()
             self.kube("--namespace", namespace, "delete", "job", name, "--wait=true", timeout=120)
@@ -2428,6 +2455,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     f"expected vault rotate to re-seal onto vault-k2, got {vault_after!r}")
 
         # Step 5a, 5b & 5d.1: Run owner SQL inside target namespace as openmettle_owner via 0600 PGPASSFILE.
+        psql_bin = "/usr/lib/postgresql/18/bin/psql"
         sql_text = pre_worker_owner_reconcile_sql(
             DRILL_OPERATOR_ID, disabled_principals=primary_state["disabled_principals"]
         )
@@ -2439,8 +2467,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
             f'printf "%s:5432:openmettle:openmettle_owner:%s\\n" "$(esc "{target_pg_host}")" "$(esc "$owner_pw")" > "$PGPASSFILE"\n'
             'chmod 0600 "$PGPASSFILE"\n'
-            f'psql -v ON_ERROR_STOP=1 --single-transaction -qtA -h "{target_pg_host}" -p 5432 '
-            "-U openmettle_owner -d openmettle <<'EOSQL'\n"
+            f'{psql_bin} -X -w -P pager=off -v ON_ERROR_STOP=1 --single-transaction -qtA '
+            f'-h "{target_pg_host}" -p 5432 -U openmettle_owner -d openmettle <<\'EOSQL\'\n'
             f"{sql_text}\n"
             "EOSQL\n"
             'rm -f "$PGPASSFILE"\n'
@@ -2454,7 +2482,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
                     "spec": {
                         "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
-                        "securityContext": POD_SEC_CONTEXT,
+                        "securityContext": PG_POD_SEC_CONTEXT,
                         "containers": [{
                             "name": "psql", "image": self.pg_client_ref, "imagePullPolicy": "Never",
                             "command": ["/bin/sh", "-eu", "-c", owner_sql_script],
@@ -2483,8 +2511,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
             f'printf "%s:5432:openmettle:openmettle_worker:%s\\n" "$(esc "{target_pg_host}")" "$(esc "$worker_pw")" > "$PGPASSFILE"\n'
             'chmod 0600 "$PGPASSFILE"\n'
-            f'psql -v ON_ERROR_STOP=1 --single-transaction -qtA -h "{target_pg_host}" -p 5432 '
-            "-U openmettle_worker -d openmettle <<'EOSQL'\n"
+            f'{psql_bin} -X -w -P pager=off -v ON_ERROR_STOP=1 --single-transaction -qtA '
+            f'-h "{target_pg_host}" -p 5432 -U openmettle_worker -d openmettle <<\'EOSQL\'\n'
             f"{worker_sql_text}\n"
             "EOSQL\n"
             'rm -f "$PGPASSFILE"\n'
@@ -2498,7 +2526,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
                     "spec": {
                         "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
-                        "securityContext": POD_SEC_CONTEXT,
+                        "securityContext": PG_POD_SEC_CONTEXT,
                         "containers": [{
                             "name": "psql-worker", "image": self.pg_client_ref, "imagePullPolicy": "Never",
                             "command": ["/bin/sh", "-eu", "-c", worker_sql_script],
@@ -2668,6 +2696,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
             proj_art = primary_state["art_project"]
             proj_art_path = f"/v1/artifacts/{proj_art['artifact_id']}/revisions/{proj_art['revision_id']}"
+            _, owner_proj_bytes = self.api_call(fwd.port, cookie_a2, "GET", f"{proj_art_path}/content", 200)
+            self.expect(owner_proj_bytes == b"drill-project-shared-bytes\n",
+                        "project owner failed to download restored shared project artifact")
             _, proj_bytes = self.api_call(fwd.port, cookie_b2, "GET", f"{proj_art_path}/content", 200)
             self.expect(proj_bytes == b"drill-project-shared-bytes\n", "viewer failed to download shared project artifact")
             self.api_call(fwd.port, cookie_d2, "GET", f"{proj_art_path}/content", 404)
