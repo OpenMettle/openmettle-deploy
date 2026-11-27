@@ -928,13 +928,20 @@ class FakeCluster:
                                                 "imagePullPolicy": "Never"}],
                             "containers": [{
                                 "name": "backup", "image": pg_ref, "imagePullPolicy": "Never",
-                                "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
-                                         "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
+                                "args": ["backup", "capture", "--destination-root", "/var/backups/openmettle",
+                                         "--request-key", "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)"],
+                                "env": [
+                                    {"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}},
+                                    {"name": "OPENMETTLE_BACKUP_JOB_UID",
+                                     "valueFrom": {"fieldRef": {
+                                         "fieldPath": "metadata.labels['batch.kubernetes.io/controller-uid']"}}},
+                                ],
                                 "volumeMounts": [
                                     {"name": "backup-keys", "mountPath": smoke.BACKUP_KEYS_DIR,
                                      "subPath": "keys", "readOnly": True},
                                     {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH, "readOnly": True},
-                                    {"name": "backup-destination", "mountPath": smoke.BACKUP_DEST_DIR},
+                                    {"name": "backup-destination", "mountPath": "/var/backups/openmettle"},
                                 ],
                             }],
                         }},

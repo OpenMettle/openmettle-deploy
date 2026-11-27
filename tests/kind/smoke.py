@@ -118,6 +118,15 @@ MIGRATION_38_45_CHECKS = (
     *((f"has_table_privilege('{role}', 'openmettle.runtime_feature_gates', '{priv}')", False)
       for role in ("openmettle_gateway", "openmettle_issuance")
       for priv in ("SELECT", "INSERT", "UPDATE", "DELETE")),
+    # Migration 40: API capacity visibility & two-phase dispatch fencing (V1-18 / ADR 0042)
+    ("has_table_privilege('openmettle_api', 'openmettle.capacity_profiles', 'SELECT')", True),
+    ("has_any_column_privilege('openmettle_api', 'openmettle.capacity_grants', 'SELECT')", False),
+    ("has_function_privilege('openmettle_api', 'openmettle.capacity_group_observations()', 'EXECUTE')", True),
+    *((f"has_function_privilege('{role}', 'openmettle.capacity_group_observations()', 'EXECUTE')", False)
+      for role in ("openmettle_worker", "openmettle_gateway", "openmettle_issuance")),
+    ("has_function_privilege('openmettle_worker', 'openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)', 'EXECUTE')", True),
+    *((f"has_function_privilege('{role}', 'openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)', 'EXECUTE')", False)
+      for role in ("openmettle_api", "openmettle_gateway", "openmettle_issuance")),
     # Migrations 41–42: restore_reconciliation_gate & deletion journal / baseline tables
     ("has_table_privilege('openmettle_worker', 'openmettle.restore_reconciliation_gate', 'SELECT')", True),
     ("has_table_privilege('openmettle_worker', 'openmettle.restore_reconciliation_gate', 'UPDATE')", False),
@@ -165,6 +174,13 @@ MIGRATION_38_45_CHECKS = (
     *((f"has_table_privilege('{role}', '{table}', 'DELETE')", False)
       for table in ("openmettle.external_connections", "openmettle.external_connection_shares")
       for role in ("openmettle_gateway", "openmettle_issuance")),
+    # Migration 44: declare-lost artifact payloads (owner-only mutation, runtime read-only lost_at)
+    ("has_column_privilege('openmettle_api', 'openmettle.artifact_revisions', 'lost_at', 'SELECT')", True),
+    ("has_column_privilege('openmettle_worker', 'openmettle.artifact_revisions', 'lost_at', 'SELECT')", True),
+    *((f"has_column_privilege('{role}', 'openmettle.artifact_revisions', 'lost_at', 'UPDATE')", False)
+      for role in RUNTIME_DB_ROLES),
+    *((f"has_function_privilege('{role}', 'openmettle.storage_declare_payload_lost(uuid,uuid,text,text)', 'EXECUTE')", False)
+      for role in RUNTIME_DB_ROLES),
     # Migration 45: backup tables (zero runtime table/column grants) & SECURITY DEFINER functions (V1-30 / ADR 0046)
     *((f"has_any_column_privilege('{role}', '{table}', '{priv}')", False)
       for table in ("openmettle.backup_maintenance_gate", "openmettle.backup_runs",
@@ -386,7 +402,7 @@ BACKUP_KEY_FILE = "backup-k1.key"
 BACKUP_KEYS_DIR = "/etc/openmettle/backup-keys"
 BACKUP_CONFIG_PATH = f"{BACKUP_KEYS_DIR}/keyring.json"
 BACKUP_DEST_CLAIM = "openmettle-smoke-backup-dest"
-BACKUP_DEST_DIR = "/var/lib/openmettle/backups"
+BACKUP_DEST_DIR = "/var/backups/openmettle"
 BACKUP_DESTINATION_DOMAIN = "kind-smoke.example.test"
 BACKUP_OPERATOR_ID = "00000000-0000-4000-8000-00000000b046"
 BACKUP_CRONJOB = f"{FULLNAME}-backup"
@@ -1527,12 +1543,26 @@ def check_vault_and_backup_spec(pods_by_role: dict, cronjob: dict, backup_np: di
     ref = main_env.get("OPENMETTLE_ADMIN_DATABASE_URL", {}).get("valueFrom", {}).get("secretKeyRef", {})
     if (ref.get("name"), ref.get("key")) != (SECRET["migrate"], "url") or ref.get("optional", False) is not False:
         raise SmokeFailure("backup container OPENMETTLE_ADMIN_DATABASE_URL does not reference owner Secret url")
+    job_uid_field = (main_env.get("OPENMETTLE_BACKUP_JOB_UID", {})
+                     .get("valueFrom", {}).get("fieldRef", {}).get("fieldPath"))
+    if job_uid_field != "metadata.labels['batch.kubernetes.io/controller-uid']":
+        raise SmokeFailure("backup container OPENMETTLE_BACKUP_JOB_UID must use batch.kubernetes.io/controller-uid")
+    main_args = main.get("args") or []
+    if "--destination-root" not in main_args:
+        raise SmokeFailure("backup container args lack --destination-root")
+    dest_root = main_args[main_args.index("--destination-root") + 1]
+    if dest_root != BACKUP_DEST_DIR:
+        raise SmokeFailure(f"backup container --destination-root is {dest_root!r}, expected {BACKUP_DEST_DIR!r}")
+    if "--request-key" not in main_args or main_args[main_args.index("--request-key") + 1] != "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)":
+        raise SmokeFailure("backup container --request-key must be cronjob-$(OPENMETTLE_BACKUP_JOB_UID)")
     main_mounts = {m.get("name"): m for m in main.get("volumeMounts") or []}
     if "backup-keys-secret" in main_mounts:
         raise SmokeFailure("backup main container must not mount raw backup-keys-secret")
     if main_mounts.get("backup-keys") != {"name": "backup-keys", "mountPath": BACKUP_KEYS_DIR,
                                           "subPath": "keys", "readOnly": True}:
         raise SmokeFailure("backup container does not mount staged backup-keys read-only with subPath keys")
+    if main_mounts.get("backup-destination", {}).get("mountPath") != dest_root:
+        raise SmokeFailure("backup container backup-destination mountPath disagrees with --destination-root")
     if main_mounts.get("artifacts", {}).get("readOnly") is not True:
         raise SmokeFailure("backup container must mount artifacts read-only")
     np_spec = backup_np.get("spec", {})
@@ -1541,10 +1571,11 @@ def check_vault_and_backup_spec(pods_by_role: dict, cronjob: dict, backup_np: di
     if len(np_spec.get("egress") or []) != 2:
         raise SmokeFailure(f"backup NetworkPolicy expected 2 egress rules (DNS + DB), got {len(np_spec.get('egress') or [])}")
     return {"api_pods": len(api_pods), "worker_pods": len(worker_pods), "gateway_isolated": True,
-            "cronjob": BACKUP_CRONJOB, "backup_network_policy": BACKUP_NETWORK_POLICY}
+            "cronjob": BACKUP_CRONJOB, "backup_network_policy": BACKUP_NETWORK_POLICY,
+            "destination_root": dest_root}
 
 
-def parse_backup_capture_log(output: str) -> dict:
+def parse_backup_capture_log(output: str, expected_dest_dir: str = BACKUP_DEST_DIR) -> dict:
     """Parse `backup.capture_succeeded ...` printed by `openmettle-admin backup capture`."""
     line = next((ln.strip() for ln in output.splitlines() if ln.strip().startswith("backup.capture_succeeded ")), None)
     if line is None:
@@ -1556,7 +1587,7 @@ def parse_backup_capture_log(output: str) -> dict:
     bundle_digest = fields.get("bundle_digest", "")
     if not UUID.fullmatch(run_id):
         raise SmokeFailure(f"backup capture reported invalid run_id: {run_id!r}")
-    if not backup_dir.startswith(f"{BACKUP_DEST_DIR}/") or ".." in Path(backup_dir).parts:
+    if not backup_dir.startswith(f"{expected_dest_dir}/") or ".." in Path(backup_dir).parts:
         raise SmokeFailure(f"backup capture reported unexpected dir: {backup_dir!r}")
     if key_id != BACKUP_KEY_ID:
         raise SmokeFailure(f"backup capture used unexpected key_id {key_id!r}, expected {BACKUP_KEY_ID!r}")
@@ -1595,16 +1626,17 @@ def evaluate_backup_run_row(output: str, expected_run_id: str, expected_bundle_d
             "key_id": BACKUP_KEY_ID, "maintenance_active": False}
 
 
-def backup_verify_job_manifest(admin_image: str, backup_dir: str, run_id: str) -> dict:
+def backup_verify_job_manifest(admin_image: str, backup_dir: str, run_id: str,
+                               dest_dir: str = BACKUP_DEST_DIR) -> dict:
     """Offline PodSecurity-restricted Job running `openmettle-admin backup verify` against the published dir."""
     labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
     stage_script = (
         "umask 077\n"
         "stage=/run/openmettle-backup-stage/keys\n"
-        "mkdir -p -- \"$stage\" && chmod 0700 -- \"$stage\"\n"
+        "mkdir -p -- \"$stage\" && chmod 0700 \"$stage\"\n"
         "for src in /run/openmettle-backup-src/*; do\n"
         "  [ -f \"$src\" ] || continue\n"
-        "  cp -L -- \"$src\" \"$stage/${src##*/}\" && chmod 0400 -- \"$stage/${src##*/}\"\n"
+        "  cp -L -- \"$src\" \"$stage/${src##*/}\" && chmod 0400 \"$stage/${src##*/}\"\n"
         "done\n"
     )
     container_sec = {"privileged": False, "allowPrivilegeEscalation": False,
@@ -1637,7 +1669,7 @@ def backup_verify_job_manifest(admin_image: str, backup_dir: str, run_id: str) -
                         "securityContext": container_sec,
                         "volumeMounts": [
                             {"name": "backup-keys", "mountPath": BACKUP_KEYS_DIR, "subPath": "keys", "readOnly": True},
-                            {"name": "backup-destination", "mountPath": BACKUP_DEST_DIR, "readOnly": True},
+                            {"name": "backup-destination", "mountPath": dest_dir, "readOnly": True},
                         ],
                     }],
                     "volumes": [
@@ -2940,7 +2972,8 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                   f"job/{BACKUP_RUN_JOB}", "--timeout=180s", timeout=210)
         capture_logs = self.kube("--namespace", APP_NAMESPACE, "logs", f"job/{BACKUP_RUN_JOB}",
                                  "--container", "backup", timeout=60).stdout
-        capture = parse_backup_capture_log(capture_logs)
+        dest_root = spec_summary["destination_root"]
+        capture = parse_backup_capture_log(capture_logs, dest_root)
         backup_row = evaluate_backup_run_row(
             self.psql(backup_run_sql(capture["run_id"])), capture["run_id"], capture["bundle_digest"])
         admin_ref = self.report["images"]["admin"]["reference"]
@@ -2949,7 +2982,7 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
                     f"kubelet did not report backup digest references as present: {present}")
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(
-            backup_verify_job_manifest(admin_ref, capture["dir"], self.run_id)))
+            backup_verify_job_manifest(admin_ref, capture["dir"], self.run_id, dest_root)))
         self.kube("--namespace", APP_NAMESPACE, "wait", "--for=condition=complete",
                   f"job/{BACKUP_VERIFY_JOB}", "--timeout=120s", timeout=150)
         verify_logs = self.kube("--namespace", APP_NAMESPACE, "logs", f"job/{BACKUP_VERIFY_JOB}",

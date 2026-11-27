@@ -71,20 +71,7 @@ spec:
             - -c
             - |
               umask 077
-              stage=/run/openmettle-vault-stage/keys
-              if [ -d "$stage" ]; then
-                chmod -R u+w -- "$stage"
-                rm -rf -- "$stage"
-              fi
-              mkdir -p -- "$stage"
-              chmod 0700 -- "$stage"
-              for src in /run/openmettle-vault-src/*; do
-                [ -f "$src" ] || continue
-                dst="$stage/${src##*/}"
-                cp -L -- "$src" "$dst"
-                chmod 0400 -- "$dst"
-              done
-              [ -f "$stage/{{ $vaultConfigKey }}" ] || { echo "missing vault keyring config" >&2; exit 78; }
+              {{- include "openmettle-core.stageKeyringScript" (dict "label" "vault" "srcDir" "/run/openmettle-vault-src" "stageDir" "/run/openmettle-vault-stage/keys" "mountDir" (include "openmettle-core.vaultKeysDirectory" $root) "configKey" $vaultConfigKey) | nindent 14 }}
           {{- with $values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

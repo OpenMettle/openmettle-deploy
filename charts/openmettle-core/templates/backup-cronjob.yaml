@@ -21,7 +21,7 @@ files (database CA bundle and optional --config-file bundle).
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: {{ include "openmettle-core.fullname" . }}-backup
+  name: {{ include "openmettle-core.backupCronJobName" . }}
   labels:
     {{- include "openmettle-core.labels" $context | nindent 4 }}
 spec:
@@ -43,11 +43,11 @@ spec:
       activeDeadlineSeconds: {{ int64 $backup.activeDeadlineSeconds }}
       podFailurePolicy:
         rules:
-          # Exit 78 is invalid configuration; backoffLimit is 0 so any failure leaves
-          # maintenance_active=true for operator inspection rather than blind retry.
+          # Exit 78 in prepare-backup-runtime indicates invalid staged keyring configuration;
+          # backoffLimit is 0 so any non-zero exit fails the Job immediately without blind retry.
           - action: FailJob
             onExitCodes:
-              containerName: backup
+              containerName: prepare-backup-runtime
               operator: In
               values: [78]
       template:
@@ -82,20 +82,7 @@ spec:
                   umask 077
                   cp -f /usr/local/bin/openmettle-admin /opt/openmettle-bin/openmettle-admin
                   chmod 0555 /opt/openmettle-bin/openmettle-admin
-                  stage=/run/openmettle-backup-stage/keys
-                  if [ -d "$stage" ]; then
-                    chmod -R u+w -- "$stage"
-                    rm -rf -- "$stage"
-                  fi
-                  mkdir -p -- "$stage"
-                  chmod 0700 -- "$stage"
-                  for src in /run/openmettle-backup-src/*; do
-                    [ -f "$src" ] || continue
-                    dst="$stage/${src##*/}"
-                    cp -L -- "$src" "$dst"
-                    chmod 0400 -- "$dst"
-                  done
-                  [ -f "$stage/{{ $keysConfigKey }}" ] || { echo "missing backup keyring config" >&2; exit 78; }
+                  {{- include "openmettle-core.stageKeyringScript" (dict "label" "backup" "srcDir" "/run/openmettle-backup-src" "stageDir" "/run/openmettle-backup-stage/keys" "mountDir" (include "openmettle-core.backupKeysDirectory" .) "configKey" $keysConfigKey) | nindent 18 }}
                   {{- if $ca.enabled }}
                   cp -L /run/openmettle-db-ca-src/ca.crt /run/openmettle-db-ca-stage/ca.crt
                   chmod 0444 /run/openmettle-db-ca-stage/ca.crt
@@ -105,7 +92,7 @@ spec:
                     [ -f "$src" ] || continue
                     dst="/run/openmettle-backup-config-stage/${src##*/}"
                     cp -L -- "$src" "$dst"
-                    chmod 0444 -- "$dst"
+                    chmod 0444 "$dst"
                   done
                   {{- end }}
               {{- with $backup.resources }}
@@ -157,7 +144,7 @@ spec:
                 - --operator-id
                 - {{ $backup.operatorId | quote }}
                 - --request-key
-                - "cronjob-$(OPENMETTLE_BACKUP_POD_UID)"
+                - "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)"
                 - --reason
                 - {{ replace "$" "$$" $backup.reason | quote }}
                 - --drain-timeout-secs
@@ -202,10 +189,10 @@ spec:
               env:
                 - name: OPENMETTLE_ADMIN_DATABASE_URL
                   {{- include "openmettle-core.databaseUrlEnv" (dict "name" "backup" "ref" .Values.database.backup) | nindent 18 }}
-                - name: OPENMETTLE_BACKUP_POD_UID
+                - name: OPENMETTLE_BACKUP_JOB_UID
                   valueFrom:
                     fieldRef:
-                      fieldPath: metadata.uid
+                      fieldPath: metadata.labels['batch.kubernetes.io/controller-uid']
               {{- with $backup.resources }}
               resources:
                 {{- toYaml . | nindent 16 }}

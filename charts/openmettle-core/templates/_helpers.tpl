@@ -13,6 +13,73 @@ Names are truncated to 52 characters so that "<fullname>-migrate" stays within 6
 {{- end -}}
 {{- end -}}
 
+{{/*
+CronJob names are limited to 52 DNS characters so the CronJob controller can append a 10-digit
+timestamp ("-<ts>") within Kubernetes' 63-character Job name limit.
+*/}}
+{{- define "openmettle-core.backupCronJobName" -}}
+{{- $fullname := include "openmettle-core.fullname" . -}}
+{{- $candidate := printf "%s-backup" $fullname -}}
+{{- if le (len $candidate) 52 -}}
+{{- $candidate -}}
+{{- else -}}
+{{- $hash := substr 0 8 (sha256sum (printf "%s/%s" .Release.Name .Chart.Name)) -}}
+{{- printf "%s-%s-backup" ($fullname | trunc 36 | trimSuffix "-") $hash -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+POSIX /bin/sh snippet staging a Secret volume into 0400 regular files inside a 0700 subdirectory of
+a RAM-backed emptyDir, rejecting dot-prefixed Secret entries and verifying that the keyring JSON
+manifest and every 32-byte key file it references under mountDir exist.
+Arguments: dict "label" "vault|backup" "srcDir" <path> "stageDir" <path> "mountDir" <path> "configKey" <key>
+*/}}
+{{- define "openmettle-core.stageKeyringScript" -}}
+stage={{ .stageDir | quote }}
+src_dir={{ .srcDir | quote }}
+mount_dir={{ .mountDir | quote }}
+cfg_key={{ .configKey | quote }}
+if [ -d "$stage" ]; then
+  chmod -R u+w "$stage"
+  rm -rf -- "$stage"
+fi
+mkdir -p -- "$stage"
+chmod 0700 "$stage"
+for hidden in "$src_dir"/.*; do
+  base="${hidden##*/}"
+  case "$base" in
+    .|..|..data|..[0-9]*) continue ;;
+  esac
+  if [ -e "$hidden" ] || [ -L "$hidden" ]; then
+    echo "dot-prefixed {{ .label }} Secret entry is not allowed: $base" >&2
+    exit 78
+  fi
+done
+for src in "$src_dir"/*; do
+  [ -f "$src" ] || continue
+  dst="$stage/${src##*/}"
+  cp -L -- "$src" "$dst"
+  chmod 0400 "$dst"
+done
+[ -f "$stage/$cfg_key" ] || { echo "missing {{ .label }} keyring config: $cfg_key" >&2; exit 78; }
+refs_list="${stage%/*}/.refs"
+tr '\n\r\t{}' '   \n\n' < "$stage/$cfg_key" | sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' > "$refs_list"
+[ -s "$refs_list" ] || { rm -f -- "$refs_list"; echo "invalid {{ .label }} keyring config: missing referenced key files" >&2; exit 78; }
+while IFS= read -r rel_path; do
+  case "$rel_path" in
+    "$mount_dir/"*) rel="${rel_path#"$mount_dir/"}" ;;
+    *) rm -f -- "$refs_list"; echo "{{ .label }} key file outside $mount_dir: $rel_path" >&2; exit 78 ;;
+  esac
+  case "$rel" in
+    ""|*/*|.*) rm -f -- "$refs_list"; echo "invalid {{ .label }} key file name: $rel" >&2; exit 78 ;;
+  esac
+  [ "$rel" != "$cfg_key" ] || { rm -f -- "$refs_list"; echo "{{ .label }} key file must differ from keyring config: $rel" >&2; exit 78; }
+  [ -f "$stage/$rel" ] || { rm -f -- "$refs_list"; echo "missing referenced {{ .label }} key file: $rel" >&2; exit 78; }
+  [ "$(wc -c < "$stage/$rel")" -eq 32 ] || { rm -f -- "$refs_list"; echo "{{ .label }} key file must be 32 bytes: $rel" >&2; exit 78; }
+done < "$refs_list"
+rm -f -- "$refs_list"
+{{- end -}}
+
 {{/* Labels on every pod of this release, whatever its component. Argument: the root context. */}}
 {{- define "openmettle-core.releaseSelectorLabels" -}}
 app.kubernetes.io/name: {{ include "openmettle-core.name" . }}
@@ -973,6 +1040,12 @@ provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030
 {{- if not $auth.loginKeysSecretName -}}
 {{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
 {{- end -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbSec := toString (default "" (get (default dict (index $.Values.database $dbRole)) "existingSecret")) -}}
+{{- if and $dbSec (eq (toString $auth.loginKeysSecretName) $dbSec) -}}
+{{- fail (printf "auth.loginKeysSecretName (%q) must differ from database.%s.existingSecret; never mount a database URL Secret wholesale into the API login-keys directory" (toString $auth.loginKeysSecretName) $dbRole) -}}
+{{- end -}}
+{{- end -}}
 {{- include "openmettle-core.validate.caBundle" (dict "path" "auth.providerCaBundle" "bundle" $auth.providerCaBundle) -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
 {{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
@@ -1105,6 +1178,12 @@ stage-vault-keys (never gateway, migrate or backup).
 {{- if and .Values.auth.enabled (eq $vaultSecret (toString .Values.auth.loginKeysSecretName)) -}}
 {{- fail (printf "vault.existingSecret (%q) must differ from auth.loginKeysSecretName; keep vault master keys in a dedicated Secret (core ADR 0045)" $vaultSecret) -}}
 {{- end -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbSec := toString (default "" (get (default dict (index $.Values.database $dbRole)) "existingSecret")) -}}
+{{- if and $dbSec (eq $vaultSecret $dbSec) -}}
+{{- fail (printf "vault.existingSecret (%q) must differ from database.%s.existingSecret; never stage a database URL Secret into api/worker pods" $vaultSecret $dbRole) -}}
+{{- end -}}
+{{- end -}}
 {{- else -}}
 {{- if $vaultSecret -}}
 {{- fail "vault.existingSecret must be empty when vault.enabled is false" -}}
@@ -1185,6 +1264,12 @@ Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
 {{- end -}}
 {{- if and .Values.auth.enabled (eq $backupSecret (toString .Values.auth.loginKeysSecretName)) -}}
 {{- fail (printf "backup.existingKeysSecret (%q) must differ from auth.loginKeysSecretName; keep backup master keys in a dedicated Secret (core ADR 0046)" $backupSecret) -}}
+{{- end -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbSec := toString (default "" (get (default dict (index $.Values.database $dbRole)) "existingSecret")) -}}
+{{- if and $dbSec (eq $backupSecret $dbSec) -}}
+{{- fail (printf "backup.existingKeysSecret (%q) must differ from database.%s.existingSecret; keep backup master keys in a dedicated Secret (core ADR 0046)" $backupSecret $dbRole) -}}
+{{- end -}}
 {{- end -}}
 {{- $destClaim := toString (default "" (get $backupDest "existingClaim")) -}}
 {{- $destSubPath := toString (default "" (get $backupDest "subPath")) -}}

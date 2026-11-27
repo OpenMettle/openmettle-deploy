@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -311,9 +312,11 @@ class PodPolicyTest(Rendered):
                 self.assertTrue(env)
                 if kind == "backup":
                     self.assertEqual({e["name"] for e in env},
-                                     {"OPENMETTLE_ADMIN_DATABASE_URL", "OPENMETTLE_BACKUP_POD_UID"})
-                    self.assertEqual(env_map(container)["OPENMETTLE_BACKUP_POD_UID"]["valueFrom"],
-                                     {"fieldRef": {"fieldPath": "metadata.uid"}})
+                                     {"OPENMETTLE_ADMIN_DATABASE_URL", "OPENMETTLE_BACKUP_JOB_UID"})
+                    self.assertEqual(
+                        env_map(container)["OPENMETTLE_BACKUP_JOB_UID"]["valueFrom"],
+                        {"fieldRef": {"fieldPath": "metadata.labels['batch.kubernetes.io/controller-uid']"}},
+                    )
                 else:
                     for entry in env:
                         self.assertTrue(entry["name"].startswith(PREFIX[kind]), entry["name"])
@@ -2452,6 +2455,30 @@ class NegativeCaseTest(unittest.TestCase):
         ("vault reuses auth loginKeysSecretName",
          [*AUTH, ISSUANCE, "vault.enabled=true", "vault.existingSecret=auth-keys"], OIDC_PEER,
          ['vault.existingSecret ("auth-keys") must differ from auth.loginKeysSecretName']),
+        ("vault existingSecret aliases database.migrate owner Secret",
+         ["vault.enabled=true", "vault.existingSecret=openmettle-owner-database"], [],
+         ['vault.existingSecret ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
+        ("vault existingSecret aliases database.backup owner Secret",
+         ["vault.enabled=true", "vault.existingSecret=backup-owner-db",
+          "backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=backup-owner-db",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['vault.existingSecret ("backup-owner-db") must differ from database.backup.existingSecret']),
+        ("auth loginKeysSecretName aliases database.migrate owner Secret",
+         ["auth.enabled=true", "auth.configMapName=auth-cm",
+          "auth.loginKeysSecretName=openmettle-owner-database", ISSUANCE], OIDC_PEER,
+         ['auth.loginKeysSecretName ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
+        ("backup existingKeysSecret aliases database.backup owner Secret",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=openmettle-owner-database", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['backup.existingKeysSecret ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
         # Worker external MCP/OAuth egress (V1-14, ADR 0045).
         ("worker mcp enabled without worker inference", ["worker.mcp.enabled=true"],
          ["--set-json", 'networkPolicy.worker.mcp.to=[{"ipBlock":{"cidr":"192.0.2.50/32"}}]'],
@@ -2992,7 +3019,8 @@ class BackupCronJobTest(Rendered):
         job_spec = spec["jobTemplate"]["spec"]
         self.assertEqual(job_spec["backoffLimit"], 0)
         self.assertEqual(job_spec["activeDeadlineSeconds"], 1800)
-        self.assertIn({"action": "FailJob", "onExitCodes": {"containerName": "backup", "operator": "In", "values": [78]}},
+        self.assertIn({"action": "FailJob",
+                       "onExitCodes": {"containerName": "prepare-backup-runtime", "operator": "In", "values": [78]}},
                       job_spec["podFailurePolicy"]["rules"])
         pod = job_spec["template"]["spec"]
         self.assertEqual(pod["restartPolicy"], "Never")
@@ -3022,7 +3050,10 @@ class BackupCronJobTest(Rendered):
         self.assertEqual(args[args.index("--backup-keys-config") + 1], f"{BACKUP_KEYS_DIR}/backup-keyring.json")
         self.assertEqual(args[args.index("--artifact-root") + 1], ARTIFACTS_PATH)
         self.assertEqual(args[args.index("--operator-id") + 1], "00000000-0000-4000-8000-000000000001")
-        self.assertEqual(args[args.index("--request-key") + 1], "cronjob-$(OPENMETTLE_BACKUP_POD_UID)")
+        self.assertEqual(args[args.index("--request-key") + 1], "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)")
+        b_env = env_map(main_c)
+        self.assertEqual(b_env["OPENMETTLE_BACKUP_JOB_UID"]["valueFrom"]["fieldRef"]["fieldPath"],
+                         "metadata.labels['batch.kubernetes.io/controller-uid']")
         self.assertEqual(args[args.index("--drain-timeout-secs") + 1], "180")
         self.assertIn("--require-separate-device", args)
         self.assertEqual(args[args.index("--graphiti-mode") + 1], "offline-dump")
@@ -3070,7 +3101,68 @@ class BackupCronJobTest(Rendered):
         e_args = find(escaped, "CronJob", "-backup")["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"]
         self.assertEqual(e_args[e_args.index("--reason") + 1], "nightly $$(OPENMETTLE_ADMIN_DATABASE_URL) run")
         self.assertEqual(e_args[e_args.index("--chroma-qualification-ref") + 1], "ref-$$1")
-        self.assertEqual(e_args[e_args.index("--request-key") + 1], "cronjob-$(OPENMETTLE_BACKUP_POD_UID)")
+        self.assertEqual(e_args[e_args.index("--request-key") + 1], "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)")
+
+    def test_cronjob_name_stays_within_52_chars_and_collision_free(self):
+        """Fails if a long Helm release name produces a CronJob name > 52 chars or collides across suffixes."""
+        names = set()
+        for rel in ("integration-observability-europe-central",
+                    "integration-observability-europe-central-a",
+                    "integration-observability-europe-central-b",
+                    "r" * 53):
+            docs = render(("vault-and-backup-enabled.yaml",), release=rel)
+            cron_name = find(docs, "CronJob", "-backup")["metadata"]["name"]
+            self.assertLessEqual(len(cron_name), 52, cron_name)
+            self.assertRegex(cron_name, r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?-backup$")
+            names.add(cron_name)
+        self.assertEqual(len(names), 4)
+
+    def test_rendered_keyring_staging_scripts_enforce_referenced_and_non_dot_keys(self):
+        """Executes rendered stage-vault-keys and prepare-backup-runtime scripts against valid, missing and dot-prefixed keys."""
+        docs = self.renders["vault-and-backup-enabled"]
+        api_script = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]["initContainers"][0]["command"][3]
+        backup_raw = find(docs, "CronJob", "-backup")["spec"]["jobTemplate"]["spec"]["template"]["spec"]["initContainers"][0]["command"][3]
+        # Strip only the /usr/local/bin/openmettle-admin binary copy lines to test key staging in isolation.
+        backup_script = "\n".join(
+            ln for ln in backup_raw.splitlines()
+            if "/opt/openmettle-bin/openmettle-admin" not in ln
+        )
+        for label, raw_script, src_const, stage_const, mount_dir in (
+            ("vault", api_script, "/run/openmettle-vault-src", "/run/openmettle-vault-stage", VAULT_KEYS_DIR),
+            ("backup", backup_script, "/run/openmettle-backup-src", "/run/openmettle-backup-stage", BACKUP_KEYS_DIR),
+        ):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    stage_parent = Path(tmp) / "stage"
+                    src.mkdir()
+                    stage_parent.mkdir()
+                    script = raw_script.replace(src_const, str(src)).replace(stage_const, str(stage_parent))
+                    # 1. Valid keyring + 32-byte key succeeds and produces 0700 dir + 0400 files.
+                    (src / "k1.key").write_bytes(b"\x42" * 32)
+                    (src / "keyring.json").write_text(json.dumps({
+                        "version": 1, "active_key_id": "k1",
+                        "keys": [{"id": "k1", "file": f"{mount_dir}/k1.key"}],
+                    }), encoding="utf-8")
+                    ok = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                    self.assertEqual(ok.returncode, 0, ok.stderr)
+                    self.assertEqual((stage_parent / "keys").stat().st_mode & 0o777, 0o700)
+                    self.assertEqual((stage_parent / "keys" / "k1.key").stat().st_mode & 0o777, 0o400)
+                    # 2. Manifest-only Secret (missing referenced key file) exits 78.
+                    (src / "k1.key").unlink()
+                    missing = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                    self.assertEqual(missing.returncode, 78, missing.stderr)
+                    self.assertIn(f"missing referenced {label} key file: k1.key", missing.stderr)
+                    # 3. Dot-prefixed Secret entry exits 78.
+                    (src / ".k1.key").write_bytes(b"\x42" * 32)
+                    (src / "keyring.json").write_text(json.dumps({
+                        "version": 1, "active_key_id": "k1",
+                        "keys": [{"id": "k1", "file": f"{mount_dir}/.k1.key"}],
+                    }), encoding="utf-8")
+                    dotted = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                    self.assertEqual(dotted.returncode, 78, dotted.stderr)
+                    self.assertIn("dot-prefixed", dotted.stderr)
+                    subprocess.run(["chmod", "-R", "u+w", str(stage_parent)], check=False)
 
 
 class WorkerInferenceTest(Rendered):
