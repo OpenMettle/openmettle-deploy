@@ -280,13 +280,24 @@ def accept_coverage_gap_args(
     ]
 
 
-def parse_failed_rebind(stdout: str, stderr: str, expected_reservation_id: str) -> str:
+def parse_failed_rebind(
+    stdout: str, stderr: str, expected_reservation_ids: str | list[str] | tuple[str, ...]
+) -> str:
     """Extract the held adoption barrier UUID from a failed `storage rebind` invocation."""
-    if not smoke.UUID.fullmatch(expected_reservation_id):
-        raise DrillFailure(f"invalid expected reservation UUID: {expected_reservation_id!r}")
-    expected_line = f"failed {expected_reservation_id}: missing revision"
-    if expected_line not in stdout.splitlines():
-        raise DrillFailure(f"storage rebind stdout did not report {expected_line!r}: {stdout!r}")
+    ids = (
+        [expected_reservation_ids]
+        if isinstance(expected_reservation_ids, str)
+        else list(expected_reservation_ids)
+    )
+    if not ids:
+        raise DrillFailure("parse_failed_rebind requires at least one expected reservation UUID")
+    lines = stdout.splitlines()
+    for res_id in ids:
+        if not smoke.UUID.fullmatch(res_id):
+            raise DrillFailure(f"invalid expected reservation UUID: {res_id!r}")
+        expected_line = f"failed {res_id}: missing revision"
+        if expected_line not in lines:
+            raise DrillFailure(f"storage rebind stdout did not report {expected_line!r}: {stdout!r}")
     match = REBIND_BARRIER_RE.search(stderr)
     if not match:
         raise DrillFailure(f"storage rebind stderr did not report --replace-adoption-run UUID: {stderr!r}")
@@ -400,30 +411,92 @@ def evaluate_rpo_rto(
     cutover_at: datetime,
     recovery_started_at: datetime,
     recovery_completed_at: datetime,
+    *,
+    report: dict | None = None,
 ) -> dict:
-    """Compute and enforce V1-31 RPO (<= 24h) and RTO (<= 4h) bounds."""
+    """Compute, record, and enforce V1-31 RPO (<= 24h) and RTO (<= 4h) bounds."""
     quiesced_at = smoke.parse_time(quiesced_at_iso)
     data_age = (cutover_at - quiesced_at).total_seconds()
     recovery_secs = (recovery_completed_at - recovery_started_at).total_seconds()
+    breaches: list[str] = []
     if data_age < 0:
-        raise DrillFailure(f"negative restored_data_age_seconds ({data_age:.3f}s)")
+        breaches.append(f"negative restored_data_age_seconds ({data_age:.3f}s)")
+    elif data_age > RPO_TARGET_SECONDS:
+        breaches.append(f"RPO breached: restored_data_age_seconds={data_age:.2f} > {RPO_TARGET_SECONDS}")
     if recovery_secs <= 0:
-        raise DrillFailure(f"non-positive recovery_duration_seconds ({recovery_secs:.3f}s)")
-    if data_age > RPO_TARGET_SECONDS:
-        raise DrillFailure(f"RPO breached: restored_data_age_seconds={data_age:.2f} > {RPO_TARGET_SECONDS}")
-    if recovery_secs > RTO_TARGET_SECONDS:
-        raise DrillFailure(f"RTO breached: recovery_duration_seconds={recovery_secs:.2f} > {RTO_TARGET_SECONDS}")
-    return {
+        breaches.append(f"non-positive recovery_duration_seconds ({recovery_secs:.3f}s)")
+    elif recovery_secs > RTO_TARGET_SECONDS:
+        breaches.append(f"RTO breached: recovery_duration_seconds={recovery_secs:.2f} > {RTO_TARGET_SECONDS}")
+    metrics = {
         "quiesced_at": quiesced_at_iso,
         "recovery_started_at": recovery_started_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "recovery_completed_at": recovery_completed_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "restored_data_age_seconds": round(data_age, 3),
         "rpo_target_seconds": RPO_TARGET_SECONDS,
-        "rpo_met": True,
+        "rpo_met": 0 <= data_age <= RPO_TARGET_SECONDS,
         "recovery_duration_seconds": round(recovery_secs, 3),
         "rto_target_seconds": RTO_TARGET_SECONDS,
-        "rto_met": True,
+        "rto_met": 0 < recovery_secs <= RTO_TARGET_SECONDS,
     }
+    if report is not None:
+        report["rpo_rto"] = metrics
+    if breaches:
+        raise DrillFailure("; ".join(breaches))
+    return metrics
+
+
+def provider_epoch_advance_block_sql(operator_id: str) -> str:
+    """PL/pgSQL block enforcing ADR 0012 / 0013 login-provider epoch advance (> prev_max_epoch)
+    with full transaction rollback if the identity sequence trails restored rows."""
+    if not smoke.UUID.fullmatch(operator_id):
+        raise DrillFailure(f"invalid operator UUID: {operator_id!r}")
+    return f"""\
+DO $provider_epoch$
+DECLARE
+    rec RECORD;
+    new_epoch bigint;
+BEGIN
+    FOR rec IN
+        SELECT p.id AS provider_id,
+               r.revision AS latest_revision,
+               r.epoch AS prev_max_epoch
+          FROM openmettle.login_providers p
+          JOIN LATERAL (
+              SELECT lpr.epoch, lpr.revision
+                FROM openmettle.login_provider_revisions lpr
+               WHERE lpr.provider_id = p.id
+               ORDER BY lpr.epoch DESC
+               LIMIT 1
+          ) r ON true
+         WHERE r.revision IS NOT NULL
+         ORDER BY p.id
+    LOOP
+        INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+        VALUES (rec.provider_id, rec.latest_revision)
+        RETURNING epoch INTO STRICT new_epoch;
+
+        IF new_epoch <= rec.prev_max_epoch
+           OR EXISTS (
+               SELECT 1
+                 FROM openmettle.login_provider_revisions lpr
+                WHERE lpr.provider_id = rec.provider_id
+                  AND lpr.epoch > new_epoch
+           )
+        THEN
+            RAISE EXCEPTION 'login_provider_revisions epoch % did not advance past previous maximum % for provider %',
+                new_epoch, rec.prev_max_epoch, rec.provider_id
+                USING ERRCODE = '22023';
+        END IF;
+
+        UPDATE openmettle.login_providers
+           SET access_generation = access_generation + 1,
+               changed_at = clock_timestamp(),
+               changed_by = 'operator:{operator_id}',
+               change_reason = 'isolated restore session invalidation'
+         WHERE id = rec.provider_id;
+    END LOOP;
+END
+$provider_epoch$;"""
 
 
 def pre_worker_owner_reconcile_sql(
@@ -431,9 +504,10 @@ def pre_worker_owner_reconcile_sql(
     *,
     disabled_principals: list[tuple[str, str]] | tuple[tuple[str, str], ...] = (),
 ) -> str:
-    """Owner SQL for Runbook Steps 5a (ADR 0013 session/provider invalidation), 5b (post-backup
-    principal/approval revocations), and 5d.1 (two-statement run cancellation preserving
-    `resolve_terminal_write_intents()` and contiguous `runs.last_event_sequence` allocation)."""
+    """Owner SQL for Runbook Steps 5a (ADR 0012 / 0013 sequence sync, monotonic epoch advance,
+    and session/provider invalidation), 5b (post-backup principal/approval revocations), and
+    5d.1 (two-statement run cancellation preserving `resolve_terminal_write_intents()` and
+    contiguous `runs.last_event_sequence` allocation)."""
     if not smoke.UUID.fullmatch(operator_id):
         raise DrillFailure(f"invalid operator UUID: {operator_id!r}")
     revocations_sql = ""
@@ -454,33 +528,15 @@ UPDATE openmettle.local_identity_approvals
 """
     return f"""\
 LOCK TABLE openmettle.login_providers IN SHARE ROW EXCLUSIVE MODE;
-INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
-SELECT p.id, r.revision
-  FROM openmettle.login_providers p
-  JOIN LATERAL (
-      SELECT revision
-        FROM openmettle.login_provider_revisions lpr
-       WHERE lpr.provider_id = p.id
-       ORDER BY lpr.epoch DESC
-       LIMIT 1
-  ) r ON r.revision IS NOT NULL;
-UPDATE openmettle.login_providers p
-   SET access_generation = p.access_generation + 1,
-       changed_at = clock_timestamp(),
-       changed_by = 'operator:{operator_id}',
-       change_reason = 'isolated restore session invalidation'
-  FROM (
-      SELECT p2.id
-        FROM openmettle.login_providers p2
-        JOIN LATERAL (
-            SELECT revision
-              FROM openmettle.login_provider_revisions lpr
-             WHERE lpr.provider_id = p2.id
-             ORDER BY lpr.epoch DESC
-             LIMIT 1
-        ) r ON r.revision IS NOT NULL
-  ) active
- WHERE p.id = active.id;
+LOCK TABLE openmettle.login_provider_revisions IN EXCLUSIVE MODE;
+
+SELECT setval(
+    pg_get_serial_sequence('openmettle.login_provider_revisions', 'epoch'),
+    coalesce((SELECT max(epoch) FROM openmettle.login_provider_revisions), 1),
+    EXISTS (SELECT 1 FROM openmettle.login_provider_revisions)
+);
+
+{provider_epoch_advance_block_sql(operator_id)}
 
 {revocations_sql}UPDATE openmettle.runs r
    SET state = 'cancelled',
@@ -568,6 +624,63 @@ SELECT openmettle.quota_release_terminal_runs(
     )
 );
 """
+
+
+def build_step4c_reconcile_lines(
+    *,
+    selected_journal: str,
+    artifacts_mount: str,
+    unpacked_dir: str,
+    operator_id: str,
+    barrier_uuid: str,
+    failed_revisions: list[tuple[str, str, int, str]],
+) -> str:
+    """Build Step 4c + 4d commands for pinned artifact volumes:
+    1) replay --db-only first,
+    2) verify staging copies by byte length + SHA-256 and restore any intact payload (`chmod 0600`)
+       BEFORE ever invoking `storage declare-lost`,
+    3) reserve `storage declare-lost` strictly for revisions absent/corrupt in all recovery copies,
+    4) resume `storage rebind --replace-adoption-run` -> `restore replay` -> `quota verify`."""
+    if not (smoke.UUID.fullmatch(operator_id) and smoke.UUID.fullmatch(barrier_uuid)):
+        raise DrillFailure("invalid operator_id or barrier_uuid in build_step4c_reconcile_lines")
+    lines = [f'openmettle-admin restore replay --db-only "{selected_journal}"']
+    for rev_id, res_id, size_bytes, expected_sha256 in failed_revisions:
+        if not (
+            smoke.UUID.fullmatch(rev_id)
+            and smoke.UUID.fullmatch(res_id)
+            and isinstance(size_bytes, int)
+            and size_bytes >= 0
+            and re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        ):
+            raise DrillFailure(f"invalid Step 4c revision descriptor: {(rev_id, res_id, size_bytes)!r}")
+        lines.append(
+            f'cand="{unpacked_dir}/artifacts/revisions/{res_id}"\n'
+            f'dst="{artifacts_mount}/revisions/{res_id}"\n'
+            "recovered=0\n"
+            'if [ -f "$cand" ]; then\n'
+            '  cand_bytes="$(wc -c < "$cand" | tr -d " ")"\n'
+            '  set -- $(sha256sum "$cand")\n'
+            f'  if [ "$cand_bytes" -eq {size_bytes} ] && [ "$1" = "{expected_sha256}" ]; then\n'
+            '    cp -a -- "$cand" "$dst"\n'
+            '    chmod 0600 "$dst"\n'
+            "    recovered=1\n"
+            f'    printf "STAGE_RECOVERED {rev_id}\\n"\n'
+            "  fi\n"
+            "fi\n"
+            'if [ "$recovered" -eq 0 ]; then\n'
+            f'  openmettle-admin storage declare-lost "{artifacts_mount}" '
+            f'--revision "{rev_id}" --operator-id "{operator_id}" '
+            f'--request-key "drill-lost-{rev_id}" '
+            '--reason "simulated unrecoverable disk payload during V1-31 isolated restore drill"\n'
+            f'  printf "DECLARED_LOST {rev_id}\\n"\n'
+            "fi"
+        )
+    lines.extend([
+        f'openmettle-admin storage rebind "{artifacts_mount}" --replace-adoption-run "{barrier_uuid}"',
+        f'openmettle-admin restore replay "{selected_journal}" "{artifacts_mount}"',
+        f'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify "{artifacts_mount}"; printf "QUOTA_STAGE4_END\\n"',
+    ])
+    return "\n".join(lines) + "\n"
 
 
 def build_step5e_script(
@@ -1623,6 +1736,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
             art_post_purge = self.upload_artifact(fwd.port, cookie_a, "drill-art-post-purge",
                                                   b"drill-post-backup-purge-bytes\n")
+            art_stage_recover = self.upload_artifact(fwd.port, cookie_a, "drill-art-stage-recover",
+                                                     b"drill-recoverable-from-staging-bytes\n")
             art_to_lose = self.upload_artifact(fwd.port, cookie_a, "drill-art-to-lose",
                                                b"drill-unrecoverable-payload-bytes\n")
 
@@ -1701,16 +1816,22 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         res_ids_raw = self.psql_superuser(
             PRIMARY_DB_NS,
             "SELECT id::text, reservation_id::text,"
-            " coalesce((extract(epoch FROM purge_after) * 1000000)::bigint::text, '')"
+            " coalesce((extract(epoch FROM purge_after) * 1000000)::bigint::text, ''),"
+            " size_bytes, encode(content_digest, 'hex')"
             " FROM openmettle.artifact_revisions"
-            f" WHERE id IN ('{art_to_lose['revision_id']}'::uuid, '{art_post_purge['revision_id']}'::uuid,"
-            f" '{art_deadline['revision_id']}'::uuid);",
+            f" WHERE id IN ('{art_to_lose['revision_id']}'::uuid, '{art_stage_recover['revision_id']}'::uuid,"
+            f" '{art_post_purge['revision_id']}'::uuid, '{art_deadline['revision_id']}'::uuid);",
         )
         rev_meta = {}
         for row in res_ids_raw.splitlines():
             if row:
-                rid, res_id, purge_after_us = row.split("|")
-                rev_meta[rid] = {"reservation_id": res_id, "purge_after_us": purge_after_us}
+                rid, res_id, purge_after_us, size_s, sha_hex = row.split("|")
+                rev_meta[rid] = {
+                    "reservation_id": res_id,
+                    "purge_after_us": purge_after_us,
+                    "size_bytes": int(size_s),
+                    "sha256": sha_hex,
+                }
 
         # Capture coordinated backup via CronJob on primary.
         capture_job = "openmettle-drill-primary-backup"
@@ -1842,6 +1963,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "art_deadline_v2": art_deadline_v2,
             "retained_purge_after": retained_doc["purge_after"],
             "art_post_purge": art_post_purge,
+            "art_stage_recover": art_stage_recover,
             "art_to_lose": art_to_lose,
             "rev_meta": rev_meta,
             "conn_keep_id": conn_keep["connection_id"],
@@ -2347,8 +2469,10 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     f"unexpected target post-migrate DB state: {db_post_migrate!r}")
 
         # Step 4: Certify `--export-complete` against the stopped-primary watermark, copy artifacts
-        # omitting rev_to_lose, prove `storage rebind` fails closed, then replay --db-only -> declare-lost
-        # -> rebind -> replay -> quota verify.
+        # omitting BOTH `art_stage_recover` (removed from target PVC only, intact in staging) and
+        # `art_to_lose` (removed from target PVC AND unpacked staging), prove `storage rebind` fails
+        # closed for both, then replay --db-only -> recover intact staging copy -> declare truly
+        # absent payload lost -> rebind -> replay -> quota verify.
         watermarks = parse_journal_export_watermarks(self.journal_text)
         self.expect(watermarks["required_seq"] > manifest_summary["journal_seq"],
                     "post-backup journal export did not advance past backup snapshot journal_seq")
@@ -2358,8 +2482,12 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.expect(export_complete, "stopped-primary watermark disagreed with post-backup journal export")
         lock_argv = " ".join(f'"{a}"' for a in restore_lock_args(watermarks, export_complete=export_complete))
         has_artifacts = manifest_summary["artifact_volume_id"] is not None
+        recover_rev_id = primary_state["art_stage_recover"]["revision_id"]
+        recover_meta = primary_state["rev_meta"][recover_rev_id]
+        recover_res_id = recover_meta["reservation_id"]
         lost_rev_id = primary_state["art_to_lose"]["revision_id"]
-        lost_res_id = primary_state["rev_meta"][lost_rev_id]["reservation_id"]
+        lost_meta = primary_state["rev_meta"][lost_rev_id]
+        lost_res_id = lost_meta["reservation_id"]
         selected_journal = f"{RECOVERY_MEDIA_DIR}/post-backup-journal.export"
 
         step4a_script = f'printf "LOCK_STDOUT_BEGIN\\n"; openmettle-admin {lock_argv}; printf "LOCK_STDOUT_END\\n"\n'
@@ -2369,7 +2497,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 '  [ -e "$entry" ] || continue\n'
                 f'  cp -a -- "$entry" "{smoke.ARTIFACTS_MOUNT_PATH}/"\n'
                 "done\n"
-                f'rm -f "{smoke.ARTIFACTS_MOUNT_PATH}/revisions/{lost_res_id}"\n'
+                f'rm -f "{smoke.ARTIFACTS_MOUNT_PATH}/revisions/{recover_res_id}"\n'
+                f'rm -f "{smoke.ARTIFACTS_MOUNT_PATH}/revisions/{lost_res_id}" "{UNPACKED_DIR}/artifacts/revisions/{lost_res_id}"\n'
                 f'set +e\nopenmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" > /tmp/rebind.out 2> /tmp/rebind.err\nrc=$?\nset -e\n'
                 'if [ "$rc" -eq 0 ]; then echo "ERROR: storage rebind succeeded despite missing payload" >&2; exit 1; fi\n'
                 'printf "REBIND_STDOUT_BEGIN\\n"; cat /tmp/rebind.out; printf "REBIND_STDOUT_END\\n"\n'
@@ -2392,13 +2521,13 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                                      "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
-                                {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR, "readOnly": True},
+                                {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR},
                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH},
                                 {"name": "tmp", "mountPath": "/tmp"},
                             ],
                         }],
                         "volumes": [
-                            {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM, "readOnly": True}},
+                            {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM}},
                             {"name": "artifacts", "persistentVolumeClaim": {"claimName": TARGET_ARTIFACTS_CLAIM}},
                             {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Mi"}},
                         ],
@@ -2413,22 +2542,24 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         if has_artifacts:
             rebind_out = s4a_out.split("REBIND_STDOUT_BEGIN\n", 1)[1].split("REBIND_STDOUT_END", 1)[0]
             rebind_err = s4a_out.split("REBIND_STDERR_BEGIN\n", 1)[1].split("REBIND_STDERR_END", 1)[0]
-            barrier_uuid = parse_failed_rebind(rebind_out, rebind_err, lost_res_id)
+            barrier_uuid = parse_failed_rebind(rebind_out, rebind_err, [recover_res_id, lost_res_id])
 
         # Step 4c + 4d + Step 5c (vault status & rotate; maintenance STAYS ACTIVE until Step 5e!).
         s4b_init, s4b_key_mounts, s4b_key_vols = staged_keyring_mounts(
             admin_ref, [("vault", smoke.VAULT_KEYS_SECRET, smoke.VAULT_KEYS_DIR)]
         )
         if has_artifacts:
-            replay_and_rebind_lines = (
-                f'openmettle-admin restore replay --db-only "{selected_journal}"\n'
-                f'openmettle-admin storage declare-lost "{smoke.ARTIFACTS_MOUNT_PATH}" '
-                f'--revision "{lost_rev_id}" --operator-id "{DRILL_OPERATOR_ID}" '
-                f'--request-key "drill-lost-{lost_rev_id}" '
-                '--reason "simulated unrecoverable disk payload during V1-31 isolated restore drill"\n'
-                f'openmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" --replace-adoption-run "{barrier_uuid}"\n'
-                f'openmettle-admin restore replay "{selected_journal}" "{smoke.ARTIFACTS_MOUNT_PATH}"\n'
-                f'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify "{smoke.ARTIFACTS_MOUNT_PATH}"; printf "QUOTA_STAGE4_END\\n"\n'
+            assert barrier_uuid is not None
+            replay_and_rebind_lines = build_step4c_reconcile_lines(
+                selected_journal=selected_journal,
+                artifacts_mount=smoke.ARTIFACTS_MOUNT_PATH,
+                unpacked_dir=UNPACKED_DIR,
+                operator_id=DRILL_OPERATOR_ID,
+                barrier_uuid=barrier_uuid,
+                failed_revisions=[
+                    (recover_rev_id, recover_res_id, recover_meta["size_bytes"], recover_meta["sha256"]),
+                    (lost_rev_id, lost_res_id, lost_meta["size_bytes"], lost_meta["sha256"]),
+                ],
             )
         else:
             replay_and_rebind_lines = (
@@ -2467,12 +2598,14 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                             "volumeMounts": [
                                 *s4b_key_mounts,
                                 {"name": "media", "mountPath": RECOVERY_MEDIA_DIR, "readOnly": True},
+                                {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR, "readOnly": True},
                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH},
                             ],
                         }],
                         "volumes": [
                             *s4b_key_vols,
                             {"name": "media", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_MEDIA_CLAIM, "readOnly": True}},
+                            {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM, "readOnly": True}},
                             {"name": "artifacts", "persistentVolumeClaim": {"claimName": TARGET_ARTIFACTS_CLAIM}},
                         ],
                     },
@@ -2480,6 +2613,13 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             },
         }
         s4b_out, _ = self.run_job(TARGET_APP_NS, step4b_job)
+        if has_artifacts:
+            self.expect(f"STAGE_RECOVERED {recover_rev_id}" in s4b_out,
+                        f"expected staging recovery for {recover_rev_id}, got {s4b_out!r}")
+            self.expect(f"DECLARED_LOST {lost_rev_id}" in s4b_out,
+                        f"expected declare-lost for {lost_rev_id}, got {s4b_out!r}")
+            self.expect(f"DECLARED_LOST {recover_rev_id}" not in s4b_out,
+                        f"recoverable revision {recover_rev_id} was erroneously declared lost: {s4b_out!r}")
         parse_quota_verify_zero(s4b_out.split("QUOTA_STAGE4_BEGIN\n", 1)[1].split("QUOTA_STAGE4_END", 1)[0])
         vault_before = parse_vault_status(s4b_out.split("VAULT_BEFORE_BEGIN\n", 1)[1].split("VAULT_BEFORE_END", 1)[0])
         vault_after = parse_vault_status(s4b_out.split("VAULT_AFTER_BEGIN\n", 1)[1].split("VAULT_AFTER_END", 1)[0])
@@ -2487,6 +2627,45 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     f"expected 1 encrypted connection on vault-k1 after replay, got {vault_before!r}")
         self.expect(vault_after["by_key_id"] == {VAULT_KEY_ID_2: 1} and vault_after["encrypted"] == 1,
                     f"expected vault rotate to re-seal onto vault-k2, got {vault_after!r}")
+
+        # Exercise ADR 0012 trailing-sequence hazard before Step 5a:
+        # 1) Insert an explicit restored row at epoch = 100 and rewind the sequence to allocate 41 (< 100).
+        # 2) Run the epoch guard WITHOUT `setval` first to prove it rolls back (does NOT commit epoch 41 or
+        #    increment `access_generation`).
+        # 3) Run full Step 5a (`setval` + epoch guard), advancing `max(epoch)` cleanly to 101.
+        self.psql_superuser(
+            TARGET_DB_NS,
+            f"INSERT INTO openmettle.login_provider_revisions (epoch, provider_id, revision)"
+            f" OVERRIDING SYSTEM VALUE VALUES (100, '{USER_A_IDS['provider']}'::uuid, 'r1');\n"
+            "SELECT setval(pg_get_serial_sequence('openmettle.login_provider_revisions', 'epoch'), 40, true);",
+        )
+        unrepaired_probe_sql = (
+            "BEGIN;\n"
+            "LOCK TABLE openmettle.login_providers IN SHARE ROW EXCLUSIVE MODE;\n"
+            "LOCK TABLE openmettle.login_provider_revisions IN EXCLUSIVE MODE;\n"
+            f"{provider_epoch_advance_block_sql(DRILL_OPERATOR_ID)}\n"
+            "COMMIT;\n"
+        )
+        unrepaired_probe = self.kube(
+            "--namespace", TARGET_DB_NS, "exec", "--stdin", "deployment/postgres", "--",
+            "psql", "-v", "ON_ERROR_STOP=1", "-qtA", "-U", "fixture_admin", "-d", "openmettle",
+            input=unrepaired_probe_sql,
+            check=False,
+        )
+        self.expect(
+            unrepaired_probe.returncode != 0,
+            "trailing login_provider_revisions sequence unexpectedly committed without advancing epoch",
+        )
+        post_rollback_row = self.psql_superuser(
+            TARGET_DB_NS,
+            f"SELECT (SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id = '{USER_A_IDS['provider']}'::uuid),"
+            f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid),"
+            f" (SELECT EXISTS (SELECT 1 FROM openmettle.login_provider_revisions WHERE epoch = 41));",
+        ).strip()
+        self.expect(
+            post_rollback_row == "100|0|f",
+            f"trailing-sequence rollback left unexpected provider state: {post_rollback_row!r}",
+        )
 
         # Step 5a, 5b & 5d.1: Run owner SQL inside target namespace as openmettle_owner via 0600 PGPASSFILE.
         psql_bin = "/usr/lib/postgresql/18/bin/psql"
@@ -2740,7 +2919,20 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             )
             self.expect(json.loads(deny_body).get("code") == "policy", "viewer write did not return 403 policy")
 
-            # 4. Declared-lost payload: 200 metadata state="lost" + 410 Gone payload_lost for owner; 404 for user_b.
+            # 4. Recoverable staging payload (`art_stage_recover`): recovered intact from staging, `200` + exact
+            #    bytes for owner, `404` for user_b; declared-lost payload (`art_to_lose`): `200` state="lost" +
+            #    `410 Gone` `payload_lost` for owner; `404` for user_b.
+            stage_rec = primary_state["art_stage_recover"]
+            stage_rec_path = f"/v1/artifacts/{stage_rec['artifact_id']}/revisions/{stage_rec['revision_id']}"
+            stage_rec_meta = self.api_json(fwd.port, cookie_a2, "GET", stage_rec_path, 200)
+            self.expect(stage_rec_meta.get("state") == "active",
+                        f"expected staging-recovered revision state='active', got {stage_rec_meta!r}")
+            _, stage_rec_bytes = self.api_call(fwd.port, cookie_a2, "GET", f"{stage_rec_path}/content", 200)
+            self.expect(stage_rec_bytes == b"drill-recoverable-from-staging-bytes\n",
+                        "corrupted staging-recovered artifact bytes")
+            self.api_call(fwd.port, cookie_b2, "GET", stage_rec_path, 404)
+            self.api_call(fwd.port, cookie_b2, "GET", f"{stage_rec_path}/content", 404)
+
             lost = primary_state["art_to_lose"]
             lost_path = f"/v1/artifacts/{lost['artifact_id']}/revisions/{lost['revision_id']}"
             lost_meta = self.api_json(fwd.port, cookie_a2, "GET", lost_path, 200)
@@ -2863,13 +3055,15 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
             f"    WHERE run_id = '{w_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens'),"
             f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
-            f"    WHERE run_id = '{i_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens');",
+            f"    WHERE run_id = '{i_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens'),"
+            f" (SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id = '{USER_A_IDS['provider']}'::uuid),"
+            f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid);",
         ).strip()
         expected_sql = (
             f"outcome_unknown:1|t|{expected_purge_after_us}|purged|t|f|"
             f"{w_expected_seq}:{w_expected_seq}:1:{w_expected_seq}|run-terminal:openmettle.run-cancelled|"
             f"{i_expected_seq}:{i_expected_seq}:1:{i_expected_seq}|unresolved-write:{i_op_id}|"
-            "run-terminal:openmettle.run-cancelled|released:0|held:25"
+            "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1"
         )
         self.expect(
             sql_checks == expected_sql,
@@ -2944,8 +3138,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             primary_state["cutover_at"],
             recovery_started_at,
             recovery_completed_at,
+            report=self.report,
         )
-        self.report["rpo_rto"] = rpo_rto
         self.passed(
             "post-restore HTTP/SQL invariants, revoked principal denial, non-revival of approvals/intents, primary non-interference, and RPO/RTO bounds verified",
             quota_verify=quota_post,

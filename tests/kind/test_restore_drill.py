@@ -41,6 +41,43 @@ sha256 {"c" * 64}
 """
 
 
+def k8s_expand(arg: str, env_names: set[str]) -> str:
+    """Simulate kubelet ExpandContainerCommandOnlyStatic (`$$` -> `$`, `$(VAR)` expansion)."""
+    out: list[str] = []
+    i = 0
+    while i < len(arg):
+        if arg[i] == "$" and i + 1 < len(arg):
+            if arg[i + 1] == "$":
+                out.append("$")
+                i += 2
+                continue
+            if arg[i + 1] == "(":
+                end = arg.find(")", i + 2)
+                if end != -1:
+                    var_name = arg[i + 2:end]
+                    if var_name in env_names:
+                        out.append(f"<expanded:{var_name}>")
+                        i = end + 1
+                        continue
+        out.append(arg[i])
+        i += 1
+    return "".join(out)
+
+
+def iter_pod_specs(doc: dict):
+    """Yield `(resource_name, pod_spec)` pairs across List, Pod, Deployment, Job, and CronJob."""
+    kind = doc.get("kind")
+    if kind == "List":
+        for item in doc.get("items", ()):
+            yield from iter_pod_specs(item)
+    elif kind == "Pod":
+        yield doc["metadata"]["name"], doc["spec"]
+    elif kind in ("Deployment", "Job"):
+        yield doc["metadata"]["name"], doc["spec"]["template"]["spec"]
+    elif kind == "CronJob":
+        yield doc["metadata"]["name"], doc["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+
+
 class JournalAndRebindParserTest(unittest.TestCase):
     def test_parses_all_watermarks_and_exercises_export_complete_vs_coverage_gap_decision(self):
         wm = restore_drill.parse_journal_export_watermarks(SAMPLE_JOURNAL)
@@ -102,12 +139,20 @@ class JournalAndRebindParserTest(unittest.TestCase):
 
     def test_parses_failed_rebind_barrier_and_rejects_missing_failure_line(self):
         res_id = "11111111-1111-4111-8111-111111111111"
+        res_id_2 = "33333333-3333-4333-8333-333333333333"
         barrier = "22222222-2222-4222-8222-222222222222"
-        stdout = f"rebound 5, emptied 0, unchanged 0, quarantined 0, failed 1\nfailed {res_id}: missing revision\n"
+        stdout = (
+            "rebound 5, emptied 0, unchanged 0, quarantined 0, failed 2\n"
+            f"failed {res_id}: missing revision\n"
+            f"failed {res_id_2}: missing revision\n"
+        )
         stderr = f"the volume stays closed; resolve what is reported and re-run with --replace-adoption-run {barrier}\n"
         self.assertEqual(restore_drill.parse_failed_rebind(stdout, stderr, res_id), barrier)
+        self.assertEqual(restore_drill.parse_failed_rebind(stdout, stderr, [res_id, res_id_2]), barrier)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing revision"):
             restore_drill.parse_failed_rebind("rebound 5, failed 0\n", stderr, res_id)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, res_id_2):
+            restore_drill.parse_failed_rebind(f"failed {res_id}: missing revision\n", stderr, [res_id, res_id_2])
         with self.assertRaisesRegex(restore_drill.DrillFailure, "replace-adoption-run"):
             restore_drill.parse_failed_rebind(stdout, "no barrier here\n", res_id)
 
@@ -153,21 +198,31 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         storage_disabled = {**manifest, "artifact_volume": {"volume_id": None, "revision_count": 0}}
         self.assertIsNone(restore_drill.evaluate_manifest_preflight(storage_disabled)["artifact_volume_id"])
 
+        vault_disabled = {**manifest, "vault_required_key_ids": []}
+        self.assertEqual(
+            restore_drill.evaluate_manifest_preflight(vault_disabled, max_schema=45, available_vault_keys=set())["vault_required_key_ids"],
+            [],
+        )
+
         with self.assertRaisesRegex(restore_drill.DrillFailure, "lacks required key IDs"):
             restore_drill.evaluate_manifest_preflight(manifest, max_schema=45, available_vault_keys={"vault-k2"})
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "lacks required key IDs"):
+            restore_drill.evaluate_manifest_preflight(manifest, max_schema=45, available_vault_keys=set())
 
         newer = {**manifest, "schema_version": 46}
         with self.assertRaisesRegex(restore_drill.DrillFailure, "incompatible backup schema_version"):
             restore_drill.evaluate_manifest_preflight(newer, max_schema=45)
 
-    def test_rpo_and_rto_bounds_accept_within_targets_and_refuse_breaches(self):
+    def test_rpo_and_rto_bounds_record_measurements_even_on_simultaneous_breach(self):
         t0 = datetime(2026, 11, 27, 8, 0, 0, tzinfo=timezone.utc)
         cutover = t0 + timedelta(hours=2)
         rec_start = cutover + timedelta(minutes=1)
         rec_done = rec_start + timedelta(minutes=12)
+        report = {}
         metrics = restore_drill.evaluate_rpo_rto(
-            "2026-11-27T08:00:00.000000Z", cutover, rec_start, rec_done
+            "2026-11-27T08:00:00.000000Z", cutover, rec_start, rec_done, report=report
         )
+        self.assertEqual(report["rpo_rto"], metrics)
         self.assertTrue(metrics["rpo_met"])
         self.assertTrue(metrics["rto_met"])
         self.assertEqual(metrics["restored_data_age_seconds"], 7200.0)
@@ -188,11 +243,90 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
                 rec_start + timedelta(hours=5),
             )
 
+        breach_report: dict = {}
+        with self.assertRaises(restore_drill.DrillFailure) as ctx:
+            restore_drill.evaluate_rpo_rto(
+                "2026-11-27T08:00:00.000000Z",
+                t0 + timedelta(hours=25),
+                rec_start,
+                rec_start + timedelta(hours=5),
+                report=breach_report,
+            )
+        self.assertIn("RPO breached", str(ctx.exception))
+        self.assertIn("RTO breached", str(ctx.exception))
+        recorded = breach_report["rpo_rto"]
+        self.assertEqual(recorded["restored_data_age_seconds"], 90000.0)
+        self.assertFalse(recorded["rpo_met"])
+        self.assertEqual(recorded["recovery_duration_seconds"], 18000.0)
+        self.assertFalse(recorded["rto_met"])
+
+    def test_step4c_script_recovers_intact_staging_before_declaring_unrecoverable_lost(self):
+        import hashlib
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        log_file = tmp / "admin-calls.log"
+        admin_stub = bin_dir / "openmettle-admin"
+        admin_stub.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{log_file}"\n',
+            encoding="utf-8",
+        )
+        admin_stub.chmod(0o755)
+
+        unpacked = tmp / "unpacked"
+        artifacts = tmp / "artifacts"
+        (unpacked / "artifacts" / "revisions").mkdir(parents=True)
+        (artifacts / "revisions").mkdir(parents=True)
+
+        rec_rev = "11111111-1111-4111-8111-111111111111"
+        rec_res = "22222222-2222-4222-8222-222222222222"
+        rec_bytes = b"intact-staging-payload\n"
+        rec_sha = hashlib.sha256(rec_bytes).hexdigest()
+        (unpacked / "artifacts" / "revisions" / rec_res).write_bytes(rec_bytes)
+
+        lost_rev = "33333333-3333-4333-8333-333333333333"
+        lost_res = "44444444-4444-4444-8444-444444444444"
+        lost_bytes = b"absent-everywhere\n"
+        lost_sha = hashlib.sha256(lost_bytes).hexdigest()
+
+        barrier = "55555555-5555-4555-8555-555555555555"
+        script = restore_drill.build_step4c_reconcile_lines(
+            selected_journal=str(tmp / "post.export"),
+            artifacts_mount=str(artifacts),
+            unpacked_dir=str(unpacked),
+            operator_id=restore_drill.DRILL_OPERATOR_ID,
+            barrier_uuid=barrier,
+            failed_revisions=[
+                (rec_rev, rec_res, len(rec_bytes), rec_sha),
+                (lost_rev, lost_res, len(lost_bytes), lost_sha),
+            ],
+        )
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+        res = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"STAGE_RECOVERED {rec_rev}", res.stdout)
+        self.assertIn(f"DECLARED_LOST {lost_rev}", res.stdout)
+        self.assertNotIn(f"DECLARED_LOST {rec_rev}", res.stdout)
+        restored_path = artifacts / "revisions" / rec_res
+        self.assertEqual(restored_path.read_bytes(), rec_bytes)
+        self.assertEqual(restored_path.stat().st_mode & 0o777, 0o600)
+        calls = log_file.read_text(encoding="utf-8")
+        self.assertNotIn(rec_rev, calls)
+        self.assertIn(f"storage declare-lost {artifacts} --revision {lost_rev}", calls)
+        self.assertIn(f"storage rebind {artifacts} --replace-adoption-run {barrier}", calls)
+
     def test_owner_and_worker_reconcile_sql_follow_core_sequence_and_role_boundaries(self):
         owner_sql = restore_drill.pre_worker_owner_reconcile_sql(
             restore_drill.DRILL_OPERATOR_ID,
             disabled_principals=[(restore_drill.USER_C_IDS["user"], restore_drill.USER_C_IDS["approval"])],
         )
+        self.assertIn("LOCK TABLE openmettle.login_provider_revisions IN EXCLUSIVE MODE;", owner_sql)
+        self.assertIn("pg_get_serial_sequence('openmettle.login_provider_revisions', 'epoch')", owner_sql)
+        self.assertIn("DO $provider_epoch$", owner_sql)
+        self.assertIn("$provider_epoch$;", owner_sql)
+        self.assertIn("new_epoch <= rec.prev_max_epoch", owner_sql)
         self.assertIn("coalesce(r.cancel_reason, 'revoked')", owner_sql)
         self.assertIn("SET last_event_sequence = last_event_sequence + 1", owner_sql)
         self.assertIn("access_generation = access_generation + 1", owner_sql)
@@ -342,8 +476,49 @@ class ChartAndManifestValuesTest(unittest.TestCase):
                 docs = [d for d in yaml.safe_load_all(res.stdout) if d]
                 cronjobs = [d for d in docs if d.get("kind") == "CronJob"]
                 self.assertEqual(len(cronjobs), 0 if is_target else 1)
+                for doc in docs:
+                    for owner_name, pod_spec in iter_pod_specs(doc):
+                        for c in (*pod_spec.get("initContainers", ()), *pod_spec.get("containers", ())):
+                            env_names = {e["name"] for e in c.get("env", ())}
+                            for field in ("command", "args"):
+                                for raw_arg in c.get(field, ()):
+                                    expanded = k8s_expand(raw_arg, env_names)
+                                    if doc.get("kind") == "CronJob" and field == "args" and raw_arg == "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)":
+                                        self.assertEqual(expanded, "cronjob-<expanded:OPENMETTLE_BACKUP_JOB_UID>")
+                                    else:
+                                        self.assertEqual(
+                                            expanded, raw_arg,
+                                            f"unexpected Kubernetes command expansion in rendered {doc.get('kind')} {owner_name}/{c['name']} {field}",
+                                        )
             finally:
                 Path(vals_path).unlink(missing_ok=True)
+
+        # Verify chart renders backup enabled with vault disabled without mounting vault secrets/keys.
+        no_vault_vals = restore_drill.drill_chart_values(
+            DIGESTS,
+            PG_CLIENT,
+            db_namespace=restore_drill.PRIMARY_DB_NS,
+            artifacts_existing_claim=None,
+            enable_backup=True,
+        )
+        no_vault_vals["vault"] = {"enabled": False}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(no_vault_vals, handle)
+            nv_path = handle.name
+        try:
+            res = subprocess.run(
+                [HELM, "template", smoke.RELEASE, str(smoke.CHART), "--values", nv_path],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            docs = [d for d in yaml.safe_load_all(res.stdout) if d]
+            self.assertEqual(len([d for d in docs if d.get("kind") == "CronJob"]), 1)
+            for doc in docs:
+                for _, pod_spec in iter_pod_specs(doc):
+                    for vol in pod_spec.get("volumes", ()):
+                        self.assertNotIn("vault-keys", vol["name"])
+        finally:
+            Path(nv_path).unlink(missing_ok=True)
 
     def test_isolation_manifests_precede_workloads_and_enforce_pod_security_and_db_revocations(self):
         catalog = smoke.smoke_catalog(test_smoke.CATALOG_FIXTURE)
@@ -623,7 +798,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "restore gate closed: restore_run 77777777-7777-4777-8777-777777777777, origin 1, snapshot 2, required 5, coverage_complete true\n"
                 "LOCK_STDOUT_END\n"
                 "REBIND_STDOUT_BEGIN\n"
-                "rebound 5, emptied 0, unchanged 0, quarantined 0, failed 1\n"
+                "rebound 5, emptied 0, unchanged 0, quarantined 0, failed 2\n"
+                "failed 99999999-9999-4999-8999-999999999997: missing revision\n"
                 "failed 99999999-9999-4999-8999-999999999995: missing revision\n"
                 "REBIND_STDOUT_END\n"
                 "REBIND_STDERR_BEGIN\n"
@@ -637,6 +813,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         if name == "openmettle-drill-reconcile-admin":
             return self._res(
                 0,
+                "STAGE_RECOVERED 99999999-9999-4999-8999-999999999997\n"
+                "DECLARED_LOST 99999999-9999-4999-8999-999999999995\n"
                 f"QUOTA_STAGE4_BEGIN\n{qv}QUOTA_STAGE4_END\n"
                 "VAULT_BEFORE_BEGIN\nconnections 2, encrypted 1\nkey_id vault-k1 1\nVAULT_BEFORE_END\n"
                 "VAULT_AFTER_BEGIN\nconnections 2, encrypted 1\nkey_id vault-k2 1\nVAULT_AFTER_END\n",
@@ -691,17 +869,26 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if "FROM openmettle.artifact_revisions" in stdin_text and "WHERE id IN" in stdin_text:
                 return self._res(
                     0,
-                    "99999999-9999-4999-8999-999999999993|99999999-9999-4999-8999-999999999990|1800000000000000\n"
-                    "99999999-9999-4999-8999-999999999994|99999999-9999-4999-8999-999999999991|\n"
-                    "99999999-9999-4999-8999-999999999995|99999999-9999-4999-8999-999999999995|\n",
+                    f"99999999-9999-4999-8999-999999999993|99999999-9999-4999-8999-999999999990|1800000000000000|27|{'1' * 64}\n"
+                    f"99999999-9999-4999-8999-999999999994|99999999-9999-4999-8999-999999999991||30|{'2' * 64}\n"
+                    f"99999999-9999-4999-8999-999999999995|99999999-9999-4999-8999-999999999995||34|{'3' * 64}\n"
+                    f"99999999-9999-4999-8999-999999999997|99999999-9999-4999-8999-999999999997||37|{'4' * 64}\n",
                 )
+            if "DO $provider_epoch$" in stdin_text and "setval" not in stdin_text:
+                return self._res(
+                    3,
+                    "",
+                    "ERROR: login_provider_revisions epoch 41 did not advance past previous maximum 100",
+                )
+            if "EXISTS (SELECT 1 FROM openmettle.login_provider_revisions WHERE epoch = 41)" in stdin_text:
+                return self._res(0, "100|0|f\n")
             if "openmettle.operations" in stdin_text:
                 return self._res(
                     0,
                     "outcome_unknown:1|t|1800000000000000|purged|t|f|"
                     "5:5:1:5|run-terminal:openmettle.run-cancelled|"
                     "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
-                    "run-terminal:openmettle.run-cancelled|released:0|held:25\n",
+                    "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1\n",
                 )
             if "SELECT state FROM openmettle.artifact_revisions" in stdin_text:
                 return self._res(0, "purged\n")
@@ -778,6 +965,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "drill-art-dl-v1": ("99999999-9999-4999-8999-999999999983", "99999999-9999-4999-8999-999999999993"),
                 "drill-art-dl-v2": ("99999999-9999-4999-8999-999999999983", "99999999-9999-4999-8999-999999999996"),
                 "drill-art-post-purge": ("99999999-9999-4999-8999-999999999984", "99999999-9999-4999-8999-999999999994"),
+                "drill-art-stage-recover": ("99999999-9999-4999-8999-999999999987", "99999999-9999-4999-8999-999999999997"),
                 "drill-art-to-lose": ("99999999-9999-4999-8999-999999999985", "99999999-9999-4999-8999-999999999995"),
             }
             aid, rid = mapping[key]
@@ -810,10 +998,16 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-unrecoverable-payload-bytes\n"
             if raw_cookie == getattr(self, "_cookie_d2", None):
                 return 404, prob_hdrs, json.dumps({"status": 404, "code": "not_found"}).encode()
-            if raw_cookie == self._cookie_b2 and ("99999999-9999-4999-8999-999999999981" in path or "99999999-9999-4999-8999-999999999985" in path):
+            if raw_cookie == self._cookie_b2 and (
+                "99999999-9999-4999-8999-999999999981" in path
+                or "99999999-9999-4999-8999-999999999985" in path
+                or "99999999-9999-4999-8999-999999999987" in path
+            ):
                 return 404, prob_hdrs, json.dumps({"status": 404, "code": "not_found"}).encode()
             if "99999999-9999-4999-8999-999999999991/content" in path:
                 return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-personal-keep-bytes\n"
+            if "99999999-9999-4999-8999-999999999997/content" in path:
+                return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-recoverable-from-staging-bytes\n"
             if "99999999-9999-4999-8999-999999999992/content" in path:
                 self.shared_artifact_readers.append(raw_cookie)
                 return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-project-shared-bytes\n"
@@ -908,37 +1102,6 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertEqual(self.shared_artifact_readers, [self._cookie_a2, self._cookie_b2])
         # Simulate Kubernetes kubelet ExpandContainerCommandOnlyStatic across EVERY container and initContainer
         # command/args in every applied manifest so `$$` -> `$` or `$(ENV_VAR)` can never silently mutate scripts/SQL.
-        def k8s_expand(arg: str, env_names: set[str]) -> str:
-            out: list[str] = []
-            i = 0
-            while i < len(arg):
-                if arg[i] == "$" and i + 1 < len(arg):
-                    if arg[i + 1] == "$":
-                        out.append("$")
-                        i += 2
-                        continue
-                    if arg[i + 1] == "(":
-                        end = arg.find(")", i + 2)
-                        if end != -1:
-                            var_name = arg[i + 2:end]
-                            if var_name in env_names:
-                                out.append(f"<expanded:{var_name}>")
-                                i = end + 1
-                                continue
-                out.append(arg[i])
-                i += 1
-            return "".join(out)
-
-        def iter_pod_specs(doc: dict):
-            kind = doc.get("kind")
-            if kind == "List":
-                for item in doc.get("items", ()):
-                    yield from iter_pod_specs(item)
-            elif kind == "Pod":
-                yield doc["metadata"]["name"], doc["spec"]
-            elif kind in ("Deployment", "Job"):
-                yield doc["metadata"]["name"], doc["spec"]["template"]["spec"]
-
         pre_worker_delivered_sql = None
         for manifest in self.applied_manifests:
             for owner_name, pod_spec in iter_pod_specs(manifest):
@@ -956,13 +1119,16 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertIsNotNone(pre_worker_delivered_sql)
         self.assertIn("DO $restore$", pre_worker_delivered_sql)
         self.assertIn("$restore$;", pre_worker_delivered_sql)
+        self.assertIn("DO $provider_epoch$", pre_worker_delivered_sql)
         self.assertNotIn("DO $\n", pre_worker_delivered_sql)
 
-        # Runbook invariants: recoverable payload check before declare-lost, OPENMETTLE_ADMIN_DATABASE_URL bound via
-        # database.migrate.existingSecret + database.migrate.key, /etc/openmettle/db-ca/ca.crt with O_NOFOLLOW staging,
-        # tagged $restore$ SQL delimiter, and Step 5e storage-disabled branch + set -eu + maintenance_active==false gate.
+        # Runbook invariants: recoverable payload check before declare-lost, vault-disabled support,
+        # ADR 0012 sequence sync + epoch check, OPENMETTLE_ADMIN_DATABASE_URL bound via database.migrate.existingSecret
+        # + database.migrate.key, /etc/openmettle/db-ca/ca.crt with O_NOFOLLOW staging, tagged $restore$ SQL
+        # delimiter, and Step 5e storage-disabled branch + set -eu + maintenance_active==false gate.
         runbook = (smoke.ROOT / "docs" / "restore-drill.md").read_text(encoding="utf-8")
         self.assertIn("OPENMETTLE_ADMIN_DATABASE_URL", runbook)
+        self.assertIn("vault.enabled: false", runbook)
         self.assertIn("database.migrate.key", runbook)
         self.assertNotIn("(key: url)", runbook)
         self.assertNotIn("database.migrate.existingSecret, key `url`", runbook)
@@ -972,6 +1138,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertIn("PGSSLMODE=verify-full", runbook)
         self.assertIn("PGSSLROOTCERT=", runbook)
         self.assertIn("PGGSSENCMODE=disable", runbook)
+        self.assertIn("DO $provider_epoch$", runbook)
+        self.assertIn("pg_get_serial_sequence('openmettle.login_provider_revisions', 'epoch')", runbook)
         self.assertIn("DO $restore$", runbook)
         self.assertNotIn("DO $$", runbook)
         self.assertIn("ARTIFACT_VOLUME_ID", runbook)

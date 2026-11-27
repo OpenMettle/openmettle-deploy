@@ -8,7 +8,7 @@ This runbook defines the repeatable Kubernetes recovery and isolated-target rest
 
 1. **Isolated target only.** Always restore into a separate namespace or cluster, a fresh PostgreSQL database (`openmettle`) with freshly generated role passwords, and a fresh artifact `PersistentVolumeClaim`. Never run `pg_restore`, `storage rebind` or `restore replay` against a live primary database or mounted primary artifact volume.
 2. **Default-deny network and Pod Security isolation before workloads.** Apply `pod-security.kubernetes.io/enforce=restricted` and namespace-wide `default-deny` `NetworkPolicy` manifests across both the target application namespace and any in-cluster target database namespace **before** submitting database fixtures, recovery `Job`s, or runtime workloads, so target pods cannot reach primary PostgreSQL, primary `openmettle-gateway` Services, or unapproved external endpoints at any point in their lifecycle. Keep `backup.suspend: true` (or `backup.enabled: false`) on the drill target so it cannot write to or prune a shared backup destination.
-3. **Separate backup and vault key custody.** `OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG` and `OPENMETTLE_API_VAULT_KEYS_CONFIG` / `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` must remain distinct Secrets, files, and 32-byte key material (`ADR 0045`, `ADR 0046`). `openmettle-admin` refuses overlapping paths, inodes, or duplicate key bytes whenever `OPENMETTLE_API_VAULT_KEYS_CONFIG` is set in the preflight environment.
+3. **Separate backup and vault key custody.** `OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG` and `OPENMETTLE_API_VAULT_KEYS_CONFIG` / `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` must remain distinct Secrets, files, and 32-byte key material (`ADR 0045`, `ADR 0046`). Whenever `OPENMETTLE_API_VAULT_KEYS_CONFIG` is set in the environment, `openmettle-admin` fails closed if that keyring or any key file it names is unreadable or overlaps the backup keyring; on vault-disabled installations (`vault.enabled: false`), leave `OPENMETTLE_API_VAULT_KEYS_CONFIG` unset during backup preflight and stop recovery immediately if the unpacked `manifest.json` lists non-empty `vault_required_key_ids`.
 4. **RPO / RTO targets.** Single-node v1 targets **RPO <= 24 hours** (`86,400 s` between the restored backup's `quiesced_at` timestamp and incident/drill cutover) and **RTO <= 4 hours** (`14,400 s` from recovery initiation — before target provisioning and media staging — through final post-restore HTTP/SQL acceptance and `quota verify` completion).
 5. **Explicit non-goals.** Legacy Open WebUI database or file import is excluded from v1 recovery (`ADR 0003`). Optional Graphiti (`neo4j.dump`) and Chroma (`chroma.archive` or `qualified_rebuild`) recovery steps apply only when `manifest.json` records a provisioned state other than `not_provisioned`.
 
@@ -16,13 +16,17 @@ This runbook defines the repeatable Kubernetes recovery and isolated-target rest
 
 ## Step 1 — Preflight verification and unpacking
 
-Stage **both** the backup keyring (`/etc/openmettle/backup-keys`) and the target vault keyring (`/etc/openmettle/vault-keys`) via `Memory` `emptyDir` `initContainer`s writing `0400` files owned by UID `65532` and mounted `readOnly: true` with `subPath: keys`, mount the backup destination PVC `readOnly: true`, mount an isolated scratch PVC at `/var/recovery`, and export `OPENMETTLE_API_VAULT_KEYS_CONFIG` so `BackupKeyRing::load_from_config` enforces backup/vault key separation during preflight:
+- **Vault-enabled deployments (`vault.enabled: true`):** stage **both** the backup keyring (`/etc/openmettle/backup-keys`) and the target vault keyring (`/etc/openmettle/vault-keys`) via `Memory` `emptyDir` `initContainer`s writing `0400` files owned by UID `65532` and mounted `readOnly: true` with `subPath: keys`, and export `OPENMETTLE_API_VAULT_KEYS_CONFIG=/etc/openmettle/vault-keys/keyring.json` so `BackupKeyRing::load_from_config` enforces backup/vault key separation during preflight.
+- **Vault-disabled deployments (`vault.enabled: false`):** stage only the backup keyring (`/etc/openmettle/backup-keys`) and leave `OPENMETTLE_API_VAULT_KEYS_CONFIG` and `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` **unset** during `backup verify` and `backup unpack` (`openmettle-admin` fails closed if `OPENMETTLE_API_VAULT_KEYS_CONFIG` points to a missing file). Do not create or mount a dummy vault keyring just to pass preflight.
+
+Mount the backup destination PVC `readOnly: true` and an isolated scratch PVC at `/var/recovery`:
 
 ```sh
 set -eu
+# Vault-enabled target only (`vault.enabled: true`); leave unset when `vault.enabled: false`:
 export OPENMETTLE_API_VAULT_KEYS_CONFIG=/etc/openmettle/vault-keys/keyring.json
 
-# 1. Verify backup-meta.json, backup/vault key separation, encrypted manifest, and AEAD stream tags.
+# 1. Verify backup-meta.json, backup/vault key separation (when vault is enabled), encrypted manifest, and AEAD stream tags.
 openmettle-admin backup verify \
   --backup-dir /var/backups/openmettle/<backup-dir> \
   --backup-keys-config /etc/openmettle/backup-keys/keyring.json
@@ -37,7 +41,7 @@ openmettle-admin backup unpack \
 `backup unpack` writes `pg.dump`, `gateway-entitlements.json`, `deletion-journal.bin`, `artifacts/` (with `revisions/`, `staging/`, and `.openmettle-volume-id` sentinels when pinned), `config/` (including `vault-key-inventory.json`), optional `neo4j.dump`, optional `chroma.archive`, and plaintext `manifest.json`. Inspect `/var/recovery/unpacked/manifest.json` before touching PostgreSQL or PVCs:
 
 - **Schema compatibility:** `schema_version` must be `<=` the migration version shipped by the target chart's `CORE_COMMIT` (`45` at `87a395e`). Never restore a newer schema dump onto an older `openmettle-core` binary.
-- **Required vault key IDs:** check `vault_required_key_ids` (and `/var/recovery/unpacked/config/vault-key-inventory.json`). Every listed key ID must exist in `/etc/openmettle/vault-keys/keyring.json` before starting `api`/`worker` or running `openmettle-admin vault rotate`.
+- **Required vault key IDs:** check `vault_required_key_ids` (and `/var/recovery/unpacked/config/vault-key-inventory.json`). If `vault_required_key_ids` is non-empty, **every** listed key ID must be present in `/etc/openmettle/vault-keys/keyring.json` (and `vault.enabled` must be `true`) before continuing recovery — **stop recovery** if `manifest.json` names any key ID that is unavailable on the target (or when restoring onto a `vault.enabled: false` target where keys were not provisioned). If `vault_required_key_ids` is `[]`, target may preserve `vault.enabled: false`.
 - **Artifact volume mode:** check `artifact_volume.volume_id` (non-null UUID when artifact storage is pinned; `null` on storage-disabled deployments).
 - **Optional stores:** check `graphiti_neo4j.status` (`"not_provisioned"` or `"offline_dump"`) and `chroma.mode` (`"not_provisioned"`, `"archive"` or `"qualified_rebuild"`). If `neo4j.dump` is unpacked, restore Neo4j offline (`neo4j-admin database load`) before enabling Graphiti; if `chroma.archive` is unpacked, restore Chroma's persistent directory from `chroma.archive`; if `chroma.mode` is `"qualified_rebuild"`, rebuild `chroma_vector_embeddings` offline against `chroma.qualification_ref` before opening retrieval traffic.
 - **RPO anchor:** record `quiesced_at` and `deletion_journal.journal_seq`.
@@ -62,7 +66,7 @@ GRANT CONNECT ON DATABASE openmettle TO openmettle_api, openmettle_worker, openm
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 ```
 
-3. Create the target Kubernetes `Secret`s (`database.api`, `database.worker`, `database.migrate`, `database.issuance`, `database.gateway`, and optional `database.backup`), distinct `auth.loginKeysSecretName` (fresh 32-byte `active.key` and `cursor.key`), and `vault.existingSecret`.
+3. Create the target Kubernetes `Secret`s (`database.api`, `database.worker`, `database.migrate`, `database.issuance`, `database.gateway`, and optional `database.backup`), distinct `auth.loginKeysSecretName` (fresh 32-byte `active.key` and `cursor.key`), and (when `vault.enabled` is `true` or `manifest.vault_required_key_ids` is non-empty) `vault.existingSecret`.
 
 ---
 
@@ -181,9 +185,13 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
 
    ```sh
    cand="/var/recovery/unpacked/artifacts/revisions/$RESERVATION_UUID"
-   if [ -f "$cand" ] && [ "$(sha256sum "$cand" | awk '{print $1}')" = "$EXPECTED_SHA256" ]; then
-     cp -a -- "$cand" "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
-     chmod 0600 "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
+   if [ -f "$cand" ]; then
+     cand_bytes="$(wc -c < "$cand" | tr -d ' ')"
+     set -- $(sha256sum "$cand")
+     if [ "$cand_bytes" -eq "$EXPECTED_SIZE_BYTES" ] && [ "$1" = "$EXPECTED_SHA256" ]; then
+       cp -a -- "$cand" "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
+       chmod 0600 "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
+     fi
    fi
    ```
 
@@ -233,39 +241,66 @@ Complete every item below **before** releasing maintenance, starting `openmettle
 
 ### 5a. Invalidate all restored sessions and pending OIDC logins (`ADR 0013`)
 
-Enumerate **every** provider in `openmettle.login_providers` (not only those in the current `auth.json`). Preserve retired providers (`latest revision IS NULL`), reapply any post-backup provider retirements via `ADR 0013`'s `retire` protocol (`access_generation + 1` and a `NULL` revision tombstone epoch), and for every remaining active provider append a fresh non-retirement epoch and advance `access_generation` in one `openmettle_owner` transaction (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE` under an `EXIT` trap, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/db-ca/ca.crt` matching the owner URL's `sslrootcert`, and `PGGSSENCMODE=disable`):
+Enumerate **every** provider in `openmettle.login_providers` (not only those in the current `auth.json`). Preserve retired providers (`latest revision IS NULL`), reapply any post-backup provider retirements via `ADR 0013`'s `retire` protocol (`access_generation + 1` and a `NULL` revision tombstone epoch), and for every remaining active provider advance the `login_provider_revisions` identity sequence past all restored rows (`ADR 0012` — preventing a trailing sequence after `pg_restore` or owner overrides from allocating an epoch `<= prev_max_epoch`), append a fresh non-retirement epoch while verifying the inserted `epoch` strictly advances past the provider's previous maximum (rolling back the entire transaction if any epoch is not current), and advance `access_generation` in one `openmettle_owner` transaction (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE` under an `EXIT` trap, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/db-ca/ca.crt` matching the owner URL's `sslrootcert`, and `PGGSSENCMODE=disable`; uses a tagged `$provider_epoch$` delimiter so Kubernetes `command`/`args` `$$` expansion cannot mutate it):
 
 ```sql
 BEGIN;
 LOCK TABLE openmettle.login_providers IN SHARE ROW EXCLUSIVE MODE;
-INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
-SELECT p.id, r.revision
-  FROM openmettle.login_providers p
-  JOIN LATERAL (
-      SELECT revision
-        FROM openmettle.login_provider_revisions lpr
-       WHERE lpr.provider_id = p.id
-       ORDER BY lpr.epoch DESC
-       LIMIT 1
-  ) r ON r.revision IS NOT NULL;
+LOCK TABLE openmettle.login_provider_revisions IN EXCLUSIVE MODE;
 
-UPDATE openmettle.login_providers p
-   SET access_generation = p.access_generation + 1,
-       changed_at = clock_timestamp(),
-       changed_by = 'operator:<operator-uuid>',
-       change_reason = 'isolated restore session invalidation'
-  FROM (
-      SELECT p2.id
-        FROM openmettle.login_providers p2
-        JOIN LATERAL (
-            SELECT revision
-              FROM openmettle.login_provider_revisions lpr
-             WHERE lpr.provider_id = p2.id
-             ORDER BY lpr.epoch DESC
-             LIMIT 1
-        ) r ON r.revision IS NOT NULL
-  ) active
- WHERE p.id = active.id;
+-- ADR 0012: keep the identity sequence strictly ahead of any restored or owner-inserted rows.
+SELECT setval(
+    pg_get_serial_sequence('openmettle.login_provider_revisions', 'epoch'),
+    coalesce((SELECT max(epoch) FROM openmettle.login_provider_revisions), 1),
+    EXISTS (SELECT 1 FROM openmettle.login_provider_revisions)
+);
+
+DO $provider_epoch$
+DECLARE
+    rec RECORD;
+    new_epoch bigint;
+BEGIN
+    FOR rec IN
+        SELECT p.id AS provider_id,
+               r.revision AS latest_revision,
+               r.epoch AS prev_max_epoch
+          FROM openmettle.login_providers p
+          JOIN LATERAL (
+              SELECT lpr.epoch, lpr.revision
+                FROM openmettle.login_provider_revisions lpr
+               WHERE lpr.provider_id = p.id
+               ORDER BY lpr.epoch DESC
+               LIMIT 1
+          ) r ON true
+         WHERE r.revision IS NOT NULL
+         ORDER BY p.id
+    LOOP
+        INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+        VALUES (rec.provider_id, rec.latest_revision)
+        RETURNING epoch INTO STRICT new_epoch;
+
+        IF new_epoch <= rec.prev_max_epoch
+           OR EXISTS (
+               SELECT 1
+                 FROM openmettle.login_provider_revisions lpr
+                WHERE lpr.provider_id = rec.provider_id
+                  AND lpr.epoch > new_epoch
+           )
+        THEN
+            RAISE EXCEPTION 'login_provider_revisions epoch % did not advance past previous maximum % for provider %',
+                new_epoch, rec.prev_max_epoch, rec.provider_id
+                USING ERRCODE = '22023';
+        END IF;
+
+        UPDATE openmettle.login_providers
+           SET access_generation = access_generation + 1,
+               changed_at = clock_timestamp(),
+               changed_by = 'operator:<operator-uuid>',
+               change_reason = 'isolated restore session invalidation'
+         WHERE id = rec.provider_id;
+    END LOOP;
+END
+$provider_epoch$;
 COMMIT;
 ```
 
@@ -280,7 +315,8 @@ Bumping provider generation fences pre-restore cookies/bearers and pending login
 
 ### 5c. Verify and rotate credential vault keys (`ADR 0045`)
 
-With the target vault keyring staged read-only at `/etc/openmettle/vault-keys` and `OPENMETTLE_ADMIN_DATABASE_URL` set to the target `openmettle_owner` URL:
+- **Vault-disabled deployments (`vault.enabled: false` and `manifest.vault_required_key_ids` is `[]`):** skip staging `/etc/openmettle/vault-keys` and skip `vault rotate`; running `openmettle-admin vault status` with `OPENMETTLE_ADMIN_DATABASE_URL` set confirms `encrypted 0`. If `manifest.vault_required_key_ids` is non-empty, **stop** and switch to the vault-enabled path with every required key staged before proceeding.
+- **Vault-enabled deployments (`vault.enabled: true` or non-empty `manifest.vault_required_key_ids`):** with the target vault keyring staged read-only at `/etc/openmettle/vault-keys` and `OPENMETTLE_ADMIN_DATABASE_URL` set to the target `openmettle_owner` URL:
 
 ```sh
 openmettle-admin vault status
@@ -415,7 +451,7 @@ rm -rf /var/recovery/unpacked
 
 ## Step 6 — Start target workloads, verify invariants, and record RPO / RTO
 
-1. Install or upgrade `charts/openmettle-core` in the isolated target namespace with `storage.artifacts.existingClaim` bound to the reconciled target PVC (when storage is enabled), `vault.enabled: true` pointing at the target vault Secret, and `backup.suspend: true` (or `backup.enabled: false`).
+1. Install or upgrade `charts/openmettle-core` in the isolated target namespace preserving the source deployment's storage and vault settings (`storage.artifacts.existingClaim` bound to the reconciled target PVC when storage is enabled; `vault.enabled: true` pointing at `vault.existingSecret` when vault is enabled or required by `manifest.vault_required_key_ids`, or `vault.enabled: false` when vault is disabled and `manifest.vault_required_key_ids` is `[]`), and keeping `backup.suspend: true` (or `backup.enabled: false`).
 2. Wait for `Deployment/<release>-api`, `Deployment/<release>-worker`, and any configured `Deployment/<release>-gateway-*` to report Ready and `GET /readyz` -> `200`.
 3. Verify post-restore functional and security invariants before recording `recovery_completed_at` and signing off:
    - Pre-restore session cookies/tokens and post-backup disabled accounts return `401 unauthenticated`.
