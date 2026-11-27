@@ -56,10 +56,15 @@ GAP_OWNER_SECRET = "openmettle-owner-gap-database"
 TARGET_ARTIFACTS_CLAIM = "openmettle-target-artifacts"
 TARGET_RECOVERY_MEDIA_CLAIM = "openmettle-target-recovery-media"
 TARGET_RECOVERY_SCRATCH_CLAIM = "openmettle-target-recovery-scratch"
+TARGET_POST_RESTORE_EXPORT_CLAIM = "openmettle-target-post-restore-export"
 RECOVERY_MEDIA_DIR = "/var/backups/openmettle"
 RECOVERY_SCRATCH_DIR = "/var/recovery"
+POST_RESTORE_EXPORT_DIR = "/var/recovery-exports"
 UNPACKED_DIR = f"{RECOVERY_SCRATCH_DIR}/unpacked"
 RETAINED_JOURNAL_PATH = f"{RECOVERY_SCRATCH_DIR}/post-backup-journal.export"
+
+LOGIN_ADMISSION_LIMIT = 64
+PENDING_LOGIN_ID = "d" * 43
 
 VAULT_KEY_ID_1 = "vault-k1"
 VAULT_KEY_FILE_1 = "vault-k1.key"
@@ -212,6 +217,62 @@ def parse_journal_export_watermarks(text: str) -> dict:
         "required_seq": watermark_seq,
         "required_digest": watermark_digest,
     }
+
+
+def verify_persisted_post_restore_journal(
+    text: str,
+    *,
+    expected_origin_us: int,
+    min_seq: int,
+    lost_revision_ids: list[str] | tuple[str, ...],
+) -> dict:
+    """Verify a post-restore `deletion_journal` export read back from persistent storage against
+    `openmettle-core`'s `Export::parse` SHA-256 contract, expected installation `origin`,
+    advanced watermark `seq`, and declared `artifact_revision.lost` revision records."""
+    if "\r" in text:
+        raise DrillFailure("persisted post-restore journal export contains carriage returns")
+    idx = text.rfind("\nsha256 ")
+    if idx == -1:
+        raise DrillFailure("persisted post-restore journal export missing trailing sha256 checksum")
+    body = text[: idx + 1]
+    trailer = text[idx + 1 :]
+    expected_hex = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if trailer != f"sha256 {expected_hex}\n":
+        raise DrillFailure("persisted post-restore journal export sha256 checksum mismatch")
+
+    wm = parse_journal_export_watermarks(text)
+    if wm["origin_us"] != expected_origin_us:
+        raise DrillFailure(
+            f"persisted post-restore journal origin mismatch: got {wm['origin_us']}, expected {expected_origin_us}"
+        )
+    if lost_revision_ids and wm["required_seq"] <= min_seq:
+        raise DrillFailure(
+            f"persisted post-restore journal seq {wm['required_seq']} did not advance past {min_seq}"
+        )
+    if not lost_revision_ids and wm["required_seq"] < min_seq:
+        raise DrillFailure(
+            f"persisted post-restore journal seq {wm['required_seq']} regressed behind {min_seq}"
+        )
+
+    lost_revs: set[str] = set()
+    for raw in body.splitlines():
+        parts = raw.split()
+        if len(parts) == 11 and parts[0].isdigit() and parts[2] == "artifact_revision.lost":
+            if not (
+                smoke.UUID.fullmatch(parts[3])
+                and re.fullmatch(r"[0-9a-f]{64}", parts[7])
+                and re.fullmatch(r"[0-9a-f]{64}", parts[9])
+            ):
+                raise DrillFailure(f"malformed artifact_revision.lost record in post-restore export: {raw!r}")
+            lost_revs.add(parts[3])
+    for rev_id in lost_revision_ids:
+        if not smoke.UUID.fullmatch(rev_id):
+            raise DrillFailure(f"invalid expected lost revision UUID: {rev_id!r}")
+        if rev_id not in lost_revs:
+            raise DrillFailure(
+                f"persisted post-restore journal export missing artifact_revision.lost for {rev_id}"
+            )
+    return wm
 
 
 def should_pass_export_complete(
@@ -539,13 +600,16 @@ def pre_worker_owner_reconcile_sql(
     operator_id: str,
     *,
     disabled_principals: list[tuple[str, str]] | tuple[tuple[str, str], ...] = (),
+    expected_login_limit: int = LOGIN_ADMISSION_LIMIT,
 ) -> str:
     """Owner SQL for Runbook Steps 5a (ADR 0012 / 0013 sequence sync, monotonic epoch advance,
-    and session/provider invalidation), 5b (post-backup principal/approval revocations), and
-    5d.1 (two-statement run cancellation preserving `resolve_terminal_write_intents()` and
-    contiguous `runs.last_event_sequence` allocation)."""
+    and session/provider invalidation), 5b (post-backup principal/approval revocations and
+    ADR 0014 login_admission verification), and 5d.1 (two-statement run cancellation preserving
+    `resolve_terminal_write_intents()` and contiguous `runs.last_event_sequence` allocation)."""
     if not smoke.UUID.fullmatch(operator_id):
         raise DrillFailure(f"invalid operator UUID: {operator_id!r}")
+    if isinstance(expected_login_limit, bool) or not isinstance(expected_login_limit, int) or not (1 <= expected_login_limit <= 65536):
+        raise DrillFailure(f"invalid expected_login_limit: {expected_login_limit!r}")
     revocations_sql = ""
     for user_id, approval_id in disabled_principals:
         if not (smoke.UUID.fullmatch(user_id) and smoke.UUID.fullmatch(approval_id)):
@@ -574,7 +638,35 @@ SELECT setval(
 
 {provider_epoch_advance_block_sql(operator_id)}
 
-{revocations_sql}UPDATE openmettle.runs r
+{revocations_sql}DO $login_admission$
+DECLARE
+    lim integer;
+    outstanding bigint;
+BEGIN
+    SELECT outstanding_limit
+      INTO STRICT lim
+      FROM openmettle.login_admission
+     WHERE id
+       FOR SHARE;
+    IF lim IS DISTINCT FROM {expected_login_limit} THEN
+        RAISE EXCEPTION 'restored login_admission.outstanding_limit % does not match expected %',
+            lim, {expected_login_limit}
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT count(*)
+      INTO STRICT outstanding
+      FROM openmettle.login_transactions
+     WHERE NOT session_issued
+       AND expires_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint;
+    IF outstanding >= lim THEN
+        RAISE EXCEPTION 'restored login_admission has no available initiation capacity (% >= %)',
+            outstanding, lim
+            USING ERRCODE = '22023';
+    END IF;
+END
+$login_admission$;
+
+UPDATE openmettle.runs r
    SET state = 'cancelled',
        wait_reason = NULL,
        cancel_reason = coalesce(r.cancel_reason, 'revoked'),
@@ -1073,6 +1165,22 @@ INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, i
       FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}';
 """
     sql += f"""\
+UPDATE openmettle.login_admission
+    SET outstanding_limit = {LOGIN_ADMISSION_LIMIT},
+        changed_at = clock_timestamp(),
+        changed_by = 'operator:{DRILL_OPERATOR_ID}',
+        change_reason = 'synthetic restore drill login admission ceiling'
+  WHERE id;
+INSERT INTO openmettle.login_nonce_reservations (key_id, nonce)
+    VALUES ('drill-pending', substring(sha256(convert_to('{PENDING_LOGIN_ID}', 'UTF8')) FROM 1 FOR 12));
+INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
+        key_id, nonce, ciphertext, consumed, session_issued)
+    SELECT '{PENDING_LOGIN_ID}', decode('05', 'hex'), {exp},
+           sha256(convert_to('{PENDING_LOGIN_ID}:s', 'UTF8')),
+           sha256(convert_to('{PENDING_LOGIN_ID}:n', 'UTF8')),
+           sha256(convert_to('{PENDING_LOGIN_ID}:c', 'UTF8')),
+           key_id, nonce, decode(repeat('ab', 59), 'hex'), false, false
+      FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-pending';
 UPDATE openmettle.storage_instance
     SET instance_budget_bytes = {STORAGE_BUDGET_BYTES},
         personal_limit_bytes = {SCOPE_STORAGE_LIMIT_BYTES},
@@ -1449,7 +1557,12 @@ def isolation_and_config_manifests(
             "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "64Mi"}}},
         })
     else:
-        for claim_name in (TARGET_ARTIFACTS_CLAIM, TARGET_RECOVERY_MEDIA_CLAIM, TARGET_RECOVERY_SCRATCH_CLAIM):
+        for claim_name in (
+            TARGET_ARTIFACTS_CLAIM,
+            TARGET_RECOVERY_MEDIA_CLAIM,
+            TARGET_RECOVERY_SCRATCH_CLAIM,
+            TARGET_POST_RESTORE_EXPORT_CLAIM,
+        ):
             items.append({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": {"name": claim_name, "namespace": app_ns, "labels": labels},
@@ -3388,7 +3501,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]} for r in probe_results],
         )
 
-        return {"manifest": manifest_summary, "restore_run_id": restore_run_id}
+        return {"manifest": manifest_summary, "restore_run_id": restore_run_id, "pre_restore_journal_watermarks": watermarks}
 
     def verify_post_restore_state(
         self, primary_state: dict, recovery_meta: dict, recovery_started_at: datetime
@@ -3667,13 +3780,23 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
             f"    WHERE run_id = '{i_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens'),"
             f" (SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id = '{USER_A_IDS['provider']}'::uuid),"
-            f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid);",
+            f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid),"
+            " (SELECT coalesce(la.outstanding_limit::text, 'null') || ':' ||"
+            "         (SELECT count(*)::text FROM openmettle.login_transactions lt"
+            "           WHERE NOT lt.session_issued"
+            "             AND lt.expires_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) || ':' ||"
+            "         coalesce((la.outstanding_limit - ("
+            "             SELECT count(*) FROM openmettle.login_transactions lt"
+            "              WHERE NOT lt.session_issued"
+            "                AND lt.expires_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint"
+            "         ))::text, 'null')"
+            "    FROM openmettle.login_admission la WHERE la.id);",
         ).strip()
         expected_sql = (
             f"outcome_unknown:1|{target_mcp_url()}|{expected_family_state}|t|{expected_purge_after_us}|purged|t|t|0|f|"
             f"{w_expected_seq}:{w_expected_seq}:1:{w_expected_seq}|run-terminal:openmettle.run-cancelled|"
             f"{i_expected_seq}:{i_expected_seq}:1:{i_expected_seq}|unresolved-write:{i_op_id}|"
-            "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1"
+            f"run-terminal:openmettle.run-cancelled|released:0|held:25|101|1|{LOGIN_ADMISSION_LIMIT}:1:{LOGIN_ADMISSION_LIMIT - 1}"
         )
         self.expect(
             sql_checks == expected_sql,
@@ -3689,9 +3812,10 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         )
         self.expect(resurrected_check.returncode == 0, "purged artifact file resurrected on target PVC")
 
-        # Post-restore quota verify + journal export Job on live target.
+        # Post-restore quota verify + journal export Job persisted onto dedicated recovery PVC.
         admin_ref = self.report["images"]["admin"]["reference"]
         labels = {"openmettle.dev/environment": "dev", RUN_LABEL: self.run_id}
+        post_export_path = f"{POST_RESTORE_EXPORT_DIR}/post-restore-{recovery_meta['restore_run_id']}.export"
         post_verify_job = {
             "apiVersion": "batch/v1", "kind": "Job",
             "metadata": {"name": "openmettle-drill-post-verify", "namespace": TARGET_APP_NS, "labels": labels},
@@ -3706,19 +3830,18 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                             "name": "verify", "image": admin_ref, "imagePullPolicy": "Never",
                             "command": ["/bin/sh", "-eu", "-c",
                                         f'openmettle-admin quota verify "{smoke.ARTIFACTS_MOUNT_PATH}"\n'
-                                        "openmettle-admin journal export /tmp/post-restore.export\n"
-                                        'grep -q "artifact_revision.lost" /tmp/post-restore.export\n'],
+                                        f'openmettle-admin journal export "{post_export_path}"\n'],
                             "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
                                      "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH, "readOnly": True},
-                                {"name": "tmp", "mountPath": "/tmp"},
+                                {"name": "post-exports", "mountPath": POST_RESTORE_EXPORT_DIR},
                             ],
                         }],
                         "volumes": [
                             {"name": "artifacts", "persistentVolumeClaim": {"claimName": TARGET_ARTIFACTS_CLAIM}},
-                            {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Mi"}},
+                            {"name": "post-exports", "persistentVolumeClaim": {"claimName": TARGET_POST_RESTORE_EXPORT_CLAIM}},
                         ],
                     },
                 },
@@ -3726,6 +3849,42 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         }
         pv_out, _ = self.run_job(TARGET_APP_NS, post_verify_job)
         quota_post = parse_quota_verify_zero(pv_out)
+
+        # Read back the persisted post-restore journal export in a separate Job AFTER
+        # `openmettle-drill-post-verify` has exited and been deleted, and verify SHA-256 + `artifact_revision.lost`.
+        read_post_export_job = {
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "openmettle-drill-read-post-export", "namespace": TARGET_APP_NS, "labels": labels},
+            "spec": {
+                "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                        "securityContext": POD_SEC_CONTEXT,
+                        "containers": [{
+                            "name": "read-export", "image": admin_ref, "imagePullPolicy": "Never",
+                            "command": ["cat", post_export_path],
+                            "securityContext": CONTAINER_SEC_CONTEXT,
+                            "volumeMounts": [
+                                {"name": "post-exports", "mountPath": POST_RESTORE_EXPORT_DIR, "readOnly": True},
+                            ],
+                        }],
+                        "volumes": [
+                            {"name": "post-exports", "persistentVolumeClaim": {"claimName": TARGET_POST_RESTORE_EXPORT_CLAIM, "readOnly": True}},
+                        ],
+                    },
+                },
+            },
+        }
+        persisted_export_text, _ = self.run_job(TARGET_APP_NS, read_post_export_job)
+        pre_wm = recovery_meta["pre_restore_journal_watermarks"]
+        verify_persisted_post_restore_journal(
+            persisted_export_text,
+            expected_origin_us=pre_wm["origin_us"],
+            min_seq=pre_wm["required_seq"],
+            lost_revision_ids=[primary_state["art_to_lose"]["revision_id"]],
+        )
 
         # Confirm primary environment remained completely untouched (rev_to_lose still active & 200 on primary).
         fwd_pri = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=PRIMARY_APP_NS)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+import hashlib
 import io
 import json
 import os
@@ -177,6 +178,44 @@ class JournalAndRebindParserTest(unittest.TestCase):
             restore_drill.verify_trailing_epoch_probe_failure(
                 1,
                 "error: unable to upgrade connection: container not found",
+            )
+
+    def test_verify_persisted_post_restore_journal_checks_sha256_watermark_and_lost_records(self):
+        rev_lost = "99999999-9999-4999-8999-999999999995"
+        scope_id = "22222222-2222-4222-8222-222222222222"
+        body = (
+            "openmettle.deletion_journal.export/1\n"
+            "origin 1795450000000000\n"
+            f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - - {DIGEST_A} - {DIGEST_B} -\n"
+            f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
+        )
+        valid = body + f"sha256 {hashlib.sha256(body.encode('utf-8')).hexdigest()}\n"
+        wm = restore_drill.verify_persisted_post_restore_journal(
+            valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+        )
+        self.assertEqual(wm["required_seq"], 6)
+
+        tampered = valid.replace(rev_lost, "99999999-9999-4999-8999-999999999999")
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                tampered, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        other_body = (
+            "openmettle.deletion_journal.export/1\n"
+            "origin 1795450000000000\n"
+            f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999999 {scope_id} - - {DIGEST_A} - {DIGEST_B} -\n"
+            f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
+        )
+        other_valid = other_body + f"sha256 {hashlib.sha256(other_body.encode('utf-8')).hexdigest()}\n"
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "missing artifact_revision.lost"):
+            restore_drill.verify_persisted_post_restore_journal(
+                other_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "did not advance past 6"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid, expected_origin_us=1795450000000000, min_seq=6, lost_revision_ids=[rev_lost]
             )
 
 
@@ -751,9 +790,26 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("access_generation = access_generation + 1", owner_sql)
         self.assertNotIn("quota_release_terminal_runs", owner_sql)
         self.assertIn("SELECT 'cancelled_runs=' || count(*)", owner_sql)
+        self.assertIn("DO $login_admission$", owner_sql)
+        self.assertIn("$login_admission$;", owner_sql)
+        self.assertIn("FROM openmettle.login_admission", owner_sql)
+        self.assertIn("WHERE NOT session_issued", owner_sql)
         self.assertIn("DO $restore$", owner_sql)
         self.assertIn("$restore$;", owner_sql)
         self.assertNotIn("$$", owner_sql)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "expected_login_limit"):
+            restore_drill.pre_worker_owner_reconcile_sql(
+                restore_drill.DRILL_OPERATOR_ID, expected_login_limit=0
+            )
+
+        seed_sql = restore_drill.seed_users_sql(
+            ("A" * 43, "B" * 43, "a" * 64),
+            ("C" * 43, "D" * 43, "b" * 64),
+            ("E" * 43, "F" * 43, "c" * 64),
+            ("G" * 43, "H" * 43, "d" * 64),
+        )
+        self.assertIn(f"outstanding_limit = {restore_drill.LOGIN_ADMISSION_LIMIT}", seed_sql)
+        self.assertIn("decode(repeat('ab', 59), 'hex'), false, false", seed_sql)
 
         worker_sql = restore_drill.worker_quota_release_sql()
         self.assertIn("openmettle.quota_release_terminal_runs", worker_sql)
@@ -889,7 +945,13 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
             self.assertNotIn(forbidden, step5b)
         self.assertIn("restored-audit-ids.txt", step5b)
         self.assertIn("Fail closed", step5b)
+        self.assertIn("openmettle.login_admission", step5b)
+        self.assertIn("NOT lt.session_issued", step5b)
+        self.assertNotIn("/tmp/post-restore.export", runbook)
         self.assertIn("details->>'restore_run_id' = '<RESTORE_RUN_UUID>'", step6)
+        self.assertIn("openmettle.login_admission.outstanding_limit", step6)
+        self.assertIn("post-restore-$RESTORE_RUN_UUID.export", step6)
+        self.assertIn("artifact_revision.lost", step6)
 
         m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
         self.assertIsNotNone(m_sh)
@@ -1195,6 +1257,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.applied_manifests: list[dict] = []
         self.live_objects: set[tuple[str, str, str]] = set()
         self.media_lifecycle: list[str] = []
+        self.post_export_lifecycle: list[str] = []
         self.target_settlement_events: list[str] = []
         self.fail_on_target_migrate = False
         self.job_failed_on_pre_worker_sql = False
@@ -1321,6 +1384,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     self._last_job = doc["metadata"]["name"]
                     if self._last_job == "openmettle-drill-reconcile-admin":
                         self.media_lifecycle.append("applied-reconcile-admin")
+                    if self._last_job == "openmettle-drill-read-post-export":
+                        self.post_export_lifecycle.append("applied-read-post-export")
                     if self.fail_on_target_migrate and self._last_job == "openmettle-drill-migrate":
                         return self._res(1, "", f"fatal migrate error password={self._leak_secret}")
                 self._record_applied(doc)
@@ -1347,6 +1412,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                         self.live_objects.remove(key)
                         if res_kind == "pvc" and obj_name == restore_drill.TARGET_RECOVERY_MEDIA_CLAIM:
                             self.media_lifecycle.append("deleted-media-pvc")
+                        if res_kind == "job" and obj_name == "openmettle-drill-post-verify":
+                            self.post_export_lifecycle.append("deleted-post-verify-job")
                 return self._res(0, "")
             if "get" in argv and "job" in argv and argv[-1] == "--output=json":
                 job_name = argv[argv.index("job") + 1]
@@ -1488,6 +1555,14 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             )
         if name == "openmettle-drill-post-verify":
             return self._res(0, qv)
+        if name == "openmettle-drill-read-post-export":
+            export_body = (
+                "openmettle.deletion_journal.export/1\n"
+                "origin 1795450000000000\n"
+                f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999995 22222222-2222-4222-8222-222222222222 - - {DIGEST_A} - {DIGEST_B} -\n"
+                f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
+            )
+            return self._res(0, export_body + f"sha256 {hashlib.sha256(export_body.encode('utf-8')).hexdigest()}\n")
         return self._res(0, "")
 
     def _exec_handler(self, argv: list[str], stdin_text: str | None):
@@ -1563,6 +1638,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 import re as _re
                 self.assertIn("fp.override_group_schedules::text", stdin_text)
                 self.assertIn("details->>'restore_run_id'", stdin_text)
+                self.assertIn("FROM openmettle.login_admission", stdin_text)
                 pre_job = next(
                     d for d in self.applied_manifests
                     if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-primary-family-pre"
@@ -1577,7 +1653,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     f"outcome_unknown:1|{restore_drill.target_mcp_url()}|Europe/London:{q_start}:{q_end}:960:1080:true:2|t|1800000000000000|purged|t|t|0|f|"
                     "5:5:1:5|run-terminal:openmettle.run-cancelled|"
                     "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
-                    "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1\n",
+                    "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1|64:1:63\n",
                 )
             if "SELECT state FROM openmettle.artifact_revisions" in stdin_text:
                 return self._res(0, "purged\n")
@@ -1882,8 +1958,29 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertIn("unresolved_deletion_coverage_gap", runbook)
         self.assertIn("openmettle-admin family set-model", runbook)
         self.assertIn("openmettle-admin quota verify /var/lib/openmettle/artifacts", runbook)
-        self.assertIn("openmettle-admin journal export /tmp/post-restore.export", runbook)
+        self.assertNotIn("/tmp/post-restore.export", runbook)
+        self.assertIn('openmettle-admin journal export "/var/backups/openmettle/post-restore-$RESTORE_RUN_UUID.export"', runbook)
         self.assertIn('[ ! -r "$cand" ]', runbook)
+        self.assertEqual(self.post_export_lifecycle, ["deleted-post-verify-job", "applied-read-post-export"])
+        post_verify_job = next(
+            d for d in self.applied_manifests
+            if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-post-verify"
+        )
+        post_verify_pod = post_verify_job["spec"]["template"]["spec"]
+        self.assertIn(restore_drill.POST_RESTORE_EXPORT_DIR, post_verify_pod["containers"][0]["command"][-1])
+        self.assertNotIn("/tmp", post_verify_pod["containers"][0]["command"][-1])
+        read_export_job = next(
+            d for d in self.applied_manifests
+            if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-read-post-export"
+        )
+        read_export_pod = read_export_job["spec"]["template"]["spec"]
+        self.assertNotIn("env", read_export_pod["containers"][0])
+        self.assertTrue(read_export_pod["containers"][0]["volumeMounts"][0]["readOnly"])
+        self.assertTrue(read_export_pod["volumes"][0]["persistentVolumeClaim"]["readOnly"])
+        self.assertEqual(
+            read_export_pod["volumes"][0]["persistentVolumeClaim"]["claimName"],
+            restore_drill.TARGET_POST_RESTORE_EXPORT_CLAIM,
+        )
         # Verify uncertified coverage-gap scenario was also exercised:
         check_names = [c["name"] for c in summary["checks"]]
         self.assertTrue(any("coverage-gap" in n for n in check_names))
