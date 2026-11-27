@@ -36,7 +36,7 @@
     "database": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["api", "worker", "migrate", "issuance"],
+      "required": ["api", "worker", "migrate"],
       "properties": {
         "api": {"$ref": "#/$defs/secretKeyRef"},
         "worker": {"$ref": "#/$defs/secretKeyRef"},
@@ -452,7 +452,14 @@
   "allOf": [
     {
       "if": {"properties": {"auth": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}, "required": ["auth"]},
-      "then": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"minLength": 1}}}}}}},
+      "then": {
+        "properties": {
+          "database": {
+            "required": ["issuance"],
+            "properties": {"issuance": {"properties": {"existingSecret": {"minLength": 1}}}}
+          }
+        }
+      },
       "else": {"properties": {"database": {"properties": {"issuance": {"properties": {"existingSecret": {"const": ""}}}}}}}
     },
     {

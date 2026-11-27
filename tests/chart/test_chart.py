@@ -3143,23 +3143,36 @@ class BackupCronJobTest(Rendered):
         self.assertEqual(len(names), 4)
 
     def test_reuse_values_from_pre_vault_backup_release_renders_cleanly(self):
-        """Fails if helm upgrade --reuse-values from a pre-vault/backup release (lacking database.backup, vault, backup, worker.mcp, images.admin/postgresClient) fails schema or template guards."""
-        unset_new_defaults = [
+        """Fails if helm upgrade --reuse-values from an older release omitting optional database/image/feature sections fails schema or template guards."""
+        common_optional = [
+            "images.gateway=null",
             "images.admin=null",
             "images.postgresClient=null",
+            "database.gateway=null",
             "database.backup=null",
+            "worker.inference=null",
             "worker.mcp=null",
-            "networkPolicy.worker.mcp=null",
+            "networkPolicy.worker=null",
+            "gateways=null",
             "vault=null",
             "backup=null",
         ]
-        for overlays in ((), ("auth-enabled.yaml",)):
+        cases = (
+            ((), [*common_optional, "database.issuance=null"]),
+            (("auth-enabled.yaml",), common_optional),
+        )
+        for overlays, unset_optional in cases:
             for extra in ((), (SKIP,)):
                 with self.subTest(overlays=overlays, extra=extra):
-                    res = helm_template(overlays, unset_new_defaults, extra=extra)
+                    res = helm_template(overlays, unset_optional, extra=extra)
                     self.assertEqual(res.returncode, 0, res.stderr)
                     docs = [d for d in yaml.safe_load_all(res.stdout) if d]
                     self.assertEqual(docs, render(overlays))
+        for extra in ((), (SKIP,)):
+            with self.subTest(auth_enabled_missing_issuance=True, extra=extra):
+                res = helm_template(("auth-enabled.yaml",), ["database.issuance=null"], extra=extra)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("issuance", res.stderr)
 
     def test_rendered_keyring_staging_scripts_enforce_referenced_and_non_dot_keys(self):
         """Executes rendered stage-vault-keys and prepare-backup-runtime scripts against valid, missing and dot-prefixed keys."""

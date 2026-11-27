@@ -1425,11 +1425,11 @@ Session issuance (core ADR 0030): sign-in requires a second, API-only database c
 login role of openmettle_issuance. Reusing another component's Secret key would hand the API the
 same login role twice (core exits 78) or mount a role's credential where it does not belong.
 */ -}}
-{{- $issuance := .Values.database.issuance -}}
-{{- if not $issuance.existingSecret -}}
+{{- $issuance := default dict .Values.database.issuance -}}
+{{- if not (get $issuance "existingSecret") -}}
 {{- fail "database.issuance.existingSecret is required when auth.enabled is true (an existing Secret holding the openmettle_issuance PostgreSQL URL; core ADR 0030)" -}}
 {{- end -}}
-{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $issuance.key)) -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (toString (index $issuance "key"))) -}}
 {{- fail "database.issuance.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
 {{- end -}}
 {{- $issuanceDbRoles := list "api" "worker" "migrate" -}}
@@ -1438,13 +1438,14 @@ same login role twice (core exits 78) or mount a role's credential where it does
 {{- end -}}
 {{- range $role := $issuanceDbRoles -}}
 {{- $ref := index $.Values.database $role -}}
-{{- if and (eq (toString $issuance.existingSecret) (toString $ref.existingSecret)) (eq (toString $issuance.key) (toString $ref.key)) -}}
+{{- if and (eq (toString (get $issuance "existingSecret")) (toString $ref.existingSecret)) (eq (toString (index $issuance "key")) (toString $ref.key)) -}}
 {{- fail (printf "database.issuance must not reuse database.%s (Secret %q, key %q); session issuance needs its own openmettle_issuance login (core ADR 0030)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
 {{- end -}}
 {{- end -}}
 {{- include "openmettle-core.validate.intRange" (dict "field" "api.settings.issuanceDbMaxConnections" "value" .Values.api.settings.issuanceDbMaxConnections "min" 1 "max" 64 "includeValueOnTypeError" true) -}}
 {{- else -}}
-{{- if .Values.database.issuance.existingSecret -}}
+{{- $issuance := default dict .Values.database.issuance -}}
+{{- if get $issuance "existingSecret" -}}
 {{- fail "database.issuance.existingSecret must be empty when auth.enabled is false; the issuance URL is mounted only with sign-in (core ADR 0030)" -}}
 {{- end -}}
 {{- if $auth.catalogKey -}}
