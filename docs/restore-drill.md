@@ -125,7 +125,7 @@ pg_restore \
 
   3. **Fail restore validation while any deletion gap remains unresolved:** per `ARCHITECTURE-v1.md`, records never captured cannot be reconstructed, so any unresolved deletion/revocation coverage gap **MUST be recorded as a failed restore validation (`unresolved_deletion_coverage_gap`)** rather than signing off clean `V1-31` / `V1-33` qualification.
 
-Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`), lock the gate, and record the printed `restore_run <RESTORE_RUN_UUID>` (also used in Step 5e):
+Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`), lock the gate, and record the printed `restore_run <RESTORE_RUN_UUID>` (used across Steps 5b, 5c, 5e, and 6):
 
 ```sh
 # OPENMETTLE_ADMIN_DATABASE_URL bound via secretKeyRef {name: database.migrate.existingSecret, key: database.migrate.key}.
@@ -381,46 +381,74 @@ Deploy the target release with freshly generated 32-byte `active.key` and `curso
 Bumping provider generation fences pre-restore cookies/bearers and pending logins, **not** fresh sign-ins by accounts whose authority was reduced after the backup. Before reopening authentication (`auth.enabled: true` / ingress):
 
 - Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), family-policy schedules and model rules (`openmettle.family_policies`, `openmettle.family_policy_models` `rule_kind IN ('disabled', 'study_allow')`, audited under `family_policy.*` in `openmettle.authorization_audit`, `ADR 0044`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records.
-  - Capture `RESTORED_MAX_AUDIT_ID` on the restored target database (`SELECT COALESCE(MAX(id), 0) FROM openmettle.authorization_audit;`) before reconciliation, then replay post-backup `family_policy.*` rows from the primary `openmettle.authorization_audit` export (`WHERE id > $RESTORED_MAX_AUDIT_ID AND target_kind = 'family_policy' ORDER BY id ASC`) **in ascending `id` (`$AUDIT_ROW_ID`) order**, binding `"$AUDIT_ROW_ID"` into each SHA-256 `--request-key` input and selecting `--user`, `--local-group`, or `--oidc-group` per `details->>'grantee_kind'`.
-  - Why chronological audit replay with `$AUDIT_ROW_ID`: `openmettle-admin family` rejects no-op writes (`UNCHANGED`), requires a `family_policies` row to exist before `set-model`, and treats identical `(operator_id, request_key)` pairs as idempotent replays. Replaying each audited transition in `id` order applies toggles that return to the backup state (`disable -> enable` or schedule revert), multi-step toggles (`disable -> enable -> disable`), and post-backup `set-policy -> set-model -> clear-policy` sequences without `UNCHANGED` or missing-policy errors, preserves restored schedules untouched when only model rules changed post-backup, and remains idempotent if the recovery script is re-run. When emitting `family set-policy`, supply `--zone` plus `--quiet`, `--study`, and `--override-group-schedules` whenever set in `authorization_audit.details`.
-  - Always derive `--request-key` from a fixed-width SHA-256 hash (`restore-fp-$RESTORE_RUN_UUID-<hash>` / `restore-fm-$RESTORE_RUN_UUID-<hash>`, 112 bytes <= the CLI's 128-byte limit) so valid model identifiers up to 256 UTF-8 bytes remain recoverable:
+  - `openmettle.authorization_audit.id` is a random `uuid DEFAULT gen_random_uuid()` (never monotonic). Immediately after Step 3 (`pg_restore` + `openmettle-migrate`, before target operator commands append new target audit rows), capture the restored snapshot's existing audit UUID set (`psql ... -Atc 'SELECT id FROM openmettle.authorization_audit ORDER BY id;' > /var/recovery/restored-audit-ids.txt`) and identify post-backup `family_policy.*` rows in the surviving primary `openmettle.authorization_audit` export by **UUID set-difference** (`target_kind = 'family_policy'` whose `id` is absent from `/var/recovery/restored-audit-ids.txt`; never use numeric watermarks or compare/sort random `id` UUIDs).
+  - Order each grantee's post-backup `family_policy.*` transitions solely from **independently verified event order** (such as strictly increasing `occurred_at` corroborated against structured primary/off-host audit logs, operator change records, or surviving primary `openmettle.family_policies` / `openmettle.family_policy_models` state). **Fail closed on ordering ambiguity:** if post-backup `family_policy.*` rows exist and their chronological order cannot be established unambiguously (for instance, tied or clock-stepped `occurred_at` timestamps without an ordered external audit log or surviving primary current state to disambiguate), **do not guess an order — keep authentication and inference closed (`auth.enabled: false` / ingress blocked)** until an operator audits and explicitly re-establishes the grantee's policy and model restrictions.
+  - Replay each ordered post-backup row with `$AUDIT_ROW_UUID` (`id`) bound into the SHA-256 `--request-key` input (`restore-fp-$RESTORE_RUN_UUID-<hash>` / `restore-fm-$RESTORE_RUN_UUID-<hash>`, 112 bytes <= the CLI's 128-byte limit, keeping valid model names up to 256 UTF-8 bytes recoverable while preventing `UNCHANGED` errors on toggles back to backup state, preventing `NotFound` errors on `set-policy -> set-model -> clear-policy`, preserving existing restored schedules when only model rules changed post-backup, and keeping script retries idempotent):
 
   ```sh
-  # Example 1: family_policy.model_disable / model_enable row ($AUDIT_ROW_ID from authorization_audit):
-  # Runs set-model directly so an already-restored policy's quiet/study/override schedule stays intact:
-  fm_hash="$(printf '%s\0%s\0%s\0disabled\0%s\01' "$RESTORE_RUN_UUID" "$AUDIT_ROW_ID" "$RESTRICTED_USER_UUID" "$DISABLED_MODEL" | sha256sum)"
-  fm_key="restore-fm-$RESTORE_RUN_UUID-${fm_hash%% *}"
-  openmettle-admin family set-model \
-    --user "$RESTRICTED_USER_UUID" \
-    --kind disabled \
-    --model "$DISABLED_MODEL" \
-    --enable \
-    --operator-id "$OPERATOR_UUID" \
-    --request-key "$fm_key" \
-    --reason "reconcile post-backup disabled model rule before reopening inference"
+  set -eu
+  # Replay one independently ordered post-backup family_policy.* row (`$AUDIT_ROW_UUID`).
+  # Map details->>'grantee_kind' / details->>'grantee_id' and validate event fields fail-closed:
+  case "$GRANTEE_KIND" in
+    user) GRANTEE_FLAG="--user" ;;
+    local_group) GRANTEE_FLAG="--local-group" ;;
+    oidc_group) GRANTEE_FLAG="--oidc-group" ;;
+    *) echo "unknown grantee_kind: $GRANTEE_KIND" >&2; exit 1 ;;
+  esac
 
-  # Example 2: family_policy.set row ($AUDIT_ROW_ID; omit --quiet/--study/--override-group-schedules
-  # whenever those fields were unset in authorization_audit.details):
-  fp_hash="$(printf '%s\0%s\0%s\0set\0%s\0%s\0%s\0%s' "$RESTORE_RUN_UUID" "$AUDIT_ROW_ID" "$RESTRICTED_USER_UUID" "$POLICY_TZ" "${QUIET_WINDOW:-}" "${STUDY_WINDOW:-}" "${OVERRIDE_FLAG:-0}" | sha256sum)"
-  fp_key="restore-fp-$RESTORE_RUN_UUID-${fp_hash%% *}"
-  openmettle-admin family set-policy \
-    --user "$RESTRICTED_USER_UUID" \
-    --zone "$POLICY_TZ" \
-    --quiet "$QUIET_WINDOW" \
-    --study "$STUDY_WINDOW" \
-    --override-group-schedules \
-    --operator-id "$OPERATOR_UUID" \
-    --request-key "$fp_key" \
-    --reason "reconcile post-backup family policy before reopening inference"
-
-  # Example 3: family_policy.clear row ($AUDIT_ROW_ID; runs after any prior set-policy/set-model rows):
-  fp_clear_hash="$(printf '%s\0%s\0%s\0clear' "$RESTORE_RUN_UUID" "$AUDIT_ROW_ID" "$RESTRICTED_USER_UUID" | sha256sum)"
-  fp_clear_key="restore-fp-$RESTORE_RUN_UUID-${fp_clear_hash%% *}"
-  openmettle-admin family clear-policy \
-    --user "$RESTRICTED_USER_UUID" \
-    --operator-id "$OPERATOR_UUID" \
-    --request-key "$fp_clear_key" \
-    --reason "reconcile post-backup family policy clearance before reopening inference"
+  case "$ACTION" in
+    family_policy.model_disable|family_policy.model_enable|family_policy.model_study_allow|family_policy.model_study_revoke)
+      case "${RULE_KIND:-}" in
+        disabled|study_allow) ;;
+        *) echo "invalid details.rule_kind: ${RULE_KIND:-}" >&2; exit 1 ;;
+      esac
+      case "${RULE_ACTIVE:-}" in
+        true)  STATE_BIT="1"; MODEL_FLAG="--enable" ;;
+        false) STATE_BIT="0"; MODEL_FLAG="--disable" ;;
+        *) echo "invalid details.active: ${RULE_ACTIVE:-}" >&2; exit 1 ;;
+      esac
+      fm_hash="$(printf '%s\0%s\0%s\0%s\0%s\0%s' "$RESTORE_RUN_UUID" "$AUDIT_ROW_UUID" "$GRANTEE_ID" "$RULE_KIND" "$MODEL_NAME" "$STATE_BIT" | sha256sum)"
+      fm_key="restore-fm-$RESTORE_RUN_UUID-${fm_hash%% *}"
+      openmettle-admin family set-model \
+        "$GRANTEE_FLAG" "$GRANTEE_ID" \
+        --kind "$RULE_KIND" \
+        --model "$MODEL_NAME" \
+        "$MODEL_FLAG" \
+        --operator-id "$OPERATOR_UUID" \
+        --request-key "$fm_key" \
+        --reason "reconcile post-backup family model rule before reopening inference"
+      ;;
+    family_policy.set)
+      case "${OVERRIDE_SCHEDULES:-false}" in
+        true)  OVERRIDE_BIT="1" ;;
+        false) OVERRIDE_BIT="0" ;;
+        *) echo "invalid details.override_group_schedules: ${OVERRIDE_SCHEDULES:-}" >&2; exit 1 ;;
+      esac
+      fp_hash="$(printf '%s\0%s\0%s\0set\0%s\0%s\0%s\0%s' "$RESTORE_RUN_UUID" "$AUDIT_ROW_UUID" "$GRANTEE_ID" "$POLICY_TZ" "${QUIET_WINDOW:-}" "${STUDY_WINDOW:-}" "$OVERRIDE_BIT" | sha256sum)"
+      fp_key="restore-fp-$RESTORE_RUN_UUID-${fp_hash%% *}"
+      set -- openmettle-admin family set-policy "$GRANTEE_FLAG" "$GRANTEE_ID" --zone "$POLICY_TZ"
+      if [ -n "${QUIET_WINDOW:-}" ]; then set -- "$@" --quiet "$QUIET_WINDOW"; fi
+      if [ -n "${STUDY_WINDOW:-}" ]; then set -- "$@" --study "$STUDY_WINDOW"; fi
+      if [ "$OVERRIDE_BIT" = "1" ]; then set -- "$@" --override-group-schedules; fi
+      "$@" \
+        --operator-id "$OPERATOR_UUID" \
+        --request-key "$fp_key" \
+        --reason "reconcile post-backup family policy before reopening inference"
+      ;;
+    family_policy.clear)
+      fp_clear_hash="$(printf '%s\0%s\0%s\0clear' "$RESTORE_RUN_UUID" "$AUDIT_ROW_UUID" "$GRANTEE_ID" | sha256sum)"
+      fp_clear_key="restore-fp-$RESTORE_RUN_UUID-${fp_clear_hash%% *}"
+      openmettle-admin family clear-policy \
+        "$GRANTEE_FLAG" "$GRANTEE_ID" \
+        --operator-id "$OPERATOR_UUID" \
+        --request-key "$fp_clear_key" \
+        --reason "reconcile post-backup family policy clearance before reopening inference"
+      ;;
+    *)
+      echo "unexpected family_policy action: $ACTION" >&2
+      exit 1
+      ;;
+  esac
   ```
 
 - **Fail-closed rule:** if post-backup identity, capability, or family-policy model restriction evidence is unavailable, **keep authentication and inference closed** (`auth.enabled: false` / ingress blocked) until an operator audits and re-approves principals, grants, and model policies, so a disabled user or model cannot regain access after restore.
@@ -573,7 +601,7 @@ rm -rf /var/recovery/unpacked
    - Retained revisions keep their exact pre-backup `purge_after` deadline (not reset from wall-clock restore time).
    - Models disabled post-backup under family policy (`openmettle.family_policy_models`) return `403` (`code: "policy"`) on `POST /v1/runs` for newly authenticated affected users.
    - Parked `waiting` runs from the snapshot report `state: "cancelled"` with contiguous `run_events` sequences, `POST /v1/runs/{run_id}/approvals/{approval_id}/decision` (`{"decision": "approve", ...}`) returns `409 conflict`, and revision-`0` write intents report `outcome = 'outcome_unknown'` (`revision = 1`) with held reservations preserved and zero unsolicited external/gateway calls on worker startup.
-   - Confirm clean deletion-journal coverage (`SELECT coverage_complete FROM openmettle.restore_reconciliation_gate;` and `0` `restore.accept_coverage_gap` rows in `openmettle.authorization_audit` for a certified `--export-complete` run). If break-glass `restore accept-coverage-gap` was used and any deletion/revocation window remains unresolved, record the validation result as **failed** (`unresolved_deletion_coverage_gap`) and retain explicit owner break-glass sign-off rather than signing off clean `V1-31` / `V1-33` qualification.
+   - Confirm clean deletion-journal coverage for this restore run (`SELECT coverage_complete FROM openmettle.restore_reconciliation_gate;` is `true`, and `SELECT count(*) FROM openmettle.authorization_audit WHERE actor_kind = 'operator' AND action = 'restore.accept_coverage_gap' AND target_kind = 'restore_gate' AND target_id = 'instance' AND details->>'restore_run_id' = '<RESTORE_RUN_UUID>';` returns `0` — scoping to Step 4a's `RESTORE_RUN_UUID` so historical break-glass audit rows carried forward in `pg.dump` from an earlier recovery do not fail a later certified `--export-complete` restore). If break-glass `restore accept-coverage-gap` was used and any deletion/revocation window remains unresolved, record the validation result as **failed** (`unresolved_deletion_coverage_gap`) and retain explicit owner break-glass sign-off rather than signing off clean `V1-31` / `V1-33` qualification.
    - `openmettle-admin quota verify /var/lib/openmettle/artifacts` on deployments with a pinned artifact volume (or `openmettle-admin quota verify` without a root argument on storage-disabled deployments where `manifest.artifact_volume.volume_id` is `null`) exits `0` with all seven mismatch counters equal to `0`, and `openmettle-admin journal export /tmp/post-restore.export` succeeds on the restored database.
 4. Record `recovery_completed_at` after the final verification check above and archive the drill metrics:
    - `restored_data_age_seconds = drill_cutover_at - manifest.quiesced_at` (must be `<= 86,400 s` for the 24h RPO target).

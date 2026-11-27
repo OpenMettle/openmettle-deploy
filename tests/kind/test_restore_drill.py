@@ -637,28 +637,63 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
             self.assertEqual(pol5[uid]["zone"], "Europe/London")
             self.assertTrue(mod5[(uid, "disabled", "a")])
 
-        # Boundary tests: valid model names of 31, 32, and 256 UTF-8 bytes (and spaces/quotes) MUST
-        # stay <= 128 bytes for --request-key, remain deterministic per (run, seq, user, kind, model, bit),
-        # and safely round-trip through shlex.split.
-        for model_name in ("m" * 31, "m" * 32, "m" * 256, " padded'model "):
-            cmd_line = restore_drill.build_family_policy_reconcile_lines(
-                restore_drill.DRILL_OPERATOR_ID,
-                run_id,
-                [{"user_id": uid, "policy": None, "models": [("disabled", model_name, True)]}],
+        # Boundary tests: valid model names of 31, 32, and 256 UTF-8 bytes, spaces/quotes, and `$`
+        # sequences (`price$$tier`, `$(OPENMETTLE_ADMIN_DATABASE_URL)`) MUST stay <= 128 bytes for
+        # --request-key, remain deterministic per (run, seq, user, kind, model, bit), survive both
+        # kubelet command expansion and `/bin/sh` execution unchanged, and round-trip via shlex.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            captured_args = tmp_path / "captured.argv"
+            admin_stub = bin_dir / "openmettle-admin"
+            admin_stub.write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\0" "$@" > "{captured_args}"\n',
+                encoding="utf-8",
             )
-            tokens = shlex.split(cmd_line.strip())
-            self.assertEqual(tokens[tokens.index("--model") + 1], model_name)
-            rkey = tokens[tokens.index("--request-key") + 1]
-            self.assertLessEqual(len(rkey.encode("utf-8")), 128)
-            self.assertRegex(rkey, _re.compile(r"^restore-fm-" + _re.escape(run_id) + r"-[0-9a-f]{32}$"))
-            self.assertEqual(
-                cmd_line,
-                restore_drill.build_family_policy_reconcile_lines(
+            admin_stub.chmod(0o755)
+            stub_env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+            for model_name in (
+                "m" * 31,
+                "m" * 32,
+                "m" * 256,
+                "$" * 256,
+                " padded'model ",
+                "price$$tier",
+                "$$$",
+                "$(OPENMETTLE_ADMIN_DATABASE_URL)",
+                "$'$$'$(OPENMETTLE_ADMIN_DATABASE_URL)",
+            ):
+                cmd_line = restore_drill.build_family_policy_reconcile_lines(
                     restore_drill.DRILL_OPERATOR_ID,
                     run_id,
                     [{"user_id": uid, "policy": None, "models": [("disabled", model_name, True)]}],
-                ),
-            )
+                )
+                expanded = k8s_expand(cmd_line, {"OPENMETTLE_ADMIN_DATABASE_URL"})
+                self.assertEqual(expanded, cmd_line)
+                tokens = shlex.split(expanded.strip())
+                self.assertEqual(tokens[tokens.index("--model") + 1], model_name)
+                rkey = tokens[tokens.index("--request-key") + 1]
+                self.assertLessEqual(len(rkey.encode("utf-8")), 128)
+                self.assertRegex(rkey, _re.compile(r"^restore-fm-" + _re.escape(run_id) + r"-[0-9a-f]{32}$"))
+                sh_res = subprocess.run(
+                    ["/bin/sh", "-eu", "-c", expanded],
+                    env=stub_env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(sh_res.returncode, 0, sh_res.stderr)
+                argv = [tok for tok in captured_args.read_bytes().decode("utf-8").split("\0")[:-1]]
+                self.assertEqual(argv[argv.index("--model") + 1], model_name)
+                self.assertEqual(
+                    cmd_line,
+                    restore_drill.build_family_policy_reconcile_lines(
+                        restore_drill.DRILL_OPERATOR_ID,
+                        run_id,
+                        [{"user_id": uid, "policy": None, "models": [("disabled", model_name, True)]}],
+                    ),
+                )
 
         for bad_model in ("", "m" * 257, "bad\nmodel", "bad\x00model"):
             with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy model name"):
@@ -842,6 +877,134 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         res = subprocess.run(["/bin/sh", "-c", adapted], env=env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 1, "Step 3 masked pg_restore failure")
         self.assertFalse(pgpass.exists(), "EXIT trap did not remove PGPASSFILE after pg_restore failure")
+
+    def test_runbook_step5b_and_step6_family_and_coverage_gap_contracts(self):
+        import re as _re
+        import textwrap
+        runbook = (smoke.ROOT / "docs" / "restore-drill.md").read_text(encoding="utf-8")
+        step5b = runbook.split("### 5b.", 1)[1].split("### 5c.", 1)[0]
+        step6 = runbook.split("## Step 6", 1)[1].split("## Drill cadence", 1)[0]
+
+        for forbidden in ("MAX(id)", "ORDER BY id ASC", "WHERE id >"):
+            self.assertNotIn(forbidden, step5b)
+        self.assertIn("restored-audit-ids.txt", step5b)
+        self.assertIn("Fail closed", step5b)
+        self.assertIn("details->>'restore_run_id' = '<RESTORE_RUN_UUID>'", step6)
+
+        m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
+        self.assertIsNotNone(m_sh)
+        step5b_sh = textwrap.dedent(m_sh.group(1))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            calls_path = tmp_path / "admin-calls.jsonl"
+            admin_stub = bin_dir / "openmettle-admin"
+            admin_stub.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                f"with open({str(calls_path)!r}, 'a', encoding='utf-8') as f:\n"
+                "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+                encoding="utf-8",
+            )
+            admin_stub.chmod(0o755)
+            if shutil.which("sha256sum") is None:
+                sha_stub = bin_dir / "sha256sum"
+                sha_stub.write_text(
+                    f"#!{sys.executable}\n"
+                    "import hashlib, sys\n"
+                    "print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + '  -')\n",
+                    encoding="utf-8",
+                )
+                sha_stub.chmod(0o755)
+
+            uid = restore_drill.USER_D_IDS["user"]
+            common_env = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "RESTORE_RUN_UUID": "77777777-7777-4777-8777-777777777777",
+                "OPERATOR_UUID": restore_drill.DRILL_OPERATOR_ID,
+                "GRANTEE_KIND": "user",
+                "GRANTEE_ID": uid,
+            }
+            cases = [
+                {
+                    "ACTION": "family_policy.model_disable",
+                    "AUDIT_ROW_UUID": "88888888-8888-4888-8888-888888888881",
+                    "RULE_KIND": "disabled",
+                    "MODEL_NAME": "price$$tier",
+                    "RULE_ACTIVE": "true",
+                },
+                {
+                    "ACTION": "family_policy.model_enable",
+                    "AUDIT_ROW_UUID": "88888888-8888-4888-8888-888888888882",
+                    "RULE_KIND": "disabled",
+                    "MODEL_NAME": "price$$tier",
+                    "RULE_ACTIVE": "false",
+                },
+                {
+                    "ACTION": "family_policy.set",
+                    "AUDIT_ROW_UUID": "88888888-8888-4888-8888-888888888883",
+                    "POLICY_TZ": "Europe/London",
+                    "QUIET_WINDOW": "22:00-07:00",
+                    "STUDY_WINDOW": "",
+                    "OVERRIDE_SCHEDULES": "false",
+                },
+                {
+                    "ACTION": "family_policy.set",
+                    "AUDIT_ROW_UUID": "88888888-8888-4888-8888-888888888884",
+                    "POLICY_TZ": "UTC",
+                    "QUIET_WINDOW": "",
+                    "STUDY_WINDOW": "16:00-18:00",
+                    "OVERRIDE_SCHEDULES": "true",
+                },
+                {
+                    "ACTION": "family_policy.clear",
+                    "AUDIT_ROW_UUID": "88888888-8888-4888-8888-888888888885",
+                },
+            ]
+            for extra in cases:
+                res = subprocess.run(
+                    ["/bin/sh", "-c", step5b_sh],
+                    env={**common_env, **extra},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+
+            bad_res = subprocess.run(
+                ["/bin/sh", "-c", step5b_sh],
+                env={
+                    **common_env,
+                    "ACTION": "family_policy.model_enable",
+                    "AUDIT_ROW_UUID": "88888888-8888-4888-8888-888888888886",
+                    "RULE_KIND": "disabled",
+                    "MODEL_NAME": "a",
+                    "RULE_ACTIVE": "maybe",
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(bad_res.returncode, 0)
+
+            invocations = [json.loads(ln) for ln in calls_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(invocations), 5)
+            self.assertIn("--enable", invocations[0])
+            self.assertNotIn("--disable", invocations[0])
+            self.assertEqual(invocations[0][invocations[0].index("--model") + 1], "price$$tier")
+            self.assertIn("--disable", invocations[1])
+            self.assertNotIn("--enable", invocations[1])
+            self.assertNotEqual(
+                invocations[0][invocations[0].index("--request-key") + 1],
+                invocations[1][invocations[1].index("--request-key") + 1],
+            )
+            self.assertIn("--quiet", invocations[2])
+            self.assertNotIn("--study", invocations[2])
+            self.assertNotIn("--override-group-schedules", invocations[2])
+            self.assertNotIn("--quiet", invocations[3])
+            self.assertIn("--study", invocations[3])
+            self.assertIn("--override-group-schedules", invocations[3])
+            self.assertEqual(invocations[4][:4], ["family", "clear-policy", "--user", uid])
 
 
 class ChartAndManifestValuesTest(unittest.TestCase):
@@ -1349,6 +1512,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             )
         if "psql" in argv and stdin_text:
             if restore_drill.GAP_DB_NAME in argv:
+                if "restore.accept_coverage_gap" in stdin_text:
+                    self.assertIn("details->>'restore_run_id'", stdin_text)
                 return self._res(0, "2|0|0|0|t|1\n")
             if "gateway_requests" in stdin_text:
                 ns = argv[argv.index("--namespace") + 1]
@@ -1384,6 +1549,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     "ERROR: login_provider_revisions epoch 41 did not advance past previous maximum 100",
                 )
             if "FROM openmettle.authorization_audit" in stdin_text and "family_policy.model_disable" in stdin_text:
+                self.assertIn("drill-primary-family-disable-a-1", stdin_text)
+                self.assertNotIn("ORDER BY id", stdin_text)
                 return self._res(0, f"{restore_drill.USER_D_IDS['user']}|{smoke.CATALOG_MODEL}\n")
             if "EXISTS (SELECT 1 FROM openmettle.login_provider_revisions WHERE epoch = 41)" in stdin_text:
                 return self._res(0, "100|0|f\n")
@@ -1395,6 +1562,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if "openmettle.operations" in stdin_text:
                 import re as _re
                 self.assertIn("fp.override_group_schedules::text", stdin_text)
+                self.assertIn("details->>'restore_run_id'", stdin_text)
                 pre_job = next(
                     d for d in self.applied_manifests
                     if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-primary-family-pre"
@@ -1406,7 +1574,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 q_end = int(qm.group(3)) * 60 + int(qm.group(4))
                 return self._res(
                     0,
-                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|Europe/London:{q_start}:{q_end}:960:1080:true:2|t|1800000000000000|purged|t|f|"
+                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|Europe/London:{q_start}:{q_end}:960:1080:true:2|t|1800000000000000|purged|t|t|0|f|"
                     "5:5:1:5|run-terminal:openmettle.run-cancelled|"
                     "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
                     "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1\n",

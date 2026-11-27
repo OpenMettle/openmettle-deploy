@@ -675,8 +675,9 @@ def _validate_posix_abs_path(label: str, path: str) -> str:
 
 
 def _sh_quote(value: str) -> str:
-    """Single-quote an arbitrary non-control string safely for POSIX `/bin/sh`."""
-    return "'" + value.replace("'", "'\"'\"'") + "'"
+    """Single-quote a non-control string for POSIX `/bin/sh` while splitting `$` (`'$''...'`)
+    so Kubernetes container `command`/`args` expansion (`$$` -> `$`, `$(VAR)`) is a no-op."""
+    return "'" + value.replace("'", "'\"'\"'").replace("$", "$''") + "'"
 
 
 def _validate_model_name(model: str) -> str:
@@ -2380,7 +2381,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "SELECT details->>'grantee_id', details->>'model'"
             " FROM openmettle.authorization_audit"
             " WHERE action = 'family_policy.model_disable'"
-            " ORDER BY id DESC LIMIT 1;",
+            "   AND request_key = 'drill-primary-family-disable-a-1';",
         ).strip()
         self.expect(
             family_audit == f"{USER_D_IDS['user']}|{smoke.CATALOG_MODEL}",
@@ -2744,7 +2745,12 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 "   WHERE encryption_key_id IS NOT NULL OR access_ciphertext IS NOT NULL OR refresh_ciphertext IS NOT NULL),"
                 " (SELECT count(*) FROM openmettle.external_connection_shares WHERE active),"
                 " (SELECT coverage_complete FROM openmettle.restore_reconciliation_gate),"
-                " (SELECT count(*) FROM openmettle.authorization_audit WHERE action = 'restore.accept_coverage_gap');",
+                " (SELECT count(*) FROM openmettle.authorization_audit"
+                "   WHERE actor_kind = 'operator'"
+                "     AND action = 'restore.accept_coverage_gap'"
+                "     AND target_kind = 'restore_gate'"
+                "     AND target_id = 'instance'"
+                f"     AND details->>'restore_run_id' = '{gap_run_id}');",
                 dbname=GAP_DB_NAME,
             ).strip()
             self.expect(gap_sql == "2|0|0|0|t|1",
@@ -3382,7 +3388,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]} for r in probe_results],
         )
 
-        return {"manifest": manifest_summary}
+        return {"manifest": manifest_summary, "restore_run_id": restore_run_id}
 
     def verify_post_restore_state(
         self, primary_state: dict, recovery_meta: dict, recovery_started_at: datetime
@@ -3634,6 +3640,13 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f"    FROM openmettle.artifact_revisions WHERE id = '{dl_rev_id}'::uuid),"
             f" (SELECT state FROM openmettle.artifact_revisions WHERE id = '{purged_rev_id}'::uuid),"
             " (SELECT open FROM openmettle.restore_reconciliation_gate),"
+            " (SELECT coverage_complete FROM openmettle.restore_reconciliation_gate),"
+            " (SELECT count(*) FROM openmettle.authorization_audit"
+            "   WHERE actor_kind = 'operator'"
+            "     AND action = 'restore.accept_coverage_gap'"
+            "     AND target_kind = 'restore_gate'"
+            "     AND target_id = 'instance'"
+            f"     AND details->>'restore_run_id' = '{recovery_meta['restore_run_id']}'),"
             " (SELECT maintenance_active FROM openmettle.backup_maintenance_gate),"
             f" (SELECT last_event_sequence || ':' || (SELECT count(*) FROM openmettle.run_events WHERE run_id = r.id)"
             f"         || ':' || (SELECT coalesce(min(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
@@ -3657,7 +3670,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid);",
         ).strip()
         expected_sql = (
-            f"outcome_unknown:1|{target_mcp_url()}|{expected_family_state}|t|{expected_purge_after_us}|purged|t|f|"
+            f"outcome_unknown:1|{target_mcp_url()}|{expected_family_state}|t|{expected_purge_after_us}|purged|t|t|0|f|"
             f"{w_expected_seq}:{w_expected_seq}:1:{w_expected_seq}|run-terminal:openmettle.run-cancelled|"
             f"{i_expected_seq}:{i_expected_seq}:1:{i_expected_seq}|unresolved-write:{i_op_id}|"
             "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1"
