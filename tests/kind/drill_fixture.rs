@@ -71,8 +71,8 @@ fn proposal(logical_key: &str) -> Proposal {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let [actor, approval] = args.as_slice() else {
-        panic!("usage: kind-drill-fixture <actor_user_id> <actor_approval_id>");
+    let [actor, approval, mcp_target_url] = args.as_slice() else {
+        panic!("usage: kind-drill-fixture <actor_user_id> <actor_approval_id> <mcp_target_url>");
     };
     let mut lines = io::stdin().lines();
     let api_url = lines.next().expect("api url line").expect("api url");
@@ -254,7 +254,7 @@ async fn main() {
             scope: &scope,
             run: intent_run_id,
             key: "external-write-effect-1",
-            target: "https://mcp.example.test/tools/send",
+            target: mcp_target_url,
             capability: "non_repeatable",
             request: Payload {
                 format: "openmettle.mcp-write-intent",

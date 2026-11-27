@@ -342,15 +342,80 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn(f"storage declare-lost {artifacts} --revision {lost_rev}", calls)
         self.assertIn(f"storage rebind {artifacts} --replace-adoption-run {barrier}", calls)
 
-        # Negative test: if any encrypted backup archive copy remains reachable under `recovery_media_dir`,
+        # Negative test 1: an intact unreadable staging file MUST abort reconciliation rather than
+        # falling through to `storage declare-lost`.
+        rec_staging_path = unpacked / "artifacts" / "revisions" / rec_res
+        if os.geteuid() != 0:
+            (artifacts / "revisions" / rec_res).unlink(missing_ok=True)
+            log_file.write_text("", encoding="utf-8")
+            rec_staging_path.chmod(0o000)
+            try:
+                res_unreadable = subprocess.run(
+                    ["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True
+                )
+            finally:
+                rec_staging_path.chmod(0o600)
+            self.assertNotEqual(res_unreadable.returncode, 0)
+            self.assertIn("unreadable or not a regular file", res_unreadable.stderr)
+            self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+
+        # Negative test 2: a failing sha256sum probe on a readable staging file MUST stop
+        # reconciliation rather than masking exit status and calling `storage declare-lost`.
+        (artifacts / "revisions" / rec_res).unlink(missing_ok=True)
+        log_file.write_text("", encoding="utf-8")
+        sha_stub = bin_dir / "sha256sum"
+        sha_stub.write_text("#!/bin/sh\necho 'sha256sum: simulated read I/O error' >&2\nexit 1\n", encoding="utf-8")
+        sha_stub.chmod(0o755)
+        try:
+            res_sha_fail = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
+            self.assertNotEqual(res_sha_fail.returncode, 0)
+            self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+        finally:
+            sha_stub.unlink()
+
+        # Negative test 3: if any encrypted backup archive copy remains reachable under `recovery_media_dir`,
         # `storage declare-lost` MUST be refused before executing.
-        (artifacts / "revisions" / rec_res).unlink()
+        (artifacts / "revisions" / rec_res).unlink(missing_ok=True)
         log_file.write_text("", encoding="utf-8")
         (media / "backup-20261127T090000Z-66666666-6666-4666-8666-666666666666").mkdir(parents=True)
         res_avail = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
         self.assertNotEqual(res_avail.returncode, 0)
         self.assertIn("remains available", res_avail.stderr)
         self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+
+    def test_family_policy_reconcile_lines_validates_and_renders_cli_commands(self):
+        run_id = "77777777-7777-4777-8777-777777777777"
+        lines = restore_drill.build_family_policy_reconcile_lines(
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            [(restore_drill.USER_D_IDS["user"], "UTC", "a")],
+        )
+        self.assertIn(f'openmettle-admin family set-policy --user "{restore_drill.USER_D_IDS["user"]}" --zone "UTC"', lines)
+        self.assertIn('openmettle-admin family set-model --user', lines)
+        self.assertIn('--kind disabled --model "a" --enable', lines)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy model name"):
+            restore_drill.build_family_policy_reconcile_lines(
+                restore_drill.DRILL_OPERATOR_ID, run_id, [(restore_drill.USER_D_IDS["user"], "UTC", "bad model")]
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy timezone"):
+            restore_drill.build_family_policy_reconcile_lines(
+                restore_drill.DRILL_OPERATOR_ID, run_id, [(restore_drill.USER_D_IDS["user"], "UTC;id", "a")]
+            )
+
+    def test_mcp_post_probe_command_shapes_http_post(self):
+        cmd = restore_drill.mcp_post_probe_command(
+            "sglang-standin.openmettle-restore-target-db.svc.cluster.local",
+            30000,
+            "/tools/send",
+            '{"control":"worker-mcp-reachability"}',
+        )
+        self.assertEqual(cmd[:4], ["timeout", str(smoke.PROBE_SECONDS), "bash", "-c"])
+        self.assertEqual(cmd[-4:], [
+            "sglang-standin.openmettle-restore-target-db.svc.cluster.local",
+            "30000",
+            "/tools/send",
+            '{"control":"worker-mcp-reachability"}',
+        ])
 
     def test_owner_and_worker_reconcile_sql_follow_core_sequence_and_role_boundaries(self):
         owner_sql = restore_drill.pre_worker_owner_reconcile_sql(
@@ -619,6 +684,14 @@ class ChartAndManifestValuesTest(unittest.TestCase):
             if i["kind"] == "NetworkPolicy" and i["metadata"]["namespace"] == restore_drill.TARGET_DB_NS
         ]
         self.assertEqual(sorted(db_netpols), sorted([smoke.NAMESPACE_DENY, "postgres-network", "standin-network"]))
+        standin_np = next(
+            i for i in foundation["items"]
+            if i["kind"] == "NetworkPolicy" and i["metadata"]["name"] == "standin-network"
+        )
+        peers = standin_np["spec"]["ingress"][0]["from"]
+        self.assertEqual(len(peers), 2)
+        components = sorted(p["podSelector"]["matchLabels"]["app.kubernetes.io/component"] for p in peers)
+        self.assertEqual(components, [smoke.GATEWAY_COMPONENT, "worker"])
 
     def test_main_refuses_wrong_core_commit_before_creating_cluster(self):
         tmp = Path(tempfile.mkdtemp())
@@ -680,7 +753,10 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.job_failed_on_pre_worker_sql = False
         self.transport_fail_on_epoch_probe = False
         self.missing_restored_settlement_on_target = False
+        self.unsolicited_mcp_on_startup = False
         self.shared_artifact_readers: list[str] = []
+        self.mcp_standin_records: list[dict] = []
+        self.denied_model_requests: list[str] = []
 
     def _make_core(self):
         outer = self
@@ -950,6 +1026,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             return self._res(0, "100\ncancelled_runs=2\n")
         if name == "openmettle-drill-worker-quota-release":
             return self._res(0, "1\n")
+        if name == "openmettle-drill-primary-family-restrict":
+            return self._res(0, "family.set_policy\nfamily.model_disable\n")
         if name == "openmettle-drill-release-maintenance":
             bs = json.dumps({"maintenance_active": False})
             return self._res(
@@ -1017,12 +1095,14 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     "",
                     "ERROR: login_provider_revisions epoch 41 did not advance past previous maximum 100",
                 )
+            if "FROM openmettle.authorization_audit" in stdin_text and "family_policy.model_disable" in stdin_text:
+                return self._res(0, f"{restore_drill.USER_D_IDS['user']}|{smoke.CATALOG_MODEL}\n")
             if "EXISTS (SELECT 1 FROM openmettle.login_provider_revisions WHERE epoch = 41)" in stdin_text:
                 return self._res(0, "100|0|f\n")
             if "openmettle.operations" in stdin_text:
                 return self._res(
                     0,
-                    "outcome_unknown:1|t|1800000000000000|purged|t|f|"
+                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|t|t|1800000000000000|purged|t|f|"
                     "5:5:1:5|run-terminal:openmettle.run-cancelled|"
                     "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
                     "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1\n",
@@ -1037,6 +1117,14 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             return self._res(0, "")
         if "timeout" in argv:
             ns = argv[argv.index("--namespace") + 1]
+            if "/tools/send" in argv:
+                target_host = argv[-4]
+                if ns in (restore_drill.TARGET_APP_NS, restore_drill.TARGET_DB_NS) and (
+                    restore_drill.PRIMARY_DB_NS in target_host or restore_drill.PRIMARY_APP_NS in target_host
+                ):
+                    return self._res(124, "", "")
+                self.mcp_standin_records.append({"body": json.loads(argv[-1])})
+                return self._res(0, "HTTP/1.1 200 OK\r\n", "")
             target_host = argv[-2] if argv[-1].isdigit() else argv[-3]
             is_http = "/readyz" in argv
             if ns in (restore_drill.TARGET_APP_NS, restore_drill.TARGET_DB_NS) and (
@@ -1060,6 +1148,11 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             return 401, prob_hdrs, json.dumps({"status": 401, "code": "unauthenticated"}).encode()
         if path == "/v1/conversations" and method == "POST":
             body = json.loads(payload) if payload else {}
+            if raw_cookie == getattr(self, "_cookie_d2", None):
+                return 201, v1_hdrs, json.dumps({
+                    "conversation_id": "bbbb0000-0000-4000-8000-0000000000d1",
+                    "branch_id": "bbbb0000-0000-4000-8000-0000000000d2",
+                }).encode()
             cid = (
                 "bbbb0000-0000-4000-8000-000000000099"
                 if body.get("scope_id")
@@ -1070,6 +1163,9 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "branch_id": "bbbb0000-0000-4000-8000-000000000002",
             }).encode()
         if path == "/v1/runs" and method == "POST":
+            if raw_cookie == getattr(self, "_cookie_d2", None):
+                self.denied_model_requests.append(smoke.CATALOG_MODEL)
+                return 403, prob_hdrs, json.dumps({"status": 403, "code": "policy"}).encode()
             key = headers.get("Idempotency-Key", "")
             if key == "drill-post-restore-run":
                 rid = "bbbb0000-0000-4000-8000-000000000020"
@@ -1174,9 +1270,18 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
     def _run_drill(self) -> tuple[int, dict]:
         self._scaled_zero = False
         self._leak_secret = "not-yet-set"
+        self._stale_or_disabled_cookies = ()
+        self._cookie_a2 = None
+        self._cookie_b2 = None
+        self._cookie_d2 = None
+        self._post_restore_runs = 0
         self.live_objects.clear()
         self.media_lifecycle.clear()
         self.target_settlement_events.clear()
+        self.mcp_standin_records = (
+            [{"body": {"tool": "drill.send"}}] if self.unsolicited_mcp_on_startup else []
+        )
+        self.denied_model_requests.clear()
         outer = self
 
         class FakePF:
@@ -1214,6 +1319,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 if getattr(outer, "_post_restore_runs", 0) >= 2:
                     return 200, json.dumps([{"ok": True}])
                 return 200, "[]"
+            if port == 18090 and path == "/_recorded_mcp":
+                return 200, json.dumps(outer.mcp_standin_records)
             return 200, "{}"
 
         fake_core = self._make_core()
@@ -1290,9 +1397,16 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertIn("ARTIFACT_VOLUME_ID", runbook)
         self.assertIn("sha256sum", runbook)
         self.assertIn('"maintenance_active"[[:space:]]*:[[:space:]]*false', runbook)
+        self.assertIn("unresolved_deletion_coverage_gap", runbook)
+        self.assertIn("openmettle-admin family set-model", runbook)
+        self.assertIn("openmettle-admin quota verify /var/lib/openmettle/artifacts", runbook)
+        self.assertIn("openmettle-admin journal export /tmp/post-restore.export", runbook)
+        self.assertIn('[ ! -r "$cand" ]', runbook)
         # Verify uncertified coverage-gap scenario was also exercised:
         check_names = [c["name"] for c in summary["checks"]]
         self.assertTrue(any("coverage-gap" in n for n in check_names))
+        self.assertEqual(self.denied_model_requests, [smoke.CATALOG_MODEL])
+        self.assertEqual(self.mcp_standin_records, [{"body": {"control": "worker-mcp-reachability"}}])
         self.assertTrue(any(cmd[:3] == ["kind", "delete", "cluster"] for cmd in self.commands))
         self.assertTrue(any(cmd[:4] == ["docker", "image", "rm", "--force"] for cmd in self.commands))
         self.assertTrue(
@@ -1323,6 +1437,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             restore_drill.RETAINED_JOURNAL_PATH,
             reconcile_pod["containers"][0]["command"][-1],
         )
+        self.assertIn("family set-policy", reconcile_pod["containers"][0]["command"][-1])
+        self.assertIn("family set-model", reconcile_pod["containers"][0]["command"][-1])
         self.assertEqual(
             self.target_settlement_events,
             [
@@ -1331,6 +1447,13 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "psql:bbbb0000-0000-4000-8000-000000000020",
             ],
         )
+
+    def test_unsolicited_mcp_write_replay_on_startup_fails_drill(self):
+        self.unsolicited_mcp_on_startup = True
+        rc, summary = self._run_drill()
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["result"], "failed")
+        self.assertIn("unsolicited MCP write calls", summary["error"])
 
     def test_missing_restored_prebackup_settlement_on_target_fails_before_new_turn(self):
         self.missing_restored_settlement_on_target = True

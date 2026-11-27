@@ -110,16 +110,20 @@ pg_restore \
 `openmettle-admin` database subcommands read `OPENMETTLE_ADMIN_DATABASE_URL` (separate from `OPENMETTLE_MIGRATE_DATABASE_URL`). Bind `OPENMETTLE_ADMIN_DATABASE_URL` in the recovery Job via `secretKeyRef` from **both** `database.migrate.existingSecret` and `database.migrate.key` (default `url`; or `database.backup.existingSecret` / `database.backup.key`), stage `database.caBundle` as a regular `0444` file at the owner URL's `sslrootcert` path (`/etc/openmettle/db-ca/ca.crt` when `database.caBundle.enabled` is `true`, required for `O_NOFOLLOW` TLS verification in `backup status` and `backup release-maintenance`), for Steps 4a–4d, 5c, 5e, and 6, and carry a single verified journal export file (`SELECTED_JOURNAL` — either a newer off-host `openmettle-admin journal export` file from the same installation `origin`, or `/var/recovery/unpacked/deletion-journal.bin`) through both `restore lock` and `restore replay`:
 
 - **When to pass `--export-complete`:** Pass `--export-complete` on `restore lock` **only** when `SELECTED_JOURNAL`'s `(seq, digest)` matches an independently recorded final `(journal_seq, chain_digest)` watermark captured *after* all primary writes, purges, and external-connection revocations stopped (for example, a clean maintenance-window backup with zero post-backup primary writes before loss, or a fresh `openmettle-admin journal export` taken from an intact stopped/fenced primary). Never pass `--export-complete` merely because an external export has a higher `seq` than the backup.
-- **When post-export primary activity cannot be ruled out:** Whenever writes, purges, or connection revocations could have occurred on primary *after* `SELECTED_JOURNAL` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock`, record the printed `restore_run <RESTORE_RUN_UUID>`, and run audited break-glass acceptance before opening the gate (per `ADR 0045`, `restore accept-coverage-gap` also conservatively transitions `authorized` external connections to `reauth_required`, clears encrypted tokens, and deactivates active connection shares):
+- **When post-export primary activity cannot be ruled out (break-glass recovery):** Whenever writes, purges, or connection revocations could have occurred on primary *after* `SELECTED_JOURNAL` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock` and record the printed `restore_run <RESTORE_RUN_UUID>`. `openmettle-admin restore accept-coverage-gap` transitions `authorized` external connections to `reauth_required`, clears encrypted tokens, and deactivates active connection shares (`ADR 0045`) so `restore replay` can open the gate, **but it cannot reconstruct uncaptured artifact purges, conversation deletions, or principal/grant revocations after `SELECTED_JOURNAL`** (purged payloads already present in the backup snapshot can remain on disk). Before running `restore accept-coverage-gap` and reopening service:
+  1. **Reconcile against independent records:** cross-check surviving primary logs/audit sinks, off-host deletion or authorization audit exports, IdP/Keycloak revocation records, and operator change logs, and purge or revoke any post-export deletions/revocations identified there.
+  2. **Record explicit owner/operator break-glass sign-off:** document the uncertified `[exported_at, primary_loss]` window, every independent record checked, and the explicit sign-off authorizing break-glass reopening before invoking:
 
-```sh
-# OPENMETTLE_ADMIN_DATABASE_URL bound via secretKeyRef {name: database.migrate.existingSecret, key: database.migrate.key}
-openmettle-admin restore accept-coverage-gap \
-  --restore-run "$RESTORE_RUN_UUID" \
-  --operator-id "$OPERATOR_UUID" \
-  --request-key "restore-gap-$RESTORE_RUN_UUID" \
-  --reason "post-export primary activity before loss cannot be ruled out"
-```
+     ```sh
+     # OPENMETTLE_ADMIN_DATABASE_URL bound via secretKeyRef {name: database.migrate.existingSecret, key: database.migrate.key}
+     openmettle-admin restore accept-coverage-gap \
+       --restore-run "$RESTORE_RUN_UUID" \
+       --operator-id "$OPERATOR_UUID" \
+       --request-key "restore-gap-$RESTORE_RUN_UUID" \
+       --reason "break-glass recovery after independent reconciliation; operator sign-off recorded"
+     ```
+
+  3. **Fail restore validation while any deletion gap remains unresolved:** per `ARCHITECTURE-v1.md`, records never captured cannot be reconstructed, so any unresolved deletion/revocation coverage gap **MUST be recorded as a failed restore validation (`unresolved_deletion_coverage_gap`)** rather than signing off clean `V1-31` / `V1-33` qualification.
 
 Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`), lock the gate, and record the printed `restore_run <RESTORE_RUN_UUID>` (also used in Step 5e):
 
@@ -181,14 +185,21 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
 
    If `already_purged = true`, **do not** run `storage declare-lost` — step 4 below (`storage rebind --replace-adoption-run "$BARRIER_UUID"`) completes that already-journaled purge cleanly.
 
-2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. Verify any candidate payload's byte length and SHA-256 against `(size_bytes, sha256)` from step 1; if intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
+2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. Require `$cand` to be a readable regular non-symlink file and verify its byte length and SHA-256 against `(size_bytes, sha256)` from step 1 without masking exit status behind pipelines; any read, stat, or digest failure **must stop reconciliation immediately** rather than falling through to `storage declare-lost`. If verified intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
 
    ```sh
+   set -eu
    cand="/var/recovery/unpacked/artifacts/revisions/$RESERVATION_UUID"
-   if [ -f "$cand" ]; then
-     cand_bytes="$(wc -c < "$cand" | tr -d ' ')"
-     set -- $(sha256sum "$cand")
-     if [ "$cand_bytes" -eq "$EXPECTED_SIZE_BYTES" ] && [ "$1" = "$EXPECTED_SHA256" ]; then
+   if [ -e "$cand" ] || [ -L "$cand" ]; then
+     if [ -L "$cand" ] || [ ! -f "$cand" ] || [ ! -r "$cand" ]; then
+       echo "ERROR: staging candidate $cand is unreadable or not a regular file; refusing storage declare-lost" >&2
+       exit 1
+     fi
+     raw_wc="$(wc -c < "$cand")"
+     cand_bytes="$(printf '%s' "$raw_wc" | tr -d '[:space:]')"
+     raw_sha="$(sha256sum "$cand")"
+     cand_sha="${raw_sha%% *}"
+     if [ "${#cand_sha}" -eq 64 ] && [ "$cand_bytes" -eq "$EXPECTED_SIZE_BYTES" ] && [ "$cand_sha" = "$EXPECTED_SHA256" ]; then
        cp -a -- "$cand" "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
        chmod 0600 "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
      fi
@@ -310,8 +321,28 @@ Deploy the target release with freshly generated 32-byte `active.key` and `curso
 
 Bumping provider generation fences pre-restore cookies/bearers and pending logins, **not** fresh sign-ins by accounts whose authority was reduced after the backup. Before reopening authentication (`auth.enabled: true` / ingress):
 
-- Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records.
-- **Fail-closed rule:** if post-backup identity or authorization revocation evidence is unavailable, **keep authentication closed** (`auth.enabled: false` or ingress blocked) until an operator audits and re-approves principals and grants, so a disabled or removed user cannot sign in afresh with snapshot authority.
+- Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), family-policy schedules and model rules (`openmettle.family_policies`, `openmettle.family_policy_models` `rule_kind IN ('disabled', 'study_allow')`, audited under `family_policy.*` in `openmettle.authorization_audit`, `ADR 0044`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records:
+
+  ```sh
+  # Reconcile post-backup disabled model restrictions before reopening inference (`ADR 0044`):
+  openmettle-admin family set-policy \
+    --user "$RESTRICTED_USER_UUID" \
+    --zone "$POLICY_TZ" \
+    --operator-id "$OPERATOR_UUID" \
+    --request-key "restore-family-policy-$RESTRICTED_USER_UUID-$RESTORE_RUN_UUID" \
+    --reason "reconcile post-backup family policy before reopening inference"
+
+  openmettle-admin family set-model \
+    --user "$RESTRICTED_USER_UUID" \
+    --kind disabled \
+    --model "$DISABLED_MODEL" \
+    --enable \
+    --operator-id "$OPERATOR_UUID" \
+    --request-key "restore-family-disable-$RESTRICTED_USER_UUID-$DISABLED_MODEL-$RESTORE_RUN_UUID" \
+    --reason "reconcile post-backup disabled model rule before reopening inference"
+  ```
+
+- **Fail-closed rule:** if post-backup identity, capability, or family-policy model restriction evidence is unavailable, **keep authentication and inference closed** (`auth.enabled: false` / ingress blocked) until an operator audits and re-approves principals, grants, and model policies, so a disabled user or model cannot regain access after restore.
 
 ### 5c. Verify and rotate credential vault keys (`ADR 0045`)
 
@@ -459,8 +490,10 @@ rm -rf /var/recovery/unpacked
    - Revisions declared lost in Step 4c return `200` metadata (`state: "lost"`, non-null `lost_at`) and `410 Gone` (`code: "payload_lost"`) on `/content` for authorized readers, while remaining `404` for unauthorized callers.
    - Post-backup purged revisions (`409 conflict` on `/content`, `state = 'purged'`, `0` resurrected files on disk) and revoked/disconnected connections (`404` for former sharees; `NULL` ciphertext) remain purged/revoked.
    - Retained revisions keep their exact pre-backup `purge_after` deadline (not reset from wall-clock restore time).
+   - Models disabled post-backup under family policy (`openmettle.family_policy_models`) return `403` (`code: "policy"`) on `POST /v1/runs` for newly authenticated affected users.
    - Parked `waiting` runs from the snapshot report `state: "cancelled"` with contiguous `run_events` sequences, `POST /v1/runs/{run_id}/approvals/{approval_id}/decision` (`{"decision": "approve", ...}`) returns `409 conflict`, and revision-`0` write intents report `outcome = 'outcome_unknown'` (`revision = 1`) with held reservations preserved and zero unsolicited external/gateway calls on worker startup.
-   - `openmettle-admin quota verify` exits `0` with all seven mismatch counters equal to `0`, and `openmettle-admin journal export` succeeds on the restored database.
+   - Confirm clean deletion-journal coverage (`SELECT coverage_complete FROM openmettle.restore_reconciliation_gate;` and `0` `restore.accept_coverage_gap` rows in `openmettle.authorization_audit` for a certified `--export-complete` run). If break-glass `restore accept-coverage-gap` was used and any deletion/revocation window remains unresolved, record the validation result as **failed** (`unresolved_deletion_coverage_gap`) and retain explicit owner break-glass sign-off rather than signing off clean `V1-31` / `V1-33` qualification.
+   - `openmettle-admin quota verify /var/lib/openmettle/artifacts` on deployments with a pinned artifact volume (or `openmettle-admin quota verify` without a root argument on storage-disabled deployments where `manifest.artifact_volume.volume_id` is `null`) exits `0` with all seven mismatch counters equal to `0`, and `openmettle-admin journal export /tmp/post-restore.export` succeeds on the restored database.
 4. Record `recovery_completed_at` after the final verification check above and archive the drill metrics:
    - `restored_data_age_seconds = drill_cutover_at - manifest.quiesced_at` (must be `<= 86,400 s` for the 24h RPO target).
    - `recovery_duration_seconds = recovery_completed_at - recovery_started_at` (must be `<= 14,400 s` for the 4h RTO target, spanning target provisioning through final verification).

@@ -672,6 +672,41 @@ def _validate_posix_abs_path(label: str, path: str) -> str:
     return path
 
 
+def build_family_policy_reconcile_lines(
+    operator_id: str,
+    restore_run_id: str,
+    disabled_models: list[tuple[str, str, str]] | tuple[tuple[str, str, str], ...],
+) -> str:
+    """Build `openmettle-admin family` commands reconciling post-backup family policies and
+    disabled model rules (`ADR 0044`) before reopening inference."""
+    for label, val in (("operator_id", operator_id), ("restore_run_id", restore_run_id)):
+        if not smoke.UUID.fullmatch(val):
+            raise DrillFailure(f"invalid {label} UUID: {val!r}")
+    lines: list[str] = []
+    for user_id, zone, model in disabled_models:
+        if not smoke.UUID.fullmatch(user_id):
+            raise DrillFailure(f"invalid restricted user UUID: {user_id!r}")
+        if not re.fullmatch(r"[A-Za-z0-9/+_.-]{1,128}", zone):
+            raise DrillFailure(f"invalid family policy timezone: {zone!r}")
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", model):
+            raise DrillFailure(f"invalid family policy model name: {model!r}")
+        policy_key = f"restore-family-policy-{user_id}-{restore_run_id}"
+        model_key = f"restore-family-disable-{user_id}-{model}-{restore_run_id}"
+        if len(policy_key) > 128 or len(model_key) > 128:
+            raise DrillFailure("generated family policy request_key exceeds 128 chars")
+        lines.append(
+            f'openmettle-admin family set-policy --user "{user_id}" --zone "{zone}" '
+            f'--operator-id "{operator_id}" --request-key "{policy_key}" '
+            '--reason "reconcile post-backup family policy before reopening inference"'
+        )
+        lines.append(
+            f'openmettle-admin family set-model --user "{user_id}" --kind disabled --model "{model}" '
+            f'--enable --operator-id "{operator_id}" --request-key "{model_key}" '
+            '--reason "reconcile post-backup disabled model rule before reopening inference"'
+        )
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
 def build_step4c_reconcile_lines(
     *,
     selected_journal: str,
@@ -684,10 +719,11 @@ def build_step4c_reconcile_lines(
 ) -> str:
     """Build Step 4c + 4d commands for pinned artifact volumes:
     1) replay --db-only first,
-    2) verify staging copies by byte length + SHA-256 and restore any intact payload (`chmod 0600`)
-       BEFORE ever invoking `storage declare-lost`,
+    2) verify staging copies as regular readable non-symlink files by byte length + SHA-256 without
+       masking read/stat/digest exit codes (aborting reconciliation rather than falling through to
+       `storage declare-lost` on error), and restore any intact payload (`chmod 0600`),
     3) verify no archive media remains available and reserve `storage declare-lost` strictly for
-       revisions absent/corrupt in all recovery copies,
+       revisions confirmed absent/corrupt in all recovery copies,
     4) resume `storage rebind --replace-adoption-run` -> `restore replay` -> `quota verify`."""
     _validate_posix_abs_path("selected_journal", selected_journal)
     _validate_posix_abs_path("artifacts_mount", artifacts_mount)
@@ -709,10 +745,25 @@ def build_step4c_reconcile_lines(
             f'cand="{unpacked_dir}/artifacts/revisions/{res_id}"\n'
             f'dst="{artifacts_mount}/revisions/{res_id}"\n'
             "recovered=0\n"
-            'if [ -f "$cand" ]; then\n'
-            '  cand_bytes="$(wc -c < "$cand" | tr -d " ")"\n'
-            '  set -- $(sha256sum "$cand")\n'
-            f'  if [ "$cand_bytes" -eq {size_bytes} ] && [ "$1" = "{expected_sha256}" ]; then\n'
+            'if [ -e "$cand" ] || [ -L "$cand" ]; then\n'
+            '  if [ -L "$cand" ] || [ ! -f "$cand" ] || [ ! -r "$cand" ]; then\n'
+            '    echo "ERROR: staging candidate $cand is unreadable or not a regular file; refusing storage declare-lost" >&2\n'
+            "    exit 1\n"
+            "  fi\n"
+            '  raw_wc="$(wc -c < "$cand")"\n'
+            '  cand_bytes="$(printf \'%s\' "$raw_wc" | tr -d \'[:space:]\')"\n'
+            '  case "$cand_bytes" in \'\'|*[!0-9]*)\n'
+            '    echo "ERROR: failed to read byte size of staging candidate $cand" >&2\n'
+            "    exit 1\n"
+            "    ;;\n"
+            "  esac\n"
+            '  raw_sha="$(sha256sum "$cand")"\n'
+            '  cand_sha="${raw_sha%% *}"\n'
+            '  if [ "${#cand_sha}" -ne 64 ]; then\n'
+            '    echo "ERROR: failed to compute SHA-256 of staging candidate $cand" >&2\n'
+            "    exit 1\n"
+            "  fi\n"
+            f'  if [ "$cand_bytes" -eq {size_bytes} ] && [ "$cand_sha" = "{expected_sha256}" ]; then\n'
             '    cp -a -- "$cand" "$dst"\n'
             '    chmod 0600 "$dst"\n'
             "    recovered=1\n"
@@ -893,6 +944,22 @@ def db_url(db_namespace: str, role: str, password: str, *, dbname: str = "openme
     return f"postgres://{smoke.DB_ROLE[role]}:{password}@{host}:5432/{dbname}?sslmode=disable"
 
 
+def target_mcp_url() -> str:
+    """Synthetic in-cluster MCP write destination served by `sglang-standin` in `TARGET_DB_NS`."""
+    return f"http://{smoke.STANDIN}.{TARGET_DB_NS}.svc.cluster.local:{smoke.STANDIN_PORT}/tools/send"
+
+
+def mcp_post_probe_command(host: str, port: int, path: str, body_json: str) -> list[str]:
+    """POST a JSON payload over `/dev/tcp` inside `bash` and print the HTTP response status line."""
+    script = (
+        'exec 3<>"/dev/tcp/$0/$1" && body=$3 && '
+        'printf "POST %s HTTP/1.1\\r\\nHost: %s:%s\\r\\nContent-Type: application/json\\r\\n'
+        'Content-Length: %s\\r\\nConnection: close\\r\\n\\r\\n%s" '
+        '"$2" "$0" "$1" "${#body}" "$body" >&3 && head -n 1 <&3'
+    )
+    return ["timeout", str(smoke.PROBE_SECONDS), "bash", "-c", script, host, str(port), path, body_json]
+
+
 def drill_inference_document(app_namespace: str, catalog: dict) -> dict:
     """Reuse `smoke.smoke_inference_document` (ADR 0043 `installation` + `routes` schema) for `app_namespace`."""
     doc = smoke.smoke_inference_document(catalog, tls=False)
@@ -946,6 +1013,7 @@ def drill_chart_values(
                     "executingPerScope": 4,
                 },
             },
+            "mcp": {"enabled": True},
         },
         "migration": {
             "activeDeadlineSeconds": smoke.MIGRATION_DEADLINE_SECONDS,
@@ -956,7 +1024,10 @@ def drill_chart_values(
                 "ingressFrom": [ns_peer(db_namespace, smoke.POSTGRES_LABELS)],
                 "oidc": {"to": [{"ipBlock": {"cidr": smoke.AUTH_OIDC_CIDR}}], "port": 443},
             },
-            "worker": {"inference": {"to": [gateway_peer], "port": 8082}},
+            "worker": {
+                "inference": {"to": [gateway_peer], "port": 8082},
+                "mcp": {"to": [ns_peer(db_namespace, smoke.STANDIN_LABELS)], "ports": [smoke.STANDIN_PORT]},
+            },
             "database": {"to": [ns_peer(db_namespace, smoke.POSTGRES_LABELS)]},
         },
         "storage": {
@@ -1072,6 +1143,11 @@ def isolation_and_config_manifests(
         "app.kubernetes.io/instance": RELEASE,
         "app.kubernetes.io/component": smoke.GATEWAY_COMPONENT,
     }
+    worker_labels = {
+        "app.kubernetes.io/name": "openmettle-core",
+        "app.kubernetes.io/instance": RELEASE,
+        "app.kubernetes.io/component": "worker",
+    }
 
     items: list[dict] = [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": app_ns, "labels": restricted_ns_labels}},
@@ -1106,7 +1182,7 @@ def isolation_and_config_manifests(
          "spec": {
              "podSelector": {"matchLabels": smoke.STANDIN_LABELS},
              "policyTypes": ["Ingress", "Egress"],
-             "ingress": [{"from": [ns_peer(app_ns, gateway_labels)],
+             "ingress": [{"from": [ns_peer(app_ns, gateway_labels), ns_peer(app_ns, worker_labels)],
                           "ports": [{"protocol": "TCP", "port": smoke.STANDIN_PORT}]}],
          }},
         {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
@@ -1600,6 +1676,15 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         finally:
             fwd.close()
 
+    def standin_mcp_records(self, db_ns: str) -> list[dict]:
+        fwd = smoke.PortForward(self.kubectl, self.env, f"service/{smoke.STANDIN}", smoke.STANDIN_PORT, namespace=db_ns)
+        try:
+            status, body = self.core.http_get(fwd.port, "/_recorded_mcp")
+            self.expect(status == 200, f"{db_ns} stand-in /_recorded_mcp HTTP {status}")
+            return json.loads(body)
+        finally:
+            fwd.close()
+
     def api_call(self, port: int, cookie: str, method: str, path: str, expected_status: int, *,
                  key: str | None = None, json_body: dict | None = None,
                  raw_body: bytes = b"", boundary: str | None = None) -> tuple[dict, bytes]:
@@ -1852,6 +1937,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         )
         fixture_out = self.kube("--namespace", PRIMARY_DB_NS, "exec", "--stdin", primary_pg_pod, "--",
                                 "/tmp/kind-drill-fixture", USER_A_IDS["user"], USER_A_IDS["approval"],
+                                target_mcp_url(),
                                 input=fixture_stdin).stdout.strip()
         parked = json.loads(fixture_out)
         self.verify_identity()
@@ -1911,7 +1997,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.kube("--namespace", PRIMARY_APP_NS, "delete", "job", capture_job, "--wait=true", timeout=120)
 
         # Post-backup activity on primary: purge art_post_purge, revoke share & disconnect conn_revoke,
-        # and disable user_c + withdraw user_c's identity approval (Step 5b fixture).
+        # disable user_c + withdraw user_c's identity approval (Step 5b principal fixture), and
+        # disable catalog model `smoke.CATALOG_MODEL` for user_d under audited family policy.
         self.psql_superuser(
             PRIMARY_DB_NS,
             "UPDATE openmettle.retention_policy SET min_grace_seconds = 0, grace_seconds = 0 WHERE id;\n"
@@ -1923,6 +2010,51 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" WHERE id = '{USER_C_IDS['approval']}'::uuid;",
         )
         disabled_principals = [(USER_C_IDS["user"], USER_C_IDS["approval"])]
+        disabled_family_models = [(USER_D_IDS["user"], "UTC", smoke.CATALOG_MODEL)]
+        admin_ref = self.report["images"]["admin"]["reference"]
+        pri_labels = {"openmettle.dev/environment": "dev", RUN_LABEL: self.run_id}
+        family_restrict_script = (
+            f'openmettle-admin family set-policy --user "{USER_D_IDS["user"]}" --zone "UTC" '
+            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-primary-family-policy-1" '
+            '--reason "post-backup family policy creation"\n'
+            f'openmettle-admin family set-model --user "{USER_D_IDS["user"]}" --kind disabled '
+            f'--model "{smoke.CATALOG_MODEL}" --enable --operator-id "{DRILL_OPERATOR_ID}" '
+            '--request-key "drill-primary-family-disable-a-1" '
+            '--reason "post-backup disabled model restriction"\n'
+        )
+        family_restrict_job = {
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "openmettle-drill-primary-family-restrict", "namespace": PRIMARY_APP_NS, "labels": pri_labels},
+            "spec": {
+                "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                "template": {
+                    "metadata": {"labels": {**pri_labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                    "spec": {
+                        "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                        "securityContext": POD_SEC_CONTEXT,
+                        "containers": [{
+                            "name": "family-restrict", "image": admin_ref, "imagePullPolicy": "Never",
+                            "command": ["/bin/sh", "-eu", "-c", family_restrict_script],
+                            "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
+                            "securityContext": CONTAINER_SEC_CONTEXT,
+                        }],
+                    },
+                },
+            },
+        }
+        self.run_job(PRIMARY_APP_NS, family_restrict_job)
+        family_audit = self.psql_superuser(
+            PRIMARY_DB_NS,
+            "SELECT details->>'grantee_id', details->>'model'"
+            " FROM openmettle.authorization_audit"
+            " WHERE action = 'family_policy.model_disable'"
+            " ORDER BY id DESC LIMIT 1;",
+        ).strip()
+        self.expect(
+            family_audit == f"{USER_D_IDS['user']}|{smoke.CATALOG_MODEL}",
+            f"primary family_policy.model_disable audit row missing or mismatched: {family_audit!r}",
+        )
 
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=PRIMARY_APP_NS)
         try:
@@ -1967,7 +2099,6 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         wm_seq_s, wm_digest_s = wm_row.split("|")
         stopped_primary_watermark = (int(wm_seq_s), wm_digest_s)
 
-        admin_ref = self.report["images"]["admin"]["reference"]
         export_file = f"{smoke.BACKUP_DEST_DIR}/post-backup-journal.export"
         export_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -2017,6 +2148,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "export_file": export_file,
             "stopped_primary_watermark": stopped_primary_watermark,
             "disabled_principals": disabled_principals,
+            "disabled_family_models": disabled_family_models,
             "cutover_at": cutover_at,
             "personal_conv": personal_conv,
             "completed_run_id": completed_run_id,
@@ -2644,8 +2776,12 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify; printf "QUOTA_STAGE4_END\\n"\n'
             )
 
+        family_reconcile_lines = build_family_policy_reconcile_lines(
+            DRILL_OPERATOR_ID, restore_run_id, primary_state["disabled_family_models"]
+        )
         step4b_script = (
             replay_and_rebind_lines
+            + family_reconcile_lines
             + 'printf "VAULT_BEFORE_BEGIN\\n"; openmettle-admin vault status; printf "VAULT_BEFORE_END\\n"\n'
             + f'openmettle-admin vault rotate --vault-keys "{good_vt_cfg}" '
               f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-vault-rotate-{restore_run_id}" '
@@ -2935,10 +3071,31 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             + fresh_post_restore_session_sql(USER_D_IDS, sid_d2, smoke.b64url(secrets.token_bytes(32)), hash_d2, "target-d"),
         )
 
-        # Give target worker 3 sweeps to prove zero unsolicited SGLang calls from parked runs/write intents.
+        # Give target worker 3 sweeps to prove zero unsolicited inference OR MCP write (/tools/send)
+        # calls from parked runs/write intents, then fire a live positive control from the target
+        # worker pod to the exact MCP destination URL to prove observation reachability.
         time.sleep(3.0)
         self.expect(self.standin_records(TARGET_DB_NS) == [],
                     "target worker emitted unsolicited upstream gateway calls after restore")
+        self.expect(self.standin_mcp_records(TARGET_DB_NS) == [],
+                    "target worker replayed unsolicited MCP write calls to /tools/send after restore")
+
+        mcp_ctrl_body = json.dumps({"control": "worker-mcp-reachability"}, separators=(",", ":"))
+        mcp_ctrl_res = self.kube(
+            "--namespace", TARGET_APP_NS, "exec", f"deployment/{FULLNAME}-worker",
+            "--container", "worker", "--",
+            *mcp_post_probe_command(f"{smoke.STANDIN}.{TARGET_DB_NS}.svc.cluster.local", smoke.STANDIN_PORT, "/tools/send", mcp_ctrl_body),
+            check=False, timeout=smoke.PROBE_SECONDS + 30,
+        )
+        self.expect(
+            smoke.probe_outcome(mcp_ctrl_res.returncode, mcp_ctrl_res.stdout, mcp_ctrl_res.stderr, True) == "connected",
+            f"target worker positive control POST /tools/send failed: rc={mcp_ctrl_res.returncode}, out={mcp_ctrl_res.stdout!r}, err={mcp_ctrl_res.stderr!r}",
+        )
+        mcp_ctrl_records = self.standin_mcp_records(TARGET_DB_NS)
+        self.expect(
+            len(mcp_ctrl_records) == 1 and mcp_ctrl_records[0].get("body") == {"control": "worker-mcp-reachability"},
+            f"expected positive control recorded at /_recorded_mcp, got {mcp_ctrl_records!r}",
+        )
 
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=TARGET_APP_NS)
         try:
@@ -2946,8 +3103,18 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             for rejected_cookie in (self.cookie_a_pre, self.cookie_b_pre, self.cookie_c_pre, self.cookie_d_pre, cookie_c2):
                 self.api_call(fwd.port, rejected_cookie, "GET", "/v1/quotas/personal", 401)
             self.api_call(fwd.port, cookie_c2, "GET", f"/v1/projects/{primary_state['project_id']}", 401)
-            # Active non-member user_d is authenticated (200 on personal quotas).
+            # Active non-member user_d is authenticated (200 on personal quotas), while the post-backup
+            # family-policy disabled model returns 403 policy on POST /v1/runs.
             self.api_json(fwd.port, cookie_d2, "GET", "/v1/quotas/personal", 200)
+            d_conv = self.api_json(fwd.port, cookie_d2, "POST", "/v1/conversations", 201,
+                                   key="drill-userd-conv", json_body={})
+            _, denied_model_body = self.api_call(
+                fwd.port, cookie_d2, "POST", "/v1/runs", 403,
+                key="drill-userd-disabled-model",
+                json_body=smoke.run_request(d_conv, str(uuid.uuid4())),
+            )
+            self.expect(json.loads(denied_model_body).get("code") == "policy",
+                        f"expected 403 policy for disabled model, got {denied_model_body!r}")
 
             # 2. Surviving personal conversation, completed run history, and personal artifact ownership/404 isolation.
             p_conv_id = primary_state["personal_conv"]["conversation_id"]
@@ -3094,6 +3261,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
         self.expect(len(self.standin_records(TARGET_DB_NS)) == 1,
                     "expected exactly 1 upstream gateway call from the fresh post-restore turn")
+        self.expect(len(self.standin_mcp_records(TARGET_DB_NS)) == 1,
+                    "expected no additional MCP write calls beyond the single positive control")
 
         # Verify SQL invariants on target: write intent outcome_unknown (rev 1), exact post-backup
         # run_events appended in order & contiguous with runs.last_event_sequence, waiting_run quota
@@ -3113,6 +3282,11 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         sql_checks = self.psql_superuser(
             TARGET_DB_NS,
             f"SELECT (SELECT outcome || ':' || revision::text FROM openmettle.operations WHERE id = '{i_op_id}'::uuid),"
+            f" (SELECT target FROM openmettle.operations WHERE id = '{i_op_id}'::uuid),"
+            f" (SELECT EXISTS (SELECT 1 FROM openmettle.family_policies fp"
+            f"   JOIN openmettle.family_policy_models fpm ON fpm.policy_id = fp.id"
+            f"   WHERE fp.grantee_kind = 'user' AND fp.grantee_user_id = '{USER_D_IDS['user']}'::uuid"
+            f"     AND fp.active AND fpm.rule_kind = 'disabled' AND fpm.model = '{smoke.CATALOG_MODEL}' AND fpm.active)),"
             f" (SELECT encryption_key_id IS NULL AND access_ciphertext IS NULL AND refresh_ciphertext IS NULL"
             f"    FROM openmettle.external_connections WHERE id = '{primary_state['conn_revoke_id']}'::uuid),"
             f" (SELECT (extract(epoch FROM purge_after) * 1000000)::bigint"
@@ -3142,7 +3316,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid);",
         ).strip()
         expected_sql = (
-            f"outcome_unknown:1|t|{expected_purge_after_us}|purged|t|f|"
+            f"outcome_unknown:1|{target_mcp_url()}|t|t|{expected_purge_after_us}|purged|t|f|"
             f"{w_expected_seq}:{w_expected_seq}:1:{w_expected_seq}|run-terminal:openmettle.run-cancelled|"
             f"{i_expected_seq}:{i_expected_seq}:1:{i_expected_seq}|unresolved-write:{i_op_id}|"
             "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1"
