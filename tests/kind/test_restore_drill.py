@@ -29,6 +29,68 @@ PG_CLIENT = {"registry": "docker.io", "repository": "library/postgres", "digest"
 GENESIS = "0" * 64
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
+DEFAULT_LOST_REVISION_ID = "99999999-9999-4999-8999-999999999995"
+DEFAULT_FIXTURE_SCOPE_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def build_six_record_journal_fixture(
+    lost_entity: str = DEFAULT_LOST_REVISION_ID,
+    scope_id: str = DEFAULT_FIXTURE_SCOPE_ID,
+) -> tuple[list[str], list[str], bytes]:
+    """Build a six-record deletion journal fixture with valid `deletion_journal_digest` chains."""
+    conn_id = "11111111-1111-4111-8111-111111111115"
+    conn_disconnect_digest = hashlib.sha256(f"disconnect:{conn_id}:1".encode("utf-8")).hexdigest()
+    specs = [
+        (1, 1795450010000000, "artifact_revision.purged", "11111111-1111-4111-8111-111111111111", scope_id, None, 1795450009000000, 1795450010000000, DIGEST_A, 1),
+        (2, 1795450011000000, "artifact_revision.retained", "11111111-1111-4111-8111-111111111112", scope_id, 1795450011000000, 1795450020000000, None, DIGEST_A, 1),
+        (3, 1795450012000000, "artifact_revision.deadline_adjusted", "11111111-1111-4111-8111-111111111112", scope_id, 1795450011000000, 1795450025000000, None, DIGEST_A, 2),
+        (4, 1795450013000000, "artifact_revision.restored", "11111111-1111-4111-8111-111111111112", scope_id, None, None, None, DIGEST_A, None),
+        (5, 1795450014000000, "external_connection.disconnected", conn_id, scope_id, None, None, None, conn_disconnect_digest, 1),
+        (6, 1795450015000000, "artifact_revision.lost", lost_entity, scope_id, None, None, 1795450015000000, DIGEST_A, None),
+    ]
+    records: list[str] = []
+    chains: list[str] = []
+    prev = GENESIS
+    for seq, at_us, kind, entity, scope, r_us, a_us, p_us, c_dig, pol in specs:
+        chain = restore_drill.compute_journal_record_chain_digest(
+            prev,
+            seq=seq,
+            kind=kind,
+            entity=entity,
+            scope=scope,
+            recorded_us=at_us,
+            retained_us=r_us,
+            after_us=a_us,
+            purged_us=p_us,
+            content_digest=c_dig,
+            policy_rev=pol,
+        )
+        pol_s = "-" if pol is None else str(pol)
+        a_s = "-" if a_us is None else str(a_us)
+        p_s = "-" if p_us is None else str(p_us)
+        if kind == "artifact_revision.purged":
+            records.append(f"{seq} {at_us} {kind} {entity} {scope} {a_s} {p_s} {c_dig} {pol_s} {chain}")
+        else:
+            r_s = "-" if r_us is None else str(r_us)
+            records.append(f"{seq} {at_us} {kind} {entity} {scope} {a_s} {p_s} {c_dig} {pol_s} {chain} {r_s}")
+        chains.append(chain)
+        prev = chain
+    body = (
+        "\n".join([
+            "openmettle.deletion_journal.export/1",
+            "origin 1795450000000000",
+            "lifecycle_origin 1795450010500000",
+            f"lifecycle_baseline {GENESIS}",
+            "connection_origin 1795450010600000",
+            *records,
+            f"watermark 1795450000000000 6 {chains[-1]} 1795450025000000",
+        ])
+        + "\n"
+    )
+    body_b = body.encode("utf-8")
+    raw_bytes = body_b + f"sha256 {hashlib.sha256(body_b).hexdigest()}\n".encode("ascii")
+    return records, chains, raw_bytes
+
 
 SAMPLE_JOURNAL = f"""\
 openmettle.deletion_journal.export/1
@@ -181,28 +243,31 @@ class JournalAndRebindParserTest(unittest.TestCase):
             )
 
     def test_verify_persisted_post_restore_journal_checks_sha256_watermark_and_lost_records(self):
-        rev_lost = "99999999-9999-4999-8999-999999999995"
-        scope_id = "22222222-2222-4222-8222-222222222222"
+        rev_lost = DEFAULT_LOST_REVISION_ID
+        scope_id = DEFAULT_FIXTURE_SCOPE_ID
 
-        def make_export_bytes(records: list[str], *, seq: int = 6, with_lifecycle: bool = True, eol: str = "\n", sum_eol: str = "\n") -> bytes:
+        def make_export_bytes(
+            records: list[str],
+            *,
+            seq: int,
+            tail_chain: str,
+            with_lifecycle: bool = True,
+            baseline_lines: list[str] = (),
+            baseline_digest: str = GENESIS,
+            eol: str = "\n",
+            sum_eol: str = "\n",
+        ) -> bytes:
             lines = ["openmettle.deletion_journal.export/1", "origin 1795450000000000"]
             if with_lifecycle:
-                lines.extend(["lifecycle_origin 1795450000000100", f"lifecycle_baseline {GENESIS}"])
-            lines.extend(["connection_origin 1795450000000200", *records, f"watermark 1795450000000000 {seq} {DIGEST_B} 1795450025000000"])
+                lines.extend(["lifecycle_origin 1795450010500000", f"lifecycle_baseline {baseline_digest}", *baseline_lines])
+            lines.extend(["connection_origin 1795450010600000", *records, f"watermark 1795450000000000 {seq} {tail_chain} 1795450025000000"])
             body = eol.join(lines) + eol
             body_b = body.encode("utf-8")
             trailer = f"sha256 {hashlib.sha256(body_b).hexdigest()}{sum_eol}".encode("ascii")
             return body_b + trailer
 
-        base_records = [
-            f"1 1795450010000000 artifact_revision.purged 11111111-1111-4111-8111-111111111111 {scope_id} 1795450009000000 1795450010000000 {DIGEST_A} 1 {DIGEST_A}",
-            f"2 1795450011000000 artifact_revision.retained 11111111-1111-4111-8111-111111111112 {scope_id} 1795450020000000 - {DIGEST_A} 1 {DIGEST_A} 1795450011000000",
-            f"3 1795450012000000 artifact_revision.deadline_adjusted 11111111-1111-4111-8111-111111111113 {scope_id} 1795450025000000 - {DIGEST_A} 1 {DIGEST_A} 1795450012000000",
-            f"4 1795450013000000 artifact_revision.restored 11111111-1111-4111-8111-111111111114 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -",
-            f"5 1795450014000000 external_connection.disconnected 11111111-1111-4111-8111-111111111115 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -",
-            f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - 1795450015000000 {DIGEST_A} - {DIGEST_B} -",
-        ]
-        valid = make_export_bytes(base_records)
+        base_records, chains, valid = build_six_record_journal_fixture(rev_lost, scope_id)
+        self.assertEqual(chains[0], "15cf6556c7336ea2839a714d64201432a08031de004b90a6eec4d2f7caee26c1")
         # Round-trip via base64 even with `\r\n` log line-ending normalization.
         b64_log = base64.encodebytes(valid).decode("ascii").replace("\n", "\r\n").replace("\r\n", "\n")
         decoded_valid = restore_drill.decode_base64_export_bytes(b64_log)
@@ -210,6 +275,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
             decoded_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
         )
         self.assertEqual(wm["required_seq"], 6)
+        self.assertEqual(wm["required_digest"], chains[-1])
 
         with self.assertRaisesRegex(restore_drill.DrillFailure, "raw bytes"):
             restore_drill.verify_persisted_post_restore_journal(
@@ -227,7 +293,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
             )
 
         # Even if CRLF bytes carry a matching SHA-256 over the CRLF body, CR bytes in body MUST fail closed.
-        crlf_rehashed = make_export_bytes(base_records, eol="\r\n", sum_eol="\n")
+        crlf_rehashed = make_export_bytes(base_records, seq=6, tail_chain=chains[-1], eol="\r\n", sum_eol="\n")
         with self.assertRaisesRegex(restore_drill.DrillFailure, "carriage returns"):
             restore_drill.verify_persisted_post_restore_journal(
                 crlf_rehashed, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
@@ -239,9 +305,52 @@ class JournalAndRebindParserTest(unittest.TestCase):
                 tampered, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
             )
 
+        # Baseline canonical integer parsing & hashing (`01` and `+1` accepted and hashed as `1`, not raw text):
+        b_ent = "11111111-1111-4111-8111-111111111199"
+        canonical_b_digest = hashlib.sha256(
+            f"{GENESIS}:{b_ent}:{scope_id}:purging:1795450001000000:1795450002000000:1795450030000000:{DIGEST_A}:1".encode("utf-8")
+        ).hexdigest()
+        raw_text_b_digest = hashlib.sha256(
+            f"{GENESIS}:{b_ent}:{scope_id}:purging:1795450001000000:1795450002000000:01795450030000000:{DIGEST_A}:01".encode("utf-8")
+        ).hexdigest()
+        for pol_text, purg_text in (("01", "01795450030000000"), ("+1", "+1795450030000000")):
+            b_line = f"baseline {b_ent} {scope_id} purging 1795450001000000 1795450002000000 {purg_text} {DIGEST_A} {pol_text}"
+            ok_baseline = make_export_bytes(
+                base_records, seq=6, tail_chain=chains[-1], baseline_lines=[b_line], baseline_digest=canonical_b_digest
+            )
+            wm_b = restore_drill.verify_persisted_post_restore_journal(
+                ok_baseline, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+            self.assertEqual(wm_b["lifecycle_baseline_digest"], canonical_b_digest)
+
+        bad_baseline = make_export_bytes(
+            base_records,
+            seq=6,
+            tail_chain=chains[-1],
+            baseline_lines=[f"baseline {b_ent} {scope_id} purging 1795450001000000 1795450002000000 01795450030000000 {DIGEST_A} 01"],
+            baseline_digest=raw_text_b_digest,
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "lifecycle baseline digest mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                bad_baseline, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        # Bad chain digest on record 1 even with matching watermark & file sha256 MUST fail replay parity:
+        bad_chain = make_export_bytes(
+            [f"1 1795450010000000 artifact_revision.purged 11111111-1111-4111-8111-111111111111 {scope_id} 1795450009000000 1795450010000000 {DIGEST_A} 1 {DIGEST_A}"],
+            seq=1,
+            tail_chain=DIGEST_A,
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "chain digest mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                bad_chain, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[]
+            )
+
         # Retained Review #15 malformed fixture (starts at seq 6, omits lifecycle_origin, '-' for purged_us):
         malformed_combined = make_export_bytes(
             [f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - - {DIGEST_A} - {DIGEST_B} -"],
+            seq=6,
+            tail_chain=DIGEST_B,
             with_lifecycle=False,
         )
         with self.assertRaises(restore_drill.DrillFailure):
@@ -250,13 +359,13 @@ class JournalAndRebindParserTest(unittest.TestCase):
             )
 
         # Individual Export::parse rejection cases:
-        no_lifecycle = make_export_bytes([base_records[-1]], seq=1, with_lifecycle=False)
+        no_lifecycle = make_export_bytes([base_records[-1]], seq=6, tail_chain=chains[-1], with_lifecycle=False)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing lifecycle_origin"):
             restore_drill.verify_persisted_post_restore_journal(
                 no_lifecycle, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[rev_lost]
             )
 
-        seq_gap = make_export_bytes([base_records[-1]], seq=6, with_lifecycle=True)
+        seq_gap = make_export_bytes([base_records[-1]], seq=6, tail_chain=chains[-1], with_lifecycle=True)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "out of sequence"):
             restore_drill.verify_persisted_post_restore_journal(
                 seq_gap, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
@@ -265,6 +374,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         missing_purged_us = make_export_bytes(
             [*base_records[:-1], f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - - {DIGEST_A} - {DIGEST_B} -"],
             seq=6,
+            tail_chain=DIGEST_B,
             with_lifecycle=True,
         )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "malformed artifact_revision.lost"):
@@ -272,9 +382,32 @@ class JournalAndRebindParserTest(unittest.TestCase):
                 missing_purged_us, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
             )
 
-        other_valid = make_export_bytes(
-            [*base_records[:-1], f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999999 {scope_id} - 1795450015000000 {DIGEST_A} - {DIGEST_B} -"]
+        # Post-lifecycle purged without baseline/prior retained MUST fail replay parity:
+        missing_retained_chain = restore_drill.compute_journal_record_chain_digest(
+            GENESIS,
+            seq=1,
+            kind="artifact_revision.purged",
+            entity="11111111-1111-4111-8111-111111111111",
+            scope=scope_id,
+            recorded_us=1795450010600000,
+            after_us=1795450009000000,
+            purged_us=1795450010600000,
+            content_digest=DIGEST_A,
+            policy_rev=1,
         )
+        post_lc_purged = make_export_bytes(
+            [
+                f"1 1795450010600000 artifact_revision.purged 11111111-1111-4111-8111-111111111111 {scope_id} 1795450009000000 1795450010600000 {DIGEST_A} 1 {missing_retained_chain}"
+            ],
+            seq=1,
+            tail_chain=missing_retained_chain,
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "lacks baseline or prior retained commitment"):
+            restore_drill.verify_persisted_post_restore_journal(
+                post_lc_purged, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[]
+            )
+
+        _, _, other_valid = build_six_record_journal_fixture("99999999-9999-4999-8999-999999999999", scope_id)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
                 other_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
@@ -1022,6 +1155,11 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("Unconfigured", step6)
         self.assertIn("post-restore-$RESTORE_RUN_UUID.export", step6)
         self.assertIn("artifact_revision.lost", step6)
+        self.assertIn("Checks completable immediately", step6)
+        self.assertIn("Checks requiring a newly authenticated", step6)
+        self.assertIn("openmettle.local_sessions", step6)
+        self.assertIn("closed_signin_pending_auth_verification", step6)
+        self.assertIn("docs/operator/login-admission-limit.psql", step6)
 
         m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
         self.assertIsNotNone(m_sh)
@@ -1626,22 +1764,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         if name == "openmettle-drill-post-verify":
             return self._res(0, qv)
         if name == "openmettle-drill-read-post-export":
-            scope_id = "22222222-2222-4222-8222-222222222222"
-            export_body = (
-                "openmettle.deletion_journal.export/1\n"
-                "origin 1795450000000000\n"
-                "lifecycle_origin 1795450000000100\n"
-                f"lifecycle_baseline {GENESIS}\n"
-                "connection_origin 1795450000000200\n"
-                f"1 1795450010000000 artifact_revision.purged 11111111-1111-4111-8111-111111111111 {scope_id} 1795450009000000 1795450010000000 {DIGEST_A} 1 {DIGEST_A}\n"
-                f"2 1795450011000000 artifact_revision.retained 11111111-1111-4111-8111-111111111112 {scope_id} 1795450020000000 - {DIGEST_A} 1 {DIGEST_A} 1795450011000000\n"
-                f"3 1795450012000000 artifact_revision.deadline_adjusted 11111111-1111-4111-8111-111111111113 {scope_id} 1795450025000000 - {DIGEST_A} 1 {DIGEST_A} 1795450012000000\n"
-                f"4 1795450013000000 artifact_revision.restored 11111111-1111-4111-8111-111111111114 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -\n"
-                f"5 1795450014000000 external_connection.disconnected 11111111-1111-4111-8111-111111111115 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -\n"
-                f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999995 {scope_id} - 1795450015000000 {DIGEST_A} - {DIGEST_B} -\n"
-                f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
-            )
-            raw_export = (export_body + f"sha256 {hashlib.sha256(export_body.encode('utf-8')).hexdigest()}\n").encode("utf-8")
+            _, _, raw_export = build_six_record_journal_fixture()
             return self._res(0, base64.encodebytes(raw_export).decode("ascii"))
         return self._res(0, "")
 
@@ -1658,11 +1781,12 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "intent_operation_id": "aaaa0000-0000-4000-8000-000000000005",
             }))
         if "cat" in argv and any("post-backup-journal.export" in a for a in argv):
+            _, chains, _ = build_six_record_journal_fixture()
             return self._res(
                 0,
                 "openmettle.deletion_journal.export/1\n"
                 "origin 1795450000000000\n"
-                f"watermark 1795450000000000 5 {DIGEST_B} 1795450020000000\n"
+                f"watermark 1795450000000000 5 {chains[4]} 1795450020000000\n"
                 f"sha256 {'c' * 64}\n",
             )
         if "psql" in argv and stdin_text:
@@ -1739,7 +1863,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return self._res(0, "purged\n")
             if "FROM openmettle.deletion_journal_head" in stdin_text:
                 self.assertIn("SELECT journal_seq", stdin_text)
-                return self._res(0, f"5|{DIGEST_B}\n")
+                _, chains, _ = build_six_record_journal_fixture()
+                return self._res(0, f"5|{chains[4]}\n")
             if "_sqlx_migrations" in stdin_text:
                 return self._res(0, f"{smoke.REQUIRED_MIGRATION}|1|t\n")
             return self._res(0, "")

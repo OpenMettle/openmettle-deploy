@@ -188,18 +188,19 @@ def parse_journal_export_watermarks(text: str) -> dict:
             continue
         tag = parts[0]
         if tag == "origin" and len(parts) == 2:
-            origin_us = int(parts[1])
+            origin_us = _parse_i64(parts[1], "origin")
         elif tag == "lifecycle_origin" and len(parts) == 2:
-            lifecycle_origin_us = int(parts[1])
+            lifecycle_origin_us = _parse_i64(parts[1], "lifecycle_origin")
         elif tag == "lifecycle_baseline" and len(parts) == 2:
             if not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
                 raise DrillFailure("invalid lifecycle_baseline digest in journal export")
             lifecycle_baseline_digest = parts[1]
         elif tag == "connection_origin" and len(parts) == 2:
-            connection_origin_us = int(parts[1])
+            connection_origin_us = _parse_i64(parts[1], "connection_origin")
         elif tag == "watermark" and len(parts) == 5:
-            wm_origin = int(parts[1])
-            watermark_seq = int(parts[2])
+            wm_origin = _parse_i64(parts[1], "watermark origin")
+            watermark_seq = _parse_i64(parts[2], "watermark seq")
+            _parse_i64(parts[4], "watermark exported_at")
             if not re.fullmatch(r"[0-9a-f]{64}", parts[3]):
                 raise DrillFailure("invalid watermark chain digest in journal export")
             watermark_digest = parts[3]
@@ -234,7 +235,7 @@ def decode_base64_export_bytes(b64_text: str) -> bytes:
 
 
 def _parse_i64(raw: str, label: str) -> int:
-    if not re.fullmatch(r"-?[0-9]+", raw):
+    if not re.fullmatch(r"[+-]?[0-9]+", raw, re.ASCII):
         raise DrillFailure(f"malformed {label} integer in journal export: {raw!r}")
     val = int(raw)
     if val < -(2**63) or val > (2**63 - 1):
@@ -250,10 +251,74 @@ def _is_hex64(raw: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{64}", raw))
 
 
-def _baseline_step(prev_hex: str, fields: tuple[str, ...]) -> str:
-    entity, scope, state, r_us, a_us, purging, content, policy = fields
-    payload = f"{prev_hex}:{entity}:{scope}:{state}:{r_us}:{a_us}:{purging}:{content}:{policy}".encode("utf-8")
+def _baseline_step(
+    prev_hex: str,
+    entity: str,
+    scope: str,
+    state: str,
+    retained_us: int,
+    after_us: int,
+    purging_us: int | None,
+    content: str,
+    policy_rev: int | None,
+) -> str:
+    """Match `openmettle-core` `src/restore.rs::baseline_step` using canonical decimal integers."""
+    purging = "-" if purging_us is None else str(purging_us)
+    policy = "-" if policy_rev is None else str(policy_rev)
+    payload = f"{prev_hex}:{entity}:{scope}:{state}:{retained_us}:{after_us}:{purging}:{content}:{policy}".encode(
+        "utf-8"
+    )
     return hashlib.sha256(payload).hexdigest()
+
+
+def compute_journal_record_chain_digest(
+    prev_chain_hex: str,
+    *,
+    seq: int,
+    kind: str,
+    entity: str,
+    scope: str,
+    recorded_us: int,
+    retained_us: int | None = None,
+    after_us: int | None = None,
+    purged_us: int | None = None,
+    content_digest: str,
+    policy_rev: int | None = None,
+) -> str:
+    """Compute PostgreSQL `openmettle.deletion_journal_digest(p_previous, e)` (migrations 0042/0044)."""
+    if not _is_hex64(prev_chain_hex) or not _is_hex64(content_digest):
+        raise DrillFailure("malformed hex digest for deletion_journal_digest")
+    policy_s = "" if policy_rev is None else str(policy_rev)
+    if kind == "artifact_revision.purged":
+        if after_us is None or purged_us is None:
+            raise DrillFailure("artifact_revision.purged requires after_us and purged_us")
+        msg = "|".join([
+            "openmettle.deletion_journal/1",
+            str(seq),
+            kind,
+            entity,
+            scope,
+            str(recorded_us),
+            str(after_us),
+            str(purged_us),
+            content_digest,
+            policy_s,
+        ])
+    else:
+        msg = "|".join([
+            "openmettle.deletion_journal/2",
+            str(seq),
+            kind,
+            entity,
+            scope,
+            str(recorded_us),
+            "" if retained_us is None else str(retained_us),
+            "" if after_us is None else str(after_us),
+            "" if purged_us is None else str(purged_us),
+            content_digest,
+            policy_s,
+        ])
+    return hashlib.sha256(bytes.fromhex(prev_chain_hex) + msg.encode("utf-8")).hexdigest()
 
 
 def verify_persisted_post_restore_journal(
@@ -264,8 +329,9 @@ def verify_persisted_post_restore_journal(
     lost_revision_ids: list[str] | tuple[str, ...],
 ) -> dict:
     """Verify a post-restore `deletion_journal` export read back as raw `bytes` against
-    `openmettle-core`'s complete `Export::parse` (`src/restore.rs`) SHA-256, header, lifecycle,
-    sequence, per-event-kind, and watermark invariants plus expected `artifact_revision.lost` IDs."""
+    `openmettle-core`'s complete `Export::parse` (`src/restore.rs`) and `deletion_journal_replay`
+    (`0042`/`0044`) SHA-256, header, baseline, chain digest, sequence, per-event-kind, and
+    watermark invariants plus expected `artifact_revision.lost` IDs."""
     if not isinstance(raw_bytes, (bytes, bytearray)):
         raise DrillFailure(f"persisted post-restore journal must be raw bytes, got {type(raw_bytes).__name__}")
     raw = bytes(raw_bytes)
@@ -311,6 +377,7 @@ def verify_persisted_post_restore_journal(
     genesis = "0" * 64
     lifecycle_origin_us: int | None = None
     lifecycle_baseline_digest: str | None = None
+    baseline_entities: set[str] = set()
     if (peek := peek_line()) is not None and peek.startswith("lifecycle_origin"):
         lc_parts = (next_line() or "").split(" ")
         if len(lc_parts) != 2 or lc_parts[0] != "lifecycle_origin":
@@ -345,9 +412,11 @@ def verify_persisted_post_restore_journal(
             p_us = _parse_opt_i64(purging_s, "baseline purging")
             if not ((state == "retained" and p_us is None) or (state == "purging" and p_us is not None and p_us >= a_us)):
                 raise DrillFailure("malformed baseline state/purging pair in journal export")
-            if policy_s != "-" and _parse_i64(policy_s, "baseline policy") <= 0:
+            pol_rev = _parse_opt_i64(policy_s, "baseline policy")
+            if pol_rev is not None and pol_rev <= 0:
                 raise DrillFailure("non-positive baseline policy revision in journal export")
-            folded = _baseline_step(folded, (entity, scope, state, str(r_us), str(a_us), purging_s, content, policy_s))
+            folded = _baseline_step(folded, entity, scope, state, r_us, a_us, p_us, content, pol_rev)
+            baseline_entities.add(entity)
             prev_entity = entity
         if folded != lifecycle_baseline_digest:
             raise DrillFailure("lifecycle baseline digest mismatch in journal export")
@@ -360,6 +429,9 @@ def verify_persisted_post_restore_journal(
         connection_origin_us = _parse_i64(co_parts[1], "connection_origin")
 
     records: list[tuple[int, str, str, str]] = []
+    retained_entities: set[str] = set()
+    terminal_entities: set[str] = set()
+    prev_chain = genesis
     watermark: tuple[int, str] | None = None
     while (line := next_line()) is not None:
         fields = line.split(" ")
@@ -385,11 +457,41 @@ def verify_persisted_post_restore_journal(
                 raise DrillFailure("malformed UUID in purged journal record")
             if not (_is_hex64(content) and _is_hex64(chain)):
                 raise DrillFailure("malformed digest in purged journal record")
-            if policy_s != "-" and _parse_i64(policy_s, "policy") <= 0:
+            pol = _parse_opt_i64(policy_s, "policy")
+            if pol is not None and pol <= 0:
                 raise DrillFailure("non-positive policy revision in purged journal record")
-            _parse_i64(at_s, "recorded_at")
-            _parse_i64(after_s, "original_purge_after")
-            _parse_i64(purged_s, "purged_at")
+            at_us = _parse_i64(at_s, "recorded_at")
+            a_us = _parse_i64(after_s, "original_purge_after")
+            p_us = _parse_i64(purged_s, "purged_at")
+            expected_chain = compute_journal_record_chain_digest(
+                prev_chain,
+                seq=seq,
+                kind=kind,
+                entity=entity,
+                scope=scope,
+                recorded_us=at_us,
+                after_us=a_us,
+                purged_us=p_us,
+                content_digest=content,
+                policy_rev=pol,
+            )
+            if chain != expected_chain:
+                raise DrillFailure(
+                    f"journal record {seq} chain digest mismatch: got {chain}, expected {expected_chain}"
+                )
+            if entity in terminal_entities:
+                raise DrillFailure(f"journal record {seq} conflicts with prior terminal revision commitment")
+            if (
+                lifecycle_origin_us is not None
+                and at_us > lifecycle_origin_us
+                and entity not in baseline_entities
+                and entity not in retained_entities
+            ):
+                raise DrillFailure(
+                    f"post-upgrade purge record {seq} for {entity} lacks baseline or prior retained commitment"
+                )
+            terminal_entities.add(entity)
+            prev_chain = chain
             records.append((seq, kind, entity, chain))
         elif len(fields) == 11 and watermark is None:
             seq_s, at_s, kind, entity, scope, after_s, purged_s, content, policy_s, chain, retained_s = fields
@@ -417,10 +519,10 @@ def verify_persisted_post_restore_journal(
                 raise DrillFailure("malformed UUID in 11-field journal record")
             if not (_is_hex64(content) and _is_hex64(chain)):
                 raise DrillFailure("malformed digest in 11-field journal record")
-            pol = None if policy_s == "-" else _parse_i64(policy_s, "policy")
+            pol = _parse_opt_i64(policy_s, "policy")
             if pol is not None and pol <= 0:
                 raise DrillFailure("non-positive policy revision in 11-field journal record")
-            _parse_i64(at_s, "recorded_at")
+            at_us = _parse_i64(at_s, "recorded_at")
             a_us = _parse_opt_i64(after_s, "original_purge_after")
             p_us = _parse_opt_i64(purged_s, "purged_at")
             r_us = _parse_opt_i64(retained_s, "retained_at")
@@ -436,6 +538,47 @@ def verify_persisted_post_restore_journal(
             elif is_conn:
                 if a_us is not None or p_us is not None or r_us is not None or pol is None:
                     raise DrillFailure(f"malformed {kind} fields in journal export")
+            expected_chain = compute_journal_record_chain_digest(
+                prev_chain,
+                seq=seq,
+                kind=kind,
+                entity=entity,
+                scope=scope,
+                recorded_us=at_us,
+                retained_us=r_us,
+                after_us=a_us,
+                purged_us=p_us,
+                content_digest=content,
+                policy_rev=pol,
+            )
+            if chain != expected_chain:
+                raise DrillFailure(
+                    f"journal record {seq} chain digest mismatch: got {chain}, expected {expected_chain}"
+                )
+            if kind == "artifact_revision.retained":
+                if entity in terminal_entities:
+                    raise DrillFailure(f"journal record {seq} cannot retain terminal revision {entity}")
+                retained_entities.add(entity)
+            elif kind in ("artifact_revision.deadline_adjusted", "artifact_revision.restored"):
+                if entity in terminal_entities or (entity not in baseline_entities and entity not in retained_entities):
+                    raise DrillFailure(
+                        f"journal record {seq} {kind} for {entity} lacks baseline or prior retained commitment"
+                    )
+            elif kind == "artifact_revision.lost":
+                if entity in terminal_entities:
+                    raise DrillFailure(f"journal record {seq} conflicts with prior terminal revision commitment")
+                terminal_entities.add(entity)
+            elif kind == "external_connection.disconnected":
+                expected_conn_digest = hashlib.sha256(f"disconnect:{entity}:{pol}".encode("utf-8")).hexdigest()
+                if content != expected_conn_digest:
+                    raise DrillFailure(f"invalid external_connection.disconnected content digest at seq {seq}")
+            elif kind == "external_connection.credential_superseded":
+                expected_conn_digest = hashlib.sha256(f"superseded:{entity}:{pol}".encode("utf-8")).hexdigest()
+                if content != expected_conn_digest:
+                    raise DrillFailure(
+                        f"invalid external_connection.credential_superseded content digest at seq {seq}"
+                    )
+            prev_chain = chain
             records.append((seq, kind, entity, chain))
         else:
             raise DrillFailure(f"malformed line in journal export: {line!r}")
