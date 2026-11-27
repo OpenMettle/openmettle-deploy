@@ -3,22 +3,21 @@
 
 Test harness only; not an installer or live-cluster qualification. Reuses pinned core checkout
 verification, tool/image guards, digest-aliasing helpers and secret redaction from `smoke.py` to
-exercise `docs/restore-drill.md` end-to-end across two NetworkPolicy-isolated namespace pairs
-(`openmettle-primary` + `openmettle-primary-db` and `openmettle-restore-target` +
-`openmettle-restore-target-db`) on a temporary `kind` cluster classified `dev`.
+exercise `docs/restore-drill.md` end-to-end across two NetworkPolicy-isolated and PodSecurity
+`restricted` namespace pairs (`openmettle-primary` + `openmettle-primary-db` and
+`openmettle-restore-target` + `openmettle-restore-target-db`) on a temporary `kind` cluster
+classified `dev`.
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
 import time
@@ -47,6 +46,8 @@ DRILL_NAMESPACES = (PRIMARY_APP_NS, PRIMARY_DB_NS, TARGET_APP_NS, TARGET_DB_NS)
 RUN_LABEL = "openmettle.dev/drill-run"
 RECOVERY_DB_CLIENT_LABEL = "openmettle.dev/recovery-db-client"
 RECOVERY_NETPOL = "openmettle-target-recovery-egress"
+DB_PROBE = "db-probe"
+DB_PROBE_LABELS = {"app.kubernetes.io/name": DB_PROBE}
 
 TARGET_ARTIFACTS_CLAIM = "openmettle-target-artifacts"
 TARGET_RECOVERY_MEDIA_CLAIM = "openmettle-target-recovery-media"
@@ -62,6 +63,7 @@ VAULT_KEY_FILE_2 = "vault-k2.key"
 BACKUP_KEY_ID = smoke.BACKUP_KEY_ID
 BACKUP_KEY_FILE = smoke.BACKUP_KEY_FILE
 WRONG_BACKUP_SECRET = "openmettle-drill-wrong-backup-keys"
+WRONG_BACKUP_KEYS_DIR = "/etc/openmettle/wrong-backup-keys"
 
 DRILL_OPERATOR_ID = "00000000-0000-4000-8000-00000000d031"
 USER_A_IDS = {
@@ -74,6 +76,11 @@ USER_B_IDS = {
     "user": "00000000-0000-4000-8000-00000000c202",
     "identity": "00000000-0000-4000-8000-00000000c203",
     "approval": "00000000-0000-4000-8000-00000000c204",
+}
+USER_C_IDS = {
+    "user": "00000000-0000-4000-8000-00000000c302",
+    "identity": "00000000-0000-4000-8000-00000000c303",
+    "approval": "00000000-0000-4000-8000-00000000c304",
 }
 
 RPO_TARGET_SECONDS = 86_400
@@ -110,6 +117,14 @@ POD_SEC_CONTEXT = {
     "fsGroupChangePolicy": "OnRootMismatch",
     "seccompProfile": {"type": "RuntimeDefault"},
 }
+PG_POD_SEC_CONTEXT = {
+    "runAsNonRoot": True,
+    "runAsUser": 999,
+    "runAsGroup": 999,
+    "fsGroup": 999,
+    "fsGroupChangePolicy": "OnRootMismatch",
+    "seccompProfile": {"type": "RuntimeDefault"},
+}
 CONTAINER_SEC_CONTEXT = {
     "privileged": False,
     "allowPrivilegeEscalation": False,
@@ -117,7 +132,12 @@ CONTAINER_SEC_CONTEXT = {
     "capabilities": {"drop": ["ALL"]},
 }
 
-REBIND_BARRIER_RE = re.compile(r"--replace-adoption-run\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+RESTORE_LOCK_RUN_RE = re.compile(
+    r"\brestore_run\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
+REBIND_BARRIER_RE = re.compile(
+    r"--replace-adoption-run\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
 QUOTA_DRIFT_RE = re.compile(
     r"^storage mismatches (\d+), budget mismatches (\d+), settlement mismatches (\d+), "
     r"pending gateway (\d+), file mismatches (\d+), quarantined (\d+), unsettled payloads (\d+)$"
@@ -179,6 +199,23 @@ def parse_journal_export_watermarks(text: str) -> dict:
     }
 
 
+def should_pass_export_complete(
+    watermarks: dict, stopped_primary_watermark: tuple[int, str] | None
+) -> bool:
+    """Return True only when `(required_seq, required_digest)` matches an independently recorded
+    final watermark captured after primary writes, purges, and connection revocations stopped."""
+    if stopped_primary_watermark is None:
+        return False
+    stopped_seq, stopped_digest = stopped_primary_watermark
+    return (
+        isinstance(stopped_seq, int)
+        and isinstance(stopped_digest, str)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", stopped_digest))
+        and watermarks.get("required_seq") == stopped_seq
+        and watermarks.get("required_digest") == stopped_digest
+    )
+
+
 def restore_lock_args(watermarks: dict, *, export_complete: bool) -> list[str]:
     """Build `openmettle-admin restore lock` argv from parsed journal watermarks."""
     args = ["restore", "lock", "--required-origin", str(watermarks["origin_us"])]
@@ -200,6 +237,35 @@ def restore_lock_args(watermarks: dict, *, export_complete: bool) -> list[str]:
     if export_complete:
         args.append("--export-complete")
     return args
+
+
+def parse_restore_lock_run_id(output: str) -> str:
+    """Extract `restore_run <UUID>` from `openmettle-admin restore lock` stdout."""
+    match = RESTORE_LOCK_RUN_RE.search(output)
+    if not match:
+        raise DrillFailure(f"restore lock stdout did not report restore_run UUID: {output!r}")
+    return match.group(1)
+
+
+def accept_coverage_gap_args(
+    restore_run_id: str, operator_id: str, request_key: str, reason: str
+) -> list[str]:
+    """Build `openmettle-admin restore accept-coverage-gap` argv for uncertified exports."""
+    for label, val in (("restore_run_id", restore_run_id), ("operator_id", operator_id)):
+        if not smoke.UUID.fullmatch(val):
+            raise DrillFailure(f"invalid {label} UUID: {val!r}")
+    return [
+        "restore",
+        "accept-coverage-gap",
+        "--restore-run",
+        restore_run_id,
+        "--operator-id",
+        operator_id,
+        "--request-key",
+        request_key,
+        "--reason",
+        reason,
+    ]
 
 
 def parse_failed_rebind(stdout: str, stderr: str, expected_reservation_id: str) -> str:
@@ -267,8 +333,12 @@ def parse_vault_status(output: str) -> dict:
     }
 
 
-def evaluate_manifest_preflight(manifest: dict, *, max_schema: int = REQUIRED_MIGRATION,
-                                available_vault_keys: set[str] | None = None) -> dict:
+def evaluate_manifest_preflight(
+    manifest: dict,
+    *,
+    max_schema: int = REQUIRED_MIGRATION,
+    available_vault_keys: set[str] | None = None,
+) -> dict:
     """Validate unpacked `manifest.json` compatibility before touching PostgreSQL or PVCs."""
     if manifest.get("format") != "openmettle-backup-manifest/v1":
         raise DrillFailure(f"unexpected backup manifest format: {manifest.get('format')!r}")
@@ -290,18 +360,35 @@ def evaluate_manifest_preflight(manifest: dict, *, max_schema: int = REQUIRED_MI
         missing = sorted(set(required_vault) - set(available_vault_keys))
         if missing:
             raise DrillFailure(f"target vault keyring lacks required key IDs from manifest: {missing}")
+    art_vol = manifest.get("artifact_volume") or {}
+    volume_id = art_vol.get("volume_id")
+    if volume_id is not None and (not isinstance(volume_id, str) or not smoke.UUID.fullmatch(volume_id)):
+        raise DrillFailure(f"manifest has invalid artifact_volume.volume_id: {volume_id!r}")
+    graphiti_status = (manifest.get("graphiti_neo4j") or {}).get("status", "not_provisioned")
+    if graphiti_status not in ("not_provisioned", "offline_dump"):
+        raise DrillFailure(f"manifest has unexpected graphiti_neo4j.status: {graphiti_status!r}")
+    chroma_mode = (manifest.get("chroma") or {}).get("mode", "not_provisioned")
+    if chroma_mode not in ("not_provisioned", "archive", "qualified_rebuild"):
+        raise DrillFailure(f"manifest has unexpected chroma.mode: {chroma_mode!r}")
     return {
         "backup_run_id": manifest.get("backup_run_id"),
         "schema_version": schema,
         "quiesced_at": quiesced_at,
         "journal_seq": journal_seq,
         "vault_required_key_ids": list(required_vault),
-        "artifact_revisions": (manifest.get("artifact_volume") or {}).get("revision_count"),
+        "artifact_volume_id": volume_id,
+        "artifact_revisions": art_vol.get("revision_count"),
+        "graphiti_status": graphiti_status,
+        "chroma_mode": chroma_mode,
     }
 
 
-def evaluate_rpo_rto(quiesced_at_iso: str, cutover_at: datetime,
-                     recovery_started_at: datetime, recovery_completed_at: datetime) -> dict:
+def evaluate_rpo_rto(
+    quiesced_at_iso: str,
+    cutover_at: datetime,
+    recovery_started_at: datetime,
+    recovery_completed_at: datetime,
+) -> dict:
     """Compute and enforce V1-31 RPO (<= 24h) and RTO (<= 4h) bounds."""
     quiesced_at = smoke.parse_time(quiesced_at_iso)
     data_age = (cutover_at - quiesced_at).total_seconds()
@@ -327,12 +414,32 @@ def evaluate_rpo_rto(quiesced_at_iso: str, cutover_at: datetime,
     }
 
 
-def pre_worker_reconcile_sql(operator_id: str) -> str:
-    """Owner SQL for Runbook Steps 5a (ADR 0013 session/provider invalidation) and 5c
-    (cancelling parked waiting/queued runs, resolving write intents to outcome_unknown, and
-    releasing run quota reservations)."""
+def pre_worker_owner_reconcile_sql(
+    operator_id: str,
+    *,
+    disabled_principals: list[tuple[str, str]] | tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Owner SQL for Runbook Steps 5a (ADR 0013 session/provider invalidation), 5b (post-backup
+    principal/approval revocations), and 5d.1 (two-statement run cancellation preserving
+    `resolve_terminal_write_intents()` and contiguous `runs.last_event_sequence` allocation)."""
     if not smoke.UUID.fullmatch(operator_id):
         raise DrillFailure(f"invalid operator UUID: {operator_id!r}")
+    revocations_sql = ""
+    for user_id, approval_id in disabled_principals:
+        if not (smoke.UUID.fullmatch(user_id) and smoke.UUID.fullmatch(approval_id)):
+            raise DrillFailure(f"invalid disabled principal UUIDs: {(user_id, approval_id)!r}")
+        revocations_sql += f"""\
+UPDATE openmettle.users
+   SET disabled_at = coalesce(disabled_at, clock_timestamp()),
+       session_generation = session_generation + 1
+ WHERE id = '{user_id}'::uuid;
+UPDATE openmettle.local_identity_approvals
+   SET active = false,
+       access_generation = access_generation + 1,
+       changed_by = 'operator:{operator_id}',
+       change_reason = 'post-backup principal revocation reconciliation'
+ WHERE id = '{approval_id}'::uuid;
+"""
     return f"""\
 LOCK TABLE openmettle.login_providers IN SHARE ROW EXCLUSIVE MODE;
 WITH active_providers AS (
@@ -360,76 +467,101 @@ SELECT ap.id, ap.revision
   FROM active_providers ap
   JOIN bumped b ON b.id = ap.id;
 
-WITH target_runs AS (
-    SELECT r.id, r.scope_id
-      FROM openmettle.runs r
-     WHERE r.state IN ('queued', 'running', 'waiting')
-     ORDER BY r.id
-       FOR UPDATE
-),
-cancelled AS (
-    UPDATE openmettle.runs r
-       SET state = 'cancelled',
-           wait_reason = NULL,
-           cancel_reason = coalesce(r.cancel_reason, 'revoked'),
-           claim_token = NULL,
-           claimed_at = NULL,
-           lease_expires_at = NULL,
-           execution_expires_at = NULL
-      FROM target_runs t
-     WHERE r.id = t.id
- RETURNING r.id, r.scope_id
-),
-framed_events AS (
-    SELECT c.scope_id,
-           c.id AS run_id,
-           'run-terminal'::text AS append_key,
-           'openmettle.run-cancelled'::text AS format,
-           1::integer AS format_version,
-           convert_to('{{"reason":"revoked"}}', 'UTF8') AS payload,
-           decode('6f70656e6d6574746c652f6576656e742f3100', 'hex')
-               || int8send(octet_length(c.scope_id::text)::bigint) || convert_to(c.scope_id::text, 'UTF8')
-               || int8send(octet_length(c.id::text)::bigint) || convert_to(c.id::text, 'UTF8')
-               || int8send(octet_length('run-terminal')::bigint) || convert_to('run-terminal', 'UTF8')
-               || int8send(octet_length('openmettle.run-cancelled')::bigint) || convert_to('openmettle.run-cancelled', 'UTF8')
-               || int8send(4::bigint) || int4send(1)
-               || int8send(octet_length(convert_to('{{"reason":"revoked"}}', 'UTF8'))::bigint)
-               || convert_to('{{"reason":"revoked"}}', 'UTF8') AS identity
-      FROM cancelled c
-),
-inserted_events AS (
-    INSERT INTO openmettle.run_events (
-        scope_id, run_id, sequence, append_key, identity, digest, format, format_version, payload
-    )
-    SELECT f.scope_id,
-           f.run_id,
-           coalesce((SELECT max(e.sequence) FROM openmettle.run_events e WHERE e.run_id = f.run_id), 0) + 1,
-           f.append_key,
-           f.identity,
-           sha256(f.identity),
-           f.format,
-           f.format_version,
-           f.payload
-      FROM framed_events f
-        ON CONFLICT (run_id, append_key) DO NOTHING
- RETURNING run_id
-)
-SELECT count(*)::text || '|' || CASE
-           WHEN count(*) > 0 THEN openmettle.quota_release_terminal_runs(array_agg(id ORDER BY id))::text
-           ELSE '0'
-       END
-  FROM cancelled;
+{revocations_sql}UPDATE openmettle.runs r
+   SET state = 'cancelled',
+       wait_reason = NULL,
+       cancel_reason = coalesce(r.cancel_reason, 'revoked'),
+       claim_token = NULL,
+       claimed_at = NULL,
+       lease_expires_at = NULL,
+       execution_expires_at = NULL
+  FROM (
+      SELECT id
+        FROM openmettle.runs
+       WHERE state IN ('queued', 'running', 'waiting')
+       ORDER BY id
+         FOR UPDATE
+  ) target
+ WHERE r.id = target.id;
+
+DO $$
+DECLARE
+    rec RECORD;
+    seq bigint;
+    payload bytea := convert_to('{{"reason":"revoked"}}', 'UTF8');
+    ident bytea;
+BEGIN
+    FOR rec IN
+        SELECT r.id, r.scope_id
+          FROM openmettle.runs r
+         WHERE r.state = 'cancelled'
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM openmettle.run_events e
+                WHERE e.run_id = r.id
+                  AND e.append_key = 'run-terminal'
+           )
+         ORDER BY r.id
+           FOR UPDATE
+    LOOP
+        UPDATE openmettle.runs
+           SET last_event_sequence = last_event_sequence + 1
+         WHERE scope_id = rec.scope_id
+           AND id = rec.id
+     RETURNING last_event_sequence INTO STRICT seq;
+
+        ident := decode('6f70656e6d6574746c652f6576656e742f3100', 'hex')
+            || int8send(octet_length(rec.scope_id::text)::bigint) || convert_to(rec.scope_id::text, 'UTF8')
+            || int8send(octet_length(rec.id::text)::bigint) || convert_to(rec.id::text, 'UTF8')
+            || int8send(octet_length('run-terminal')::bigint) || convert_to('run-terminal', 'UTF8')
+            || int8send(octet_length('openmettle.run-cancelled')::bigint) || convert_to('openmettle.run-cancelled', 'UTF8')
+            || int8send(4::bigint) || int4send(1)
+            || int8send(octet_length(payload)::bigint) || payload;
+
+        INSERT INTO openmettle.run_events (
+            scope_id, run_id, sequence, append_key, format, format_version, payload, identity, digest
+        ) VALUES (
+            rec.scope_id, rec.id, seq, 'run-terminal', 'openmettle.run-cancelled', 1, payload, ident, sha256(ident)
+        );
+    END LOOP;
+END
+$$;
+
+SELECT count(*)
+  FROM openmettle.runs
+ WHERE state = 'cancelled'
+   AND cancel_reason = 'revoked';
 """
 
 
-def two_user_seed_sql(sess_a: tuple[str, str, str], sess_b: tuple[str, str, str]) -> str:
-    """Seed `user_a` and `user_b` with active approvals, browser sessions, storage limits and
-    personal + project `usage_tokens` defaults on primary PostgreSQL."""
-    sid_a, login_a, hash_a = sess_a
-    sid_b, login_b, hash_b = sess_b
-    for sid, lid, sh in (sess_a, sess_b):
+def worker_quota_release_sql() -> str:
+    """Worker-role SQL for Runbook Step 5d.2 (`openmettle.quota_release_terminal_runs` requires
+    `openmettle_api` or `openmettle_worker` membership and retains holds on `outcome_unknown`)."""
+    return """\
+SELECT openmettle.quota_release_terminal_runs(
+    coalesce(
+        (SELECT array_agg(r.id ORDER BY r.id)
+           FROM openmettle.runs r
+          WHERE r.state IN ('succeeded', 'failed', 'cancelled', 'interrupted')),
+        ARRAY[]::uuid[]
+    )
+);
+"""
+
+
+def seed_users_sql(
+    sess_a: tuple[str, str, str],
+    sess_b: tuple[str, str, str],
+    sess_c: tuple[str, str, str],
+) -> str:
+    """Seed `user_a`, `user_b`, and `user_c` with active approvals, browser sessions, storage
+    limits and personal + project `usage_tokens` defaults on primary PostgreSQL."""
+    for sid, lid, sh in (sess_a, sess_b, sess_c):
         if not (smoke.B64_ID.fullmatch(sid) and smoke.B64_ID.fullmatch(lid) and re.fullmatch(r"[0-9a-f]{64}", sh)):
             raise DrillFailure("malformed synthetic session seed values")
+    sid_a, login_a, hash_a = sess_a
+    sid_b, login_b, hash_b = sess_b
+    sid_c, login_c, hash_c = sess_c
     p_id = USER_A_IDS["provider"]
     exp = smoke.SESSION_EXPIRES_MS
     by = "'restore-drill', 'synthetic restore drill fixture'"
@@ -438,18 +570,24 @@ INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, chang
     VALUES ('{p_id}', '{smoke.SESSION_ISSUER}', '{smoke.SESSION_CLIENT}', {by});
 INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
     VALUES ('{p_id}', 'r1');
-INSERT INTO openmettle.users (id) VALUES ('{USER_A_IDS["user"]}'), ('{USER_B_IDS["user"]}');
+INSERT INTO openmettle.users (id)
+    VALUES ('{USER_A_IDS["user"]}'), ('{USER_B_IDS["user"]}'), ('{USER_C_IDS["user"]}');
 INSERT INTO openmettle.scopes (kind, personal_user_id)
-    VALUES ('personal', '{USER_A_IDS["user"]}'), ('personal', '{USER_B_IDS["user"]}');
+    VALUES ('personal', '{USER_A_IDS["user"]}'),
+           ('personal', '{USER_B_IDS["user"]}'),
+           ('personal', '{USER_C_IDS["user"]}');
 INSERT INTO openmettle.user_identities (id, user_id, issuer, subject)
     VALUES ('{USER_A_IDS["identity"]}', '{USER_A_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-a'),
-           ('{USER_B_IDS["identity"]}', '{USER_B_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-b');
+           ('{USER_B_IDS["identity"]}', '{USER_B_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-b'),
+           ('{USER_C_IDS["identity"]}', '{USER_C_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-c');
 INSERT INTO openmettle.local_identity_approvals (id, provider_id, identity_id, active, expires_ms, changed_by, change_reason)
     VALUES ('{USER_A_IDS["approval"]}', '{p_id}', '{USER_A_IDS["identity"]}', true, {exp}, {by}),
-           ('{USER_B_IDS["approval"]}', '{p_id}', '{USER_B_IDS["identity"]}', true, {exp}, {by});
+           ('{USER_B_IDS["approval"]}', '{p_id}', '{USER_B_IDS["identity"]}', true, {exp}, {by}),
+           ('{USER_C_IDS["approval"]}', '{p_id}', '{USER_C_IDS["identity"]}', true, {exp}, {by});
 INSERT INTO openmettle.login_nonce_reservations (key_id, nonce)
     VALUES ('drill-a', substring(sha256(convert_to('{login_a}', 'UTF8')) FROM 1 FOR 12)),
-           ('drill-b', substring(sha256(convert_to('{login_b}', 'UTF8')) FROM 1 FOR 12));
+           ('drill-b', substring(sha256(convert_to('{login_b}', 'UTF8')) FROM 1 FOR 12)),
+           ('drill-c', substring(sha256(convert_to('{login_c}', 'UTF8')) FROM 1 FOR 12));
 INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
         key_id, nonce, ciphertext, consumed, session_issued)
     SELECT '{login_a}', decode('01', 'hex'), {exp}, sha256(convert_to('{login_a}:s', 'UTF8')),
@@ -462,6 +600,12 @@ INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, 
            sha256(convert_to('{login_b}:n', 'UTF8')), sha256(convert_to('{login_b}:c', 'UTF8')),
            key_id, nonce, NULL, true, true
       FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-b';
+INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
+        key_id, nonce, ciphertext, consumed, session_issued)
+    SELECT '{login_c}', decode('03', 'hex'), {exp}, sha256(convert_to('{login_c}:s', 'UTF8')),
+           sha256(convert_to('{login_c}:n', 'UTF8')), sha256(convert_to('{login_c}:c', 'UTF8')),
+           key_id, nonce, NULL, true, true
+      FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-c';
 INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
         issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
         user_generation, created_ms, expires_ms)
@@ -474,6 +618,12 @@ INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, i
     SELECT '{sid_b}', decode('{hash_b}', 'hex'), '{login_b}', '{p_id}', '{USER_B_IDS["identity"]}',
            '{USER_B_IDS["approval"]}', '{USER_B_IDS["user"]}', '{smoke.SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {exp}
       FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}';
+INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
+        issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
+        user_generation, created_ms, expires_ms)
+    SELECT '{sid_c}', decode('{hash_c}', 'hex'), '{login_c}', '{p_id}', '{USER_C_IDS["identity"]}',
+           '{USER_C_IDS["approval"]}', '{USER_C_IDS["user"]}', '{smoke.SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {exp}
+      FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}';
 UPDATE openmettle.storage_instance
     SET instance_budget_bytes = {STORAGE_BUDGET_BYTES},
         personal_limit_bytes = {SCOPE_STORAGE_LIMIT_BYTES},
@@ -484,11 +634,21 @@ INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
 """
 
 
-def fresh_post_restore_session_sql(user_ids: dict, session_id: str, login_id: str,
-                                   secret_hash: str, nonce_tag: str) -> str:
-    """Mint a fresh post-restore session row reading current `access_generation` and `max(epoch)`."""
-    if not (smoke.B64_ID.fullmatch(session_id) and smoke.B64_ID.fullmatch(login_id)
-            and re.fullmatch(r"[0-9a-f]{64}", secret_hash) and re.fullmatch(r"[a-z0-9-]{1,32}", nonce_tag)):
+def fresh_post_restore_session_sql(
+    user_ids: dict,
+    session_id: str,
+    login_id: str,
+    secret_hash: str,
+    nonce_tag: str,
+) -> str:
+    """Mint a fresh post-restore session row reading current provider/approval `access_generation`,
+    user `session_generation`, and `max(epoch)`."""
+    if not (
+        smoke.B64_ID.fullmatch(session_id)
+        and smoke.B64_ID.fullmatch(login_id)
+        and re.fullmatch(r"[0-9a-f]{64}", secret_hash)
+        and re.fullmatch(r"[a-z0-9-]{1,32}", nonce_tag)
+    ):
         raise DrillFailure("malformed post-restore session values")
     p_id = USER_A_IDS["provider"]
     exp = smoke.SESSION_EXPIRES_MS
@@ -509,7 +669,7 @@ INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, i
            (SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}'),
            1,
            (SELECT access_generation FROM openmettle.login_providers WHERE id = '{p_id}'),
-           (SELECT session_generation FROM openmettle.local_identity_approvals WHERE id = '{user_ids["approval"]}'),
+           (SELECT access_generation FROM openmettle.local_identity_approvals WHERE id = '{user_ids["approval"]}'),
            (SELECT session_generation FROM openmettle.users WHERE id = '{user_ids["user"]}'),
            1, {exp};
 """
@@ -554,8 +714,14 @@ def drill_inference_document(app_namespace: str, catalog: dict) -> dict:
     }
 
 
-def drill_chart_values(digests: dict, postgres_client_image: dict, *, db_namespace: str,
-                       artifacts_existing_claim: str | None, enable_backup: bool) -> dict:
+def drill_chart_values(
+    digests: dict,
+    postgres_client_image: dict,
+    *,
+    db_namespace: str,
+    artifacts_existing_claim: str | None,
+    enable_backup: bool,
+) -> dict:
     """Helm values for primary (`artifacts_existing_claim=None`, `enable_backup=True`) and isolated
     restore target (`artifacts_existing_claim=TARGET_ARTIFACTS_CLAIM`, `enable_backup=False`)."""
     gateway_peer = {"podSelector": {"matchLabels": {
@@ -657,17 +823,42 @@ def drill_chart_values(digests: dict, postgres_client_image: dict, *, db_namespa
     return values
 
 
-def environment_manifests(*, app_ns: str, db_ns: str, postgres_image: str, standin_image: str,
-                          passwords: dict, catalog: dict, vault_keys: list[tuple[str, str, str]],
-                          backup_key_b64: str | None, wrong_backup_key_b64: str | None,
-                          is_target: bool, run_id: str) -> dict:
+def environment_manifests(
+    *,
+    app_ns: str,
+    db_ns: str,
+    postgres_image: str,
+    standin_image: str,
+    passwords: dict,
+    catalog: dict,
+    vault_keys: list[tuple[str, str, str]],
+    backup_key_b64: str | None,
+    wrong_backup_key_b64: str | None,
+    is_target: bool,
+    run_id: str,
+) -> dict:
     """Kubernetes manifests for either the primary or isolated restore-target environment."""
     labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
+    restricted_ns_labels = {
+        **labels,
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "latest",
+    }
     sql = "".join(
         f"CREATE ROLE {smoke.DB_ROLE[role]} LOGIN PASSWORD '{passwords[role]}';\n"
         for role in smoke.DB_LOGINS
     )
     sql += "CREATE DATABASE openmettle OWNER openmettle_owner;\n"
+    if is_target:
+        # pg_dump --schema=openmettle omits database and public-schema ACLs; openmettle-migrate
+        # enforces these boundaries whenever _sqlx_migrations already records version >= 1.
+        sql += (
+            "REVOKE ALL ON DATABASE openmettle FROM PUBLIC;\n"
+            "GRANT CONNECT ON DATABASE openmettle TO "
+            "openmettle_api, openmettle_worker, openmettle_issuance, openmettle_gateway;\n"
+            "\\connect openmettle\n"
+            "REVOKE ALL ON SCHEMA public FROM PUBLIC;\n"
+        )
 
     vault_keyring = json.dumps({
         "version": 1,
@@ -679,13 +870,23 @@ def environment_manifests(*, app_ns: str, db_ns: str, postgres_image: str, stand
         **{fname: kb64 for _, fname, kb64 in vault_keys},
     }
 
+    dns_egress = {
+        "to": [ns_peer("kube-system", {"k8s-app": "kube-dns"})],
+        "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
+    }
+    pg_ingress_peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": app_ns}}}]
+    if not is_target:
+        pg_ingress_peers.append({"podSelector": {"matchLabels": DB_PROBE_LABELS}})
+
+    gateway_labels = {
+        "app.kubernetes.io/name": "openmettle-core",
+        "app.kubernetes.io/instance": RELEASE,
+        "app.kubernetes.io/component": smoke.GATEWAY_COMPONENT,
+    }
+
     items: list[dict] = [
-        {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": app_ns, "labels": {
-            **labels,
-            "pod-security.kubernetes.io/enforce": "restricted",
-            "pod-security.kubernetes.io/enforce-version": "latest",
-        }}},
-        {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": db_ns, "labels": labels}},
+        {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": app_ns, "labels": restricted_ns_labels}},
+        {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": db_ns, "labels": restricted_ns_labels}},
         {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
          "metadata": {"name": "postgres-fixture", "namespace": db_ns, "labels": labels},
          "stringData": {"admin-password": passwords["admin"], "provision.sql": sql}},
@@ -695,22 +896,29 @@ def environment_manifests(*, app_ns: str, db_ns: str, postgres_image: str, stand
                   "selector": {"matchLabels": smoke.POSTGRES_LABELS},
                   "template": {"metadata": {"labels": smoke.POSTGRES_LABELS}, "spec": {
                       "automountServiceAccountToken": False, "enableServiceLinks": False,
+                      "securityContext": PG_POD_SEC_CONTEXT,
                       "containers": [{
                           "name": "postgres", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
                           "env": [{"name": "POSTGRES_USER", "value": "fixture_admin"},
                                   {"name": "POSTGRES_DB", "value": "fixture"},
+                                  {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
                                   {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {
                                       "name": "postgres-fixture", "key": "admin-password"}}}],
                           "ports": [{"name": "postgres", "containerPort": 5432}],
                           "readinessProbe": {"exec": {"command": [
                               "pg_isready", "-h", "127.0.0.1", "-U", "fixture_admin", "-d", "fixture"]},
                               "periodSeconds": 2, "failureThreshold": 2},
+                          "securityContext": CONTAINER_SEC_CONTEXT,
                           "volumeMounts": [
                               {"name": "data", "mountPath": "/var/lib/postgresql"},
+                              {"name": "run", "mountPath": "/run/postgresql"},
+                              {"name": "tmp", "mountPath": "/tmp"},
                               {"name": "init", "mountPath": "/docker-entrypoint-initdb.d", "readOnly": True}],
                       }],
                       "volumes": [
                           {"name": "data", "emptyDir": {}},
+                          {"name": "run", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}},
+                          {"name": "tmp", "emptyDir": {}},
                           {"name": "init", "secret": {"secretName": "postgres-fixture",
                                                       "items": [{"key": "provision.sql", "path": "provision.sql"}]}}],
                   }}}},
@@ -737,6 +945,7 @@ def environment_manifests(*, app_ns: str, db_ns: str, postgres_image: str, stand
          "metadata": {"name": smoke.STANDIN, "namespace": db_ns, "labels": labels},
          "spec": {"type": "ClusterIP", "selector": smoke.STANDIN_LABELS,
                   "ports": [{"name": "http", "port": smoke.STANDIN_PORT, "targetPort": "http"}]}},
+        # Default-deny + explicit NetworkPolicies in BOTH app_ns and db_ns.
         {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
          "metadata": {"name": smoke.NAMESPACE_DENY, "namespace": app_ns, "labels": labels},
          "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}},
@@ -746,13 +955,62 @@ def environment_manifests(*, app_ns: str, db_ns: str, postgres_image: str, stand
              "podSelector": {"matchLabels": {RECOVERY_DB_CLIENT_LABEL: "true"}},
              "policyTypes": ["Ingress", "Egress"],
              "egress": [
-                 {"to": [ns_peer("kube-system", {"k8s-app": "kube-dns"})],
-                  "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+                 dns_egress,
                  {"to": [ns_peer(db_ns, smoke.POSTGRES_LABELS)],
                   "ports": [{"protocol": "TCP", "port": 5432}]},
              ],
          }},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": smoke.NAMESPACE_DENY, "namespace": db_ns, "labels": labels},
+         "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "postgres-network", "namespace": db_ns, "labels": labels},
+         "spec": {
+             "podSelector": {"matchLabels": smoke.POSTGRES_LABELS},
+             "policyTypes": ["Ingress", "Egress"],
+             "ingress": [{"from": pg_ingress_peers, "ports": [{"protocol": "TCP", "port": 5432}]}],
+             "egress": [dns_egress],
+         }},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "standin-network", "namespace": db_ns, "labels": labels},
+         "spec": {
+             "podSelector": {"matchLabels": smoke.STANDIN_LABELS},
+             "policyTypes": ["Ingress", "Egress"],
+             "ingress": [{"from": [ns_peer(app_ns, gateway_labels)],
+                          "ports": [{"protocol": "TCP", "port": smoke.STANDIN_PORT}]}],
+         }},
     ]
+    if not is_target:
+        # Dedicated control client in primary-db proving primary PostgreSQL accepts 5432/TCP
+        # while target-db pods are blocked by NetworkPolicy.
+        items += [
+            {"apiVersion": "apps/v1", "kind": "Deployment",
+             "metadata": {"name": DB_PROBE, "namespace": db_ns, "labels": labels},
+             "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                      "selector": {"matchLabels": DB_PROBE_LABELS},
+                      "template": {"metadata": {"labels": DB_PROBE_LABELS}, "spec": {
+                          "automountServiceAccountToken": False, "enableServiceLinks": False,
+                          "securityContext": PG_POD_SEC_CONTEXT,
+                          "containers": [{
+                              "name": "probe", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
+                              "command": ["sleep", "3600"],
+                              "securityContext": CONTAINER_SEC_CONTEXT,
+                              "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                          }],
+                          "volumes": [{"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "4Mi"}}],
+                      }}}},
+            {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+             "metadata": {"name": "db-probe-egress", "namespace": db_ns, "labels": labels},
+             "spec": {
+                 "podSelector": {"matchLabels": DB_PROBE_LABELS},
+                 "policyTypes": ["Ingress", "Egress"],
+                 "egress": [
+                     dns_egress,
+                     {"to": [{"podSelector": {"matchLabels": smoke.POSTGRES_LABELS}}],
+                      "ports": [{"protocol": "TCP", "port": 5432}]},
+                 ],
+             }},
+        ]
     items += [
         {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
          "metadata": {"name": smoke.SECRET[role], "namespace": app_ns, "labels": labels},
@@ -791,7 +1049,7 @@ def environment_manifests(*, app_ns: str, db_ns: str, postgres_image: str, stand
         wrong_keyring = json.dumps({
             "version": 1,
             "active_key_id": BACKUP_KEY_ID,
-            "keys": [{"id": BACKUP_KEY_ID, "file": f"{smoke.BACKUP_KEYS_DIR}/{BACKUP_KEY_FILE}"}],
+            "keys": [{"id": BACKUP_KEY_ID, "file": f"{WRONG_BACKUP_KEYS_DIR}/{BACKUP_KEY_FILE}"}],
         }).encode("utf-8")
         items.append({
             "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
@@ -827,32 +1085,88 @@ def stage_keyring_snippet(src_dir: str, stage_parent: str) -> str:
     )
 
 
+def staged_keyring_mounts(
+    admin_ref: str, specs: list[tuple[str, str, str]]
+) -> tuple[dict, list[dict], list[dict]]:
+    """Build `(init_container, main_mounts, volumes)` staging each `(prefix, secret_name, mount_dir)`
+    into a `Memory` `emptyDir` (`0400` files owned by UID `65532`) mounted read-only at `mount_dir`
+    via `subPath: keys`, matching the absolute key paths inside `keyring.json`."""
+    script = "".join(stage_keyring_snippet(f"/run/{pfx}-src", f"/run/{pfx}-stage") for pfx, _, _ in specs)
+    init_mounts: list[dict] = []
+    main_mounts: list[dict] = []
+    volumes: list[dict] = []
+    for pfx, secret_name, mount_dir in specs:
+        init_mounts += [
+            {"name": f"{pfx}-src", "mountPath": f"/run/{pfx}-src", "readOnly": True},
+            {"name": f"{pfx}-stage", "mountPath": f"/run/{pfx}-stage"},
+        ]
+        main_mounts.append(
+            {"name": f"{pfx}-stage", "mountPath": mount_dir, "subPath": "keys", "readOnly": True}
+        )
+        volumes += [
+            {"name": f"{pfx}-src", "secret": {"secretName": secret_name, "defaultMode": 288}},
+            {"name": f"{pfx}-stage", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+        ]
+    init_container = {
+        "name": "stage-keys",
+        "image": admin_ref,
+        "imagePullPolicy": "Never",
+        "command": ["/bin/sh", "-eu", "-c", script],
+        "securityContext": CONTAINER_SEC_CONTEXT,
+        "volumeMounts": init_mounts,
+    }
+    return init_container, main_mounts, volumes
+
+
 def target_isolation_probe_plan() -> list[dict]:
-    """NetworkPolicy isolation probes proving `openmettle-restore-target` cannot reach primary DB or gateway."""
+    """NetworkPolicy isolation probes proving both `openmettle-restore-target` and
+    `openmettle-restore-target-db` are denied access to primary PostgreSQL and gateway."""
     primary_db = f"postgres.{PRIMARY_DB_NS}.svc.cluster.local"
     target_db = f"postgres.{TARGET_DB_NS}.svc.cluster.local"
     primary_gw = f"{smoke.GATEWAY_WORKLOAD}.{PRIMARY_APP_NS}.svc.cluster.local"
     gw_readyz = smoke.http_command(primary_gw, 8082, "/readyz")
 
     def probe(name, namespace, workload, container, command, expect, control=None, is_http=False):
-        return {"name": name, "namespace": namespace, "workload": workload, "container": container,
-                "command": command, "expect": expect, "control": control, "http": is_http}
+        return {
+            "name": name,
+            "namespace": namespace,
+            "workload": workload,
+            "container": container,
+            "command": command,
+            "expect": expect,
+            "control": control,
+            "http": is_http,
+        }
 
-    primary_db_ctrl = "control: primary-db reaches primary PostgreSQL on 5432"
+    primary_db_ctrl = "control: primary db-probe reaches primary PostgreSQL on 5432"
     primary_gw_ctrl = "control: primary worker reaches primary gateway /readyz 200"
     return [
-        probe(primary_db_ctrl, PRIMARY_DB_NS, "postgres", "postgres", smoke.tcp_command(primary_db, 5432), "connect"),
+        probe(primary_db_ctrl, PRIMARY_DB_NS, DB_PROBE, "probe", smoke.tcp_command(primary_db, 5432), "connect"),
         probe(primary_gw_ctrl, PRIMARY_APP_NS, f"{FULLNAME}-worker", "worker", gw_readyz, "connect", is_http=True),
-        probe("target api reaches isolated target PostgreSQL on 5432",
-              TARGET_APP_NS, f"{FULLNAME}-api", "api", smoke.tcp_command(target_db, 5432), "connect"),
-        probe("target worker reaches isolated target PostgreSQL on 5432",
-              TARGET_APP_NS, f"{FULLNAME}-worker", "worker", smoke.tcp_command(target_db, 5432), "connect"),
-        probe("target api denied egress to primary PostgreSQL on 5432",
-              TARGET_APP_NS, f"{FULLNAME}-api", "api", smoke.tcp_command(primary_db, 5432), "deny", primary_db_ctrl),
-        probe("target worker denied egress to primary PostgreSQL on 5432",
-              TARGET_APP_NS, f"{FULLNAME}-worker", "worker", smoke.tcp_command(primary_db, 5432), "deny", primary_db_ctrl),
-        probe("target worker denied egress to primary gateway on 8082",
-              TARGET_APP_NS, f"{FULLNAME}-worker", "worker", gw_readyz, "deny", primary_gw_ctrl, is_http=True),
+        probe(
+            "target api reaches isolated target PostgreSQL on 5432",
+            TARGET_APP_NS, f"{FULLNAME}-api", "api", smoke.tcp_command(target_db, 5432), "connect",
+        ),
+        probe(
+            "target worker reaches isolated target PostgreSQL on 5432",
+            TARGET_APP_NS, f"{FULLNAME}-worker", "worker", smoke.tcp_command(target_db, 5432), "connect",
+        ),
+        probe(
+            "target db pod denied egress to primary PostgreSQL on 5432",
+            TARGET_DB_NS, "postgres", "postgres", smoke.tcp_command(primary_db, 5432), "deny", primary_db_ctrl,
+        ),
+        probe(
+            "target api denied egress to primary PostgreSQL on 5432",
+            TARGET_APP_NS, f"{FULLNAME}-api", "api", smoke.tcp_command(primary_db, 5432), "deny", primary_db_ctrl,
+        ),
+        probe(
+            "target worker denied egress to primary PostgreSQL on 5432",
+            TARGET_APP_NS, f"{FULLNAME}-worker", "worker", smoke.tcp_command(primary_db, 5432), "deny", primary_db_ctrl,
+        ),
+        probe(
+            "target worker denied egress to primary gateway on 8082",
+            TARGET_APP_NS, f"{FULLNAME}-worker", "worker", gw_readyz, "deny", primary_gw_ctrl, is_http=True,
+        ),
     ]
 
 
@@ -926,7 +1240,7 @@ class RestoreDrill:
         }
 
     def run(self, argv: list, *, check=True, timeout=300, input=None):
-        result = self.runner.run(argv, check=False, timeout=timeout, input=input)
+        result = self.runner(argv, check=False, timeout=timeout, input=input)
         if check and result.returncode != 0:
             tail = smoke.redacted_tail(result.stderr.strip(), self.secrets_to_redact, smoke.STDERR_TAIL)
             raise DrillFailure(f"{' '.join(str(a) for a in argv[:3])} exited {result.returncode}"
@@ -1046,8 +1360,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.report["images"][role] = {
                 "reference": reference, "cri_image_id": resolved, "resolved_before_alias": before is not None,
             }
-        self.passed("core images built and digest-pinned in containerd",
-                    roles=list(ROLES))
+        self.passed("core images built and digest-pinned in containerd", roles=list(ROLES))
 
     def pin_postgres_client_image(self) -> tuple[dict, str]:
         parts = smoke.postgres_client_image_parts(self.core.POSTGRES_IMAGE)
@@ -1156,7 +1469,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         )
         self.verify_identity()
         self.kube("apply", "--filename", "-", input=json.dumps(primary_env))
-        for dep in ("postgres", smoke.STANDIN):
+        for dep in ("postgres", smoke.STANDIN, DB_PROBE):
             self.kube("--namespace", PRIMARY_DB_NS, "rollout", "status", f"deployment/{dep}",
                       "--timeout=300s", timeout=330)
         self.pg_client_parts, self.pg_client_ref = self.pin_postgres_client_image()
@@ -1170,18 +1483,24 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.helm_ns(PRIMARY_APP_NS, "install", RELEASE, str(CHART), "--values", str(primary_vals),
                      "--wait=watcher", "--timeout", smoke.HELM_TIMEOUT)
 
-        # Seed user_a and user_b sessions.
+        # Seed user_a, user_b, and user_c sessions.
         sid_a, cookie_a, hash_a = smoke.session_credential(secrets.token_bytes(64))
         sid_b, cookie_b, hash_b = smoke.session_credential(secrets.token_bytes(64))
+        sid_c, cookie_c, hash_c = smoke.session_credential(secrets.token_bytes(64))
         self.cookie_a_pre = cookie_a
         self.cookie_b_pre = cookie_b
-        self.secrets_to_redact.extend([cookie_a, cookie_b, "secret-access-keep-1", "secret-refresh-keep-1",
-                                       "secret-access-revoke-1", "secret-refresh-revoke-1"])
+        self.cookie_c_pre = cookie_c
+        self.secrets_to_redact.extend([
+            cookie_a, cookie_b, cookie_c,
+            "secret-access-keep-1", "secret-refresh-keep-1",
+            "secret-access-revoke-1", "secret-refresh-revoke-1",
+        ])
         self.psql_superuser(
             PRIMARY_DB_NS,
-            two_user_seed_sql(
+            seed_users_sql(
                 (sid_a, smoke.b64url(secrets.token_bytes(32)), hash_a),
                 (sid_b, smoke.b64url(secrets.token_bytes(32)), hash_b),
+                (sid_c, smoke.b64url(secrets.token_bytes(32)), hash_c),
             ),
         )
 
@@ -1202,7 +1521,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             )
             self.wait_for(
                 "primary gateway settlement",
-                lambda: smoke.evaluate_settled_round(self.psql_superuser(PRIMARY_DB_NS, smoke.settled_round_sql(completed_run_id))),
+                lambda: smoke.evaluate_settled_round(
+                    self.psql_superuser(PRIMARY_DB_NS, smoke.settled_round_sql(completed_run_id))
+                ),
                 timeout=30, interval=0.5,
             )
 
@@ -1211,14 +1532,22 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             project_id = project["project_id"]
             project_scope_id = project["scope_id"]
             self.api_json(fwd.port, cookie_a, "PUT", f"/v1/projects/{project_id}/members", 200,
-                          key="drill-project-viewer",
+                          key="drill-project-viewer-b",
                           json_body={"grantee": {"kind": "user", "grantee_id": USER_B_IDS["user"]}, "role": "viewer"})
+            self.api_json(fwd.port, cookie_a, "PUT", f"/v1/projects/{project_id}/members", 200,
+                          key="drill-project-viewer-c",
+                          json_body={"grantee": {"kind": "user", "grantee_id": USER_C_IDS["user"]}, "role": "viewer"})
             project_conv = self.api_json(fwd.port, cookie_a, "POST", "/v1/conversations", 201,
                                          key="drill-conv-project", json_body={"scope_id": project_scope_id})
 
             art_keep = self.upload_artifact(fwd.port, cookie_a, "drill-art-keep", b"drill-personal-keep-bytes\n")
             art_project = self.upload_artifact(fwd.port, cookie_a, "drill-art-proj", b"drill-project-shared-bytes\n",
                                                scope_id=project_scope_id)
+            # Explicit resource share so project Viewer user_b is authorized to download art_project.
+            self.api_json(fwd.port, cookie_a, "PUT", f"/v1/artifacts/{art_project['artifact_id']}/shares", 200,
+                          key="drill-art-proj-share",
+                          json_body={"grantee": {"kind": "project"}, "access": "read"})
+
             art_deadline = self.upload_artifact(fwd.port, cookie_a, "drill-art-dl-v1", b"drill-retained-deadline-v1\n")
             boundary_v2 = f"drill-boundary-{secrets.token_hex(4)}"
             _, rev2_raw = self.api_call(
@@ -1266,7 +1595,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         finally:
             fwd.close()
 
-        # Pause primary worker briefly so drill-fixture claims and parks both synthetic runs deterministically.
+        # Pause primary worker briefly so drill-fixture claims, reserves 25 usage_tokens each, and parks both runs.
         self.verify_identity()
         self.kube("--namespace", PRIMARY_APP_NS, "scale", f"deployment/{FULLNAME}-worker", "--replicas=0")
         self.wait_for(
@@ -1295,7 +1624,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
         res_ids_raw = self.psql_superuser(
             PRIMARY_DB_NS,
-            "SELECT id::text || '|' || reservation_id::text || '|' || coalesce(extract(epoch FROM original_purge_after)::bigint::text, '')"
+            "SELECT id::text, reservation_id::text,"
+            " coalesce((extract(epoch FROM purge_after) * 1000000)::bigint::text, '')"
             " FROM openmettle.artifact_revisions"
             f" WHERE id IN ('{art_to_lose['revision_id']}'::uuid, '{art_post_purge['revision_id']}'::uuid,"
             f" '{art_deadline['revision_id']}'::uuid);",
@@ -1303,8 +1633,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         rev_meta = {}
         for row in res_ids_raw.splitlines():
             if row:
-                rid, res_id, orig_epoch = row.split("|")
-                rev_meta[rid] = {"reservation_id": res_id, "original_purge_epoch": orig_epoch}
+                rid, res_id, purge_after_us = row.split("|")
+                rev_meta[rid] = {"reservation_id": res_id, "purge_after_us": purge_after_us}
 
         # Capture coordinated backup via CronJob on primary.
         capture_job = "openmettle-drill-primary-backup"
@@ -1317,11 +1647,20 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.verify_identity()
         self.kube("--namespace", PRIMARY_APP_NS, "delete", "job", capture_job, "--wait=true", timeout=120)
 
-        # Post-backup activity on primary: purge art_post_purge + revoke share & disconnect conn_revoke + export journal.
+        # Post-backup activity on primary: purge art_post_purge, revoke share & disconnect conn_revoke,
+        # and disable user_c + withdraw user_c's identity approval (Step 5b fixture).
         self.psql_superuser(
             PRIMARY_DB_NS,
-            "UPDATE openmettle.retention_policy SET min_grace_seconds = 0, grace_seconds = 0 WHERE id;",
+            "UPDATE openmettle.retention_policy SET min_grace_seconds = 0, grace_seconds = 0 WHERE id;\n"
+            f"UPDATE openmettle.users SET disabled_at = clock_timestamp(), session_generation = session_generation + 1"
+            f" WHERE id = '{USER_C_IDS['user']}'::uuid;\n"
+            f"UPDATE openmettle.local_identity_approvals"
+            f" SET active = false, access_generation = access_generation + 1,"
+            f"     changed_by = 'operator:{DRILL_OPERATOR_ID}', change_reason = 'post-backup disablement'"
+            f" WHERE id = '{USER_C_IDS['approval']}'::uuid;",
         )
+        disabled_principals = [(USER_C_IDS["user"], USER_C_IDS["approval"])]
+
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=PRIMARY_APP_NS)
         try:
             self.api_call(fwd.port, cookie_a, "DELETE", f"/v1/artifacts/{art_post_purge['artifact_id']}",
@@ -1345,6 +1684,28 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             ).strip() == "purged",
             timeout=45, interval=1.0,
         )
+
+        # Fence/stop primary api and worker before recording the authoritative final journal watermark
+        # and exporting post-backup-journal.export so `--export-complete` is genuinely certified.
+        self.verify_identity()
+        for comp in ("api", "worker"):
+            self.kube("--namespace", PRIMARY_APP_NS, "scale", f"deployment/{FULLNAME}-{comp}", "--replicas=0")
+        for comp in ("api", "worker"):
+            self.wait_for(
+                f"primary {comp} scaled to 0 before final journal watermark export",
+                lambda c=comp: len(self.kube_json(
+                    "--namespace", PRIMARY_APP_NS, "get", "pods", "--selector",
+                    f"app.kubernetes.io/instance={RELEASE},app.kubernetes.io/component={c}"
+                )["items"]) == 0,
+                timeout=60,
+            )
+
+        wm_row = self.psql_superuser(
+            PRIMARY_DB_NS,
+            "SELECT seq, encode(chain_digest, 'hex') FROM openmettle.deletion_journal_head WHERE id;",
+        ).strip()
+        wm_seq_s, wm_digest_s = wm_row.split("|")
+        stopped_primary_watermark = (int(wm_seq_s), wm_digest_s)
 
         admin_ref = self.report["images"]["admin"]["reference"]
         export_file = f"{smoke.BACKUP_DEST_DIR}/post-backup-journal.export"
@@ -1376,15 +1737,26 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.run_job(PRIMARY_APP_NS, export_job)
         cutover_at = datetime.now(timezone.utc)
 
+        # Bring primary api and worker back up so live cross-namespace NetworkPolicy isolation and
+        # primary non-interference are verified while target recovery proceeds.
+        self.verify_identity()
+        for comp in ("api", "worker"):
+            self.kube("--namespace", PRIMARY_APP_NS, "scale", f"deployment/{FULLNAME}-{comp}", "--replicas=1")
+        for comp in ("api", "worker"):
+            self.kube("--namespace", PRIMARY_APP_NS, "rollout", "status", f"deployment/{FULLNAME}-{comp}",
+                      "--timeout=120s", timeout=150)
+
         self.passed(
-            "primary state seeded, coordinated backup captured, and post-backup deletions/revocations exported",
+            "primary state seeded, coordinated backup captured, and stopped-primary deletions/revocations exported",
             backup_run_id=capture["run_id"],
             backup_dir=Path(capture["dir"]).name,
-            settled_revisions_at_backup=6,
+            stopped_primary_journal_seq=stopped_primary_watermark[0],
         )
         return {
             "capture": capture,
             "export_file": export_file,
+            "stopped_primary_watermark": stopped_primary_watermark,
+            "disabled_principals": disabled_principals,
             "cutover_at": cutover_at,
             "personal_conv": personal_conv,
             "completed_run_id": completed_run_id,
@@ -1473,42 +1845,70 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.kube("--namespace", TARGET_APP_NS, "delete", "pod", dst_pod, "--wait=true", timeout=120)
 
     def execute_target_restore(self, primary_state: dict) -> dict:
-        recovery_started_at = datetime.now(timezone.utc)
         admin_ref = self.report["images"]["admin"]["reference"]
         migrate_ref = self.report["images"]["migrate"]["reference"]
         backup_dir = f"{RECOVERY_MEDIA_DIR}/{Path(primary_state['capture']['dir']).name}"
         labels = {"openmettle.dev/environment": "dev", RUN_LABEL: self.run_id}
 
-        # Step 1a: Offline negative preflight checks (wrong key, identical vault==backup path, tampered ciphertext).
+        # Step 1a: Positive control FIRST, then offline negative preflight checks (same vault==backup
+        # path, distinct path with duplicate key bytes, wrong backup key, and tampered ciphertext).
+        neg_init, neg_key_mounts, neg_key_vols = staged_keyring_mounts(
+            admin_ref,
+            [
+                ("good-backup", smoke.BACKUP_KEYS_SECRET, smoke.BACKUP_KEYS_DIR),
+                ("good-vault", smoke.VAULT_KEYS_SECRET, smoke.VAULT_KEYS_DIR),
+                ("wrong-backup", WRONG_BACKUP_SECRET, WRONG_BACKUP_KEYS_DIR),
+            ],
+        )
+        good_bk_cfg = f"{smoke.BACKUP_KEYS_DIR}/keyring.json"
+        good_vt_cfg = f"{smoke.VAULT_KEYS_DIR}/keyring.json"
+        wrong_bk_cfg = f"{WRONG_BACKUP_KEYS_DIR}/keyring.json"
         neg_script = (
-            stage_keyring_snippet("/run/wrong-backup-src", "/run/wrong-backup-stage")
-            + stage_keyring_snippet("/run/good-backup-src", "/run/good-backup-stage")
-            + f'if openmettle-admin backup verify --backup-dir "{backup_dir}" '
-              '--backup-keys-config /run/wrong-backup-stage/keys/keyring.json; then\n'
-              '  echo "ERROR: wrong backup key unexpectedly verified" >&2; exit 1\n'
-              "fi\n"
-            + 'if OPENMETTLE_API_VAULT_KEYS_CONFIG=/run/good-backup-stage/keys/keyring.json '
-              f'openmettle-admin backup verify --backup-dir "{backup_dir}" '
-              '--backup-keys-config /run/good-backup-stage/keys/keyring.json; then\n'
-              "  # backup verify itself checks key material; also verify identical vault/backup path guard on capture:\n"
-              "  true\n"
-              "fi\n"
-            + f'cp -a "{backup_dir}" /tmp/tampered-backup\n'
-              "chmod -R u+w /tmp/tampered-backup\n"
-              'python3 -c "" 2>/dev/null || true\n'
-              # Flip the last byte of pg.dump.enc cleanly using POSIX dd + printf:
-              'size=$(wc -c < /tmp/tampered-backup/pg.dump.enc | tr -d " ")\n'
-              "trunc_len=$((size - 1))\n"
-              'last_hex=$(tail -c 1 /tmp/tampered-backup/pg.dump.enc | od -An -tx1 | tr -d " \\n")\n'
-              'if [ "$last_hex" = "ff" ]; then repl="\\000"; else repl="\\377"; fi\n'
-              "dd if=/dev/null of=/tmp/tampered-backup/pg.dump.enc bs=1 seek=\"$trunc_len\" 2>/dev/null\n"
-              'printf "$repl" >> /tmp/tampered-backup/pg.dump.enc\n'
-              "if openmettle-admin backup verify --backup-dir /tmp/tampered-backup "
-              "--backup-keys-config /run/good-backup-stage/keys/keyring.json; then\n"
-              '  echo "ERROR: tampered pg.dump.enc unexpectedly verified" >&2; exit 1\n'
-              "fi\n"
-              "rm -rf /tmp/tampered-backup\n"
-              'echo "preflight.negative_checks_passed"\n'
+            # 1. Positive control proving staged /etc/openmettle/{backup,vault}-keys load and verify cleanly:
+            f'OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
+            f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}"\n'
+            # 2. Negative: identical vault==backup keyring path must be refused:
+            f'if OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_bk_cfg}" '
+            f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}" '
+            '2>/tmp/neg-same-path.err; then\n'
+            '  echo "ERROR: identical vault/backup keyring path unexpectedly succeeded" >&2; exit 1\n'
+            "fi\n"
+            'grep -q "distinct from VAULT_KEYS_CONFIG" /tmp/neg-same-path.err\n'
+            # 3. Negative: distinct vault path & file containing identical 32-byte backup key material:
+            "umask 077 && mkdir -p /tmp/dup-vault && chmod 0700 /tmp/dup-vault\n"
+            f'cp -- "{smoke.BACKUP_KEYS_DIR}/{BACKUP_KEY_FILE}" /tmp/dup-vault/dup.key && chmod 0400 /tmp/dup-vault/dup.key\n'
+            'printf \'{"version":1,"active_key_id":"dup-v1","keys":[{"id":"dup-v1","file":"/tmp/dup-vault/dup.key"}]}\\n\' '
+            "> /tmp/dup-vault/keyring.json && chmod 0400 /tmp/dup-vault/keyring.json\n"
+            'if OPENMETTLE_API_VAULT_KEYS_CONFIG=/tmp/dup-vault/keyring.json '
+            f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}" '
+            '2>/tmp/neg-dup-bytes.err; then\n'
+            '  echo "ERROR: duplicate vault/backup key bytes unexpectedly succeeded" >&2; exit 1\n'
+            "fi\n"
+            'grep -q "backup key material must be distinct from vault keys" /tmp/neg-dup-bytes.err\n'
+            # 4. Negative: wrong 32-byte backup key reaches AEAD verification and fails:
+            f'if OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
+            f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{wrong_bk_cfg}" '
+            '2>/tmp/neg-wrong-key.err; then\n'
+            '  echo "ERROR: wrong backup key unexpectedly verified" >&2; exit 1\n'
+            "fi\n"
+            'grep -q "backup verification failed" /tmp/neg-wrong-key.err\n'
+            # 5. Negative: bit-flipped pg.dump.enc verified with the GOOD backup key fails AEAD/digest check:
+            f'cp -a "{backup_dir}" /tmp/tampered-backup\n'
+            "chmod -R u+w /tmp/tampered-backup\n"
+            'size=$(wc -c < /tmp/tampered-backup/pg.dump.enc | tr -d " ")\n'
+            "trunc_len=$((size - 1))\n"
+            'last_hex=$(tail -c 1 /tmp/tampered-backup/pg.dump.enc | od -An -tx1 | tr -d " \\n")\n'
+            'if [ "$last_hex" = "ff" ]; then repl="\\000"; else repl="\\377"; fi\n'
+            'dd if=/dev/null of=/tmp/tampered-backup/pg.dump.enc bs=1 seek="$trunc_len" 2>/dev/null\n'
+            'printf "$repl" >> /tmp/tampered-backup/pg.dump.enc\n'
+            f'if OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
+            f'openmettle-admin backup verify --backup-dir /tmp/tampered-backup --backup-keys-config "{good_bk_cfg}" '
+            '2>/tmp/neg-tamper.err; then\n'
+            '  echo "ERROR: tampered pg.dump.enc unexpectedly verified" >&2; exit 1\n'
+            "fi\n"
+            'grep -q "backup verification failed" /tmp/neg-tamper.err\n'
+            "rm -rf /tmp/dup-vault /tmp/tampered-backup /tmp/neg-*.err\n"
+            'echo "preflight.negative_checks_passed"\n'
         )
         neg_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -1520,24 +1920,19 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     "spec": {
                         "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
                         "securityContext": POD_SEC_CONTEXT,
+                        "initContainers": [neg_init],
                         "containers": [{
                             "name": "neg", "image": admin_ref, "imagePullPolicy": "Never",
                             "command": ["/bin/sh", "-eu", "-c", neg_script],
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
-                                {"name": "wrong-src", "mountPath": "/run/wrong-backup-src", "readOnly": True},
-                                {"name": "wrong-stage", "mountPath": "/run/wrong-backup-stage"},
-                                {"name": "good-src", "mountPath": "/run/good-backup-src", "readOnly": True},
-                                {"name": "good-stage", "mountPath": "/run/good-backup-stage"},
+                                *neg_key_mounts,
                                 {"name": "media", "mountPath": RECOVERY_MEDIA_DIR, "readOnly": True},
                                 {"name": "tmp", "mountPath": "/tmp"},
                             ],
                         }],
                         "volumes": [
-                            {"name": "wrong-src", "secret": {"secretName": WRONG_BACKUP_SECRET, "defaultMode": 288}},
-                            {"name": "wrong-stage", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
-                            {"name": "good-src", "secret": {"secretName": smoke.BACKUP_KEYS_SECRET, "defaultMode": 288}},
-                            {"name": "good-stage", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+                            *neg_key_vols,
                             {"name": "media", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_MEDIA_CLAIM, "readOnly": True}},
                             {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "32Mi"}},
                         ],
@@ -1549,14 +1944,21 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.expect("preflight.negative_checks_passed" in neg_stdout, "negative preflight checks did not complete")
 
         # Step 1b: Offline verify + unpack into /var/recovery/unpacked and emit manifest.json.
+        unpack_init, unpack_key_mounts, unpack_key_vols = staged_keyring_mounts(
+            admin_ref,
+            [
+                ("backup", smoke.BACKUP_KEYS_SECRET, smoke.BACKUP_KEYS_DIR),
+                ("vault", smoke.VAULT_KEYS_SECRET, smoke.VAULT_KEYS_DIR),
+            ],
+        )
         unpack_script = (
-            stage_keyring_snippet("/run/openmettle-backup-src", "/run/openmettle-backup-stage")
-            + f'rm -rf "{UNPACKED_DIR}"\n'
-            + f'openmettle-admin backup verify --backup-dir "{backup_dir}" '
-              '--backup-keys-config /run/openmettle-backup-stage/keys/keyring.json\n'
-            + f'openmettle-admin backup unpack --backup-dir "{backup_dir}" --output-dir "{UNPACKED_DIR}" '
-              '--backup-keys-config /run/openmettle-backup-stage/keys/keyring.json\n'
-            + f'printf "MANIFEST_JSON_BEGIN\\n"\ncat "{UNPACKED_DIR}/manifest.json"\nprintf "\\nMANIFEST_JSON_END\\n"\n'
+            f'rm -rf "{UNPACKED_DIR}"\n'
+            f'OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
+            f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}"\n'
+            f'OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
+            f'openmettle-admin backup unpack --backup-dir "{backup_dir}" --output-dir "{UNPACKED_DIR}" '
+            f'--backup-keys-config "{good_bk_cfg}"\n'
+            f'printf "MANIFEST_JSON_BEGIN\\n"\ncat "{UNPACKED_DIR}/manifest.json"\nprintf "\\nMANIFEST_JSON_END\\n"\n'
         )
         unpack_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -1568,20 +1970,19 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     "spec": {
                         "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
                         "securityContext": POD_SEC_CONTEXT,
+                        "initContainers": [unpack_init],
                         "containers": [{
                             "name": "unpack", "image": admin_ref, "imagePullPolicy": "Never",
                             "command": ["/bin/sh", "-eu", "-c", unpack_script],
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
-                                {"name": "backup-src", "mountPath": "/run/openmettle-backup-src", "readOnly": True},
-                                {"name": "backup-stage", "mountPath": "/run/openmettle-backup-stage"},
+                                *unpack_key_mounts,
                                 {"name": "media", "mountPath": RECOVERY_MEDIA_DIR, "readOnly": True},
                                 {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR},
                             ],
                         }],
                         "volumes": [
-                            {"name": "backup-src", "secret": {"secretName": smoke.BACKUP_KEYS_SECRET, "defaultMode": 288}},
-                            {"name": "backup-stage", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+                            *unpack_key_vols,
                             {"name": "media", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_MEDIA_CLAIM, "readOnly": True}},
                             {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM}},
                         ],
@@ -1597,6 +1998,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         )
         self.expect(manifest_summary["vault_required_key_ids"] == [VAULT_KEY_ID_1],
                     f"expected vault_required_key_ids=['vault-k1'], got {manifest_summary['vault_required_key_ids']}")
+        self.expect(manifest_summary["artifact_volume_id"] is not None,
+                    "expected pinned artifact_volume.volume_id in drill manifest")
         self.passed("backup preflight verified, negative tamper/key checks refused, and archive unpacked",
                     **manifest_summary)
 
@@ -1607,7 +2010,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
             'owner_pw="${OWNER_DB_URL#*://openmettle_owner:}"\n'
             'owner_pw="${owner_pw%%@*}"\n'
-            f'printf "%s:5432:openmettle:openmettle_owner:%s\\n" "{target_pg_host}" "$owner_pw" > "$PGPASSFILE"\n'
+            'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
+            f'printf "%s:5432:openmettle:openmettle_owner:%s\\n" "$(esc "{target_pg_host}")" "$(esc "$owner_pw")" > "$PGPASSFILE"\n'
             'chmod 0600 "$PGPASSFILE"\n'
             "pg_restore --format=custom --no-owner --exit-on-error "
             f'--host="{target_pg_host}" --port=5432 --username=openmettle_owner --dbname=openmettle '
@@ -1672,36 +2076,43 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         # Verify restored DB schema=45, owner default ACLs clean, and snapshot maintenance gate still active.
         db_post_migrate = self.psql_superuser(
             TARGET_DB_NS,
-            "SELECT (SELECT max(version) FROM openmettle._sqlx_migrations WHERE success)::text || '|' ||"
+            "SELECT (SELECT max(version) FROM openmettle._sqlx_migrations WHERE success),"
             " (SELECT count(*) FROM pg_default_acl WHERE defaclrole = 'openmettle_owner'::regrole"
-            "  AND defaclnamespace = 0 AND defaclobjtype = 'f')::text || '|' ||"
-            " (SELECT maintenance_active::text FROM openmettle.backup_maintenance_gate);",
+            "  AND defaclnamespace = 0 AND defaclobjtype = 'f'),"
+            " (SELECT maintenance_active FROM openmettle.backup_maintenance_gate);",
         ).strip()
         self.expect(db_post_migrate == f"{REQUIRED_MIGRATION}|1|t",
                     f"unexpected target post-migrate DB state: {db_post_migrate!r}")
 
-        # Step 4: Restore lock, copy artifacts omitting rev_to_lose, prove rebind fails closed,
-        # replay --db-only -> declare-lost -> rebind --replace-adoption-run -> full replay -> quota verify.
+        # Step 4: Certify `--export-complete` against the stopped-primary watermark (falling back to
+        # `restore accept-coverage-gap` if uncertified), copy artifacts omitting rev_to_lose, prove
+        # `storage rebind` fails closed, then replay --db-only -> declare-lost -> rebind -> replay -> quota verify.
         watermarks = parse_journal_export_watermarks(self.journal_text)
         self.expect(watermarks["required_seq"] > manifest_summary["journal_seq"],
                     "post-backup journal export did not advance past backup snapshot journal_seq")
-        lock_argv = " ".join(f'"{a}"' for a in restore_lock_args(watermarks, export_complete=True))
+        export_complete = should_pass_export_complete(
+            watermarks, primary_state["stopped_primary_watermark"]
+        )
+        self.expect(export_complete, "stopped-primary watermark disagreed with post-backup journal export")
+        lock_argv = " ".join(f'"{a}"' for a in restore_lock_args(watermarks, export_complete=export_complete))
+        has_artifacts = manifest_summary["artifact_volume_id"] is not None
         lost_rev_id = primary_state["art_to_lose"]["revision_id"]
         lost_res_id = primary_state["rev_meta"][lost_rev_id]["reservation_id"]
         selected_journal = f"{RECOVERY_MEDIA_DIR}/post-backup-journal.export"
 
-        step4a_script = (
-            f"openmettle-admin {lock_argv}\n"
-            f'for entry in "{UNPACKED_DIR}/artifacts"/* "{UNPACKED_DIR}/artifacts"/.[!.]*; do\n'
-            '  [ -e "$entry" ] || continue\n'
-            f'  cp -a -- "$entry" "{smoke.ARTIFACTS_MOUNT_PATH}/"\n'
-            "done\n"
-            f'rm -f "{smoke.ARTIFACTS_MOUNT_PATH}/revisions/{lost_res_id}"\n'
-            f'set +e\nopenmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" > /tmp/rebind.out 2> /tmp/rebind.err\nrc=$?\nset -e\n'
-            'if [ "$rc" -eq 0 ]; then echo "ERROR: storage rebind succeeded despite missing payload" >&2; exit 1; fi\n'
-            'printf "REBIND_STDOUT_BEGIN\\n"; cat /tmp/rebind.out; printf "REBIND_STDOUT_END\\n"\n'
-            'printf "REBIND_STDERR_BEGIN\\n"; cat /tmp/rebind.err; printf "REBIND_STDERR_END\\n"\n'
-        )
+        step4a_script = f'printf "LOCK_STDOUT_BEGIN\\n"; openmettle-admin {lock_argv}; printf "LOCK_STDOUT_END\\n"\n'
+        if has_artifacts:
+            step4a_script += (
+                f'for entry in "{UNPACKED_DIR}/artifacts"/* "{UNPACKED_DIR}/artifacts"/.[!.]*; do\n'
+                '  [ -e "$entry" ] || continue\n'
+                f'  cp -a -- "$entry" "{smoke.ARTIFACTS_MOUNT_PATH}/"\n'
+                "done\n"
+                f'rm -f "{smoke.ARTIFACTS_MOUNT_PATH}/revisions/{lost_res_id}"\n'
+                f'set +e\nopenmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" > /tmp/rebind.out 2> /tmp/rebind.err\nrc=$?\nset -e\n'
+                'if [ "$rc" -eq 0 ]; then echo "ERROR: storage rebind succeeded despite missing payload" >&2; exit 1; fi\n'
+                'printf "REBIND_STDOUT_BEGIN\\n"; cat /tmp/rebind.out; printf "REBIND_STDOUT_END\\n"\n'
+                'printf "REBIND_STDERR_BEGIN\\n"; cat /tmp/rebind.err; printf "REBIND_STDERR_END\\n"\n'
+            )
         step4a_job = {
             "apiVersion": "batch/v1", "kind": "Job",
             "metadata": {"name": "openmettle-drill-rebind-failclosed", "namespace": TARGET_APP_NS, "labels": labels},
@@ -1734,31 +2145,57 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             },
         }
         s4a_out, _ = self.run_job(TARGET_APP_NS, step4a_job)
-        rebind_out = s4a_out.split("REBIND_STDOUT_BEGIN\n", 1)[1].split("REBIND_STDOUT_END", 1)[0]
-        rebind_err = s4a_out.split("REBIND_STDERR_BEGIN\n", 1)[1].split("REBIND_STDERR_END", 1)[0]
-        barrier_uuid = parse_failed_rebind(rebind_out, rebind_err, lost_res_id)
+        lock_out = s4a_out.split("LOCK_STDOUT_BEGIN\n", 1)[1].split("LOCK_STDOUT_END", 1)[0]
+        restore_run_id = parse_restore_lock_run_id(lock_out)
+        barrier_uuid = None
+        if has_artifacts:
+            rebind_out = s4a_out.split("REBIND_STDOUT_BEGIN\n", 1)[1].split("REBIND_STDOUT_END", 1)[0]
+            rebind_err = s4a_out.split("REBIND_STDERR_BEGIN\n", 1)[1].split("REBIND_STDERR_END", 1)[0]
+            barrier_uuid = parse_failed_rebind(rebind_out, rebind_err, lost_res_id)
 
-        # Step 4b + Step 5b + Step 5d: db-only replay -> declare-lost -> rebind --replace-adoption-run ->
-        # full replay -> quota verify -> vault status/rotate -> release-maintenance -> scrub unpacked dir.
+        # Step 4c + 4d + Step 5c (vault status & rotate; maintenance STAYS ACTIVE until Step 5e!).
+        s4b_init, s4b_key_mounts, s4b_key_vols = staged_keyring_mounts(
+            admin_ref, [("vault", smoke.VAULT_KEYS_SECRET, smoke.VAULT_KEYS_DIR)]
+        )
+        gap_line = ""
+        if not export_complete:
+            gap_argv = " ".join(
+                f'"{a}"'
+                for a in accept_coverage_gap_args(
+                    restore_run_id,
+                    DRILL_OPERATOR_ID,
+                    f"drill-gap-{restore_run_id}",
+                    "post-export primary activity before loss cannot be ruled out",
+                )
+            )
+            gap_line = f"openmettle-admin {gap_argv}\n"
+
+        if has_artifacts:
+            replay_and_rebind_lines = (
+                f'openmettle-admin restore replay --db-only "{selected_journal}"\n'
+                f'openmettle-admin storage declare-lost "{smoke.ARTIFACTS_MOUNT_PATH}" '
+                f'--revision "{lost_rev_id}" --operator-id "{DRILL_OPERATOR_ID}" '
+                f'--request-key "drill-lost-{lost_rev_id}" '
+                '--reason "simulated unrecoverable disk payload during V1-31 isolated restore drill"\n'
+                f'openmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" --replace-adoption-run "{barrier_uuid}"\n'
+                + gap_line
+                + f'openmettle-admin restore replay "{selected_journal}" "{smoke.ARTIFACTS_MOUNT_PATH}"\n'
+                + f'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify "{smoke.ARTIFACTS_MOUNT_PATH}"; printf "QUOTA_STAGE4_END\\n"\n'
+            )
+        else:
+            replay_and_rebind_lines = (
+                gap_line
+                + f'openmettle-admin restore replay "{selected_journal}"\n'
+                + 'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify; printf "QUOTA_STAGE4_END\\n"\n'
+            )
+
         step4b_script = (
-            stage_keyring_snippet("/run/openmettle-vault-src", "/run/openmettle-vault-stage")
-            + f'openmettle-admin restore replay --db-only "{selected_journal}"\n'
-            + f'openmettle-admin storage declare-lost "{smoke.ARTIFACTS_MOUNT_PATH}" '
-              f'--revision "{lost_rev_id}" --operator-id "{DRILL_OPERATOR_ID}" '
-              f'--request-key "drill-lost-{lost_rev_id}" '
-              '--reason "simulated unrecoverable disk payload during V1-31 isolated restore drill"\n'
-            + f'openmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" --replace-adoption-run "{barrier_uuid}"\n'
-            + f'openmettle-admin restore replay "{selected_journal}" "{smoke.ARTIFACTS_MOUNT_PATH}"\n'
+            replay_and_rebind_lines
             + 'printf "VAULT_BEFORE_BEGIN\\n"; openmettle-admin vault status; printf "VAULT_BEFORE_END\\n"\n'
-            + 'openmettle-admin vault rotate --vault-keys /run/openmettle-vault-stage/keys/keyring.json '
+            + f'openmettle-admin vault rotate --vault-keys "{good_vt_cfg}" '
               f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-vault-rotate-1" '
               '--reason "rotate recovered external connections to vault-k2"\n'
             + 'printf "VAULT_AFTER_BEGIN\\n"; openmettle-admin vault status; printf "VAULT_AFTER_END\\n"\n'
-            + 'openmettle-admin backup release-maintenance '
-              f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-release-maint-1" '
-              '--reason "isolated restore pre-worker reconciliation complete" --abort-active-run\n'
-            + f'printf "QUOTA_VERIFY_BEGIN\\n"; openmettle-admin quota verify "{smoke.ARTIFACTS_MOUNT_PATH}"; printf "QUOTA_VERIFY_END\\n"\n'
-            + f'rm -rf "{UNPACKED_DIR}"\n'
         )
         step4b_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -1770,25 +2207,25 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     "spec": {
                         "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
                         "securityContext": POD_SEC_CONTEXT,
+                        "initContainers": [s4b_init],
                         "containers": [{
                             "name": "reconcile", "image": admin_ref, "imagePullPolicy": "Never",
                             "command": ["/bin/sh", "-eu", "-c", step4b_script],
-                            "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
-                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
+                            "env": [
+                                {"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                 "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}},
+                                {"name": "OPENMETTLE_API_VAULT_KEYS_CONFIG", "value": good_vt_cfg},
+                            ],
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
-                                {"name": "vault-src", "mountPath": "/run/openmettle-vault-src", "readOnly": True},
-                                {"name": "vault-stage", "mountPath": "/run/openmettle-vault-stage"},
+                                *s4b_key_mounts,
                                 {"name": "media", "mountPath": RECOVERY_MEDIA_DIR, "readOnly": True},
-                                {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR},
                                 {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH},
                             ],
                         }],
                         "volumes": [
-                            {"name": "vault-src", "secret": {"secretName": smoke.VAULT_KEYS_SECRET, "defaultMode": 288}},
-                            {"name": "vault-stage", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+                            *s4b_key_vols,
                             {"name": "media", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_MEDIA_CLAIM, "readOnly": True}},
-                            {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM}},
                             {"name": "artifacts", "persistentVolumeClaim": {"claimName": TARGET_ARTIFACTS_CLAIM}},
                         ],
                     },
@@ -1796,25 +2233,28 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             },
         }
         s4b_out, _ = self.run_job(TARGET_APP_NS, step4b_job)
+        parse_quota_verify_zero(s4b_out.split("QUOTA_STAGE4_BEGIN\n", 1)[1].split("QUOTA_STAGE4_END", 1)[0])
         vault_before = parse_vault_status(s4b_out.split("VAULT_BEFORE_BEGIN\n", 1)[1].split("VAULT_BEFORE_END", 1)[0])
         vault_after = parse_vault_status(s4b_out.split("VAULT_AFTER_BEGIN\n", 1)[1].split("VAULT_AFTER_END", 1)[0])
-        quota_pre = parse_quota_verify_zero(s4b_out.split("QUOTA_VERIFY_BEGIN\n", 1)[1].split("QUOTA_VERIFY_END", 1)[0])
         self.expect(vault_before["by_key_id"] == {VAULT_KEY_ID_1: 1} and vault_before["encrypted"] == 1,
                     f"expected 1 encrypted connection on vault-k1 after replay, got {vault_before!r}")
         self.expect(vault_after["by_key_id"] == {VAULT_KEY_ID_2: 1} and vault_after["encrypted"] == 1,
                     f"expected vault rotate to re-seal onto vault-k2, got {vault_after!r}")
 
-        # Step 5a & 5c: Run owner SQL inside target namespace as openmettle_owner (no superuser) via 0600 PGPASSFILE.
-        sql_text = pre_worker_reconcile_sql(DRILL_OPERATOR_ID)
+        # Step 5a, 5b & 5d.1: Run owner SQL inside target namespace as openmettle_owner via 0600 PGPASSFILE.
+        sql_text = pre_worker_owner_reconcile_sql(
+            DRILL_OPERATOR_ID, disabled_principals=primary_state["disabled_principals"]
+        )
         owner_sql_script = (
             "umask 077\n"
             "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
             'owner_pw="${OWNER_DB_URL#*://openmettle_owner:}"\n'
             'owner_pw="${owner_pw%%@*}"\n'
-            f'printf "%s:5432:openmettle:openmettle_owner:%s\\n" "{target_pg_host}" "$owner_pw" > "$PGPASSFILE"\n'
+            'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
+            f'printf "%s:5432:openmettle:openmettle_owner:%s\\n" "$(esc "{target_pg_host}")" "$(esc "$owner_pw")" > "$PGPASSFILE"\n'
             'chmod 0600 "$PGPASSFILE"\n'
             f'psql -v ON_ERROR_STOP=1 --single-transaction -qtA -h "{target_pg_host}" -p 5432 '
-            '-U openmettle_owner -d openmettle <<\'EOSQL\'\n'
+            "-U openmettle_owner -d openmettle <<'EOSQL'\n"
             f"{sql_text}\n"
             "EOSQL\n"
             'rm -f "$PGPASSFILE"\n'
@@ -1843,15 +2283,102 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             },
         }
         sql_out, _ = self.run_job(TARGET_APP_NS, owner_sql_job)
-        cancelled_counts = [ln.strip() for ln in sql_out.splitlines() if "|" in ln]
-        self.expect(cancelled_counts == ["2|0"],
+        cancelled_lines = [ln.strip() for ln in sql_out.splitlines() if ln.strip().isdigit()]
+        self.expect(cancelled_lines == ["2"],
                     f"expected 2 parked waiting runs cancelled cleanly, got {sql_out!r}")
 
+        # Step 5d.2: Release eligible terminal-run quota holds as openmettle_worker (`SECRET['worker']`).
+        worker_sql_text = worker_quota_release_sql()
+        worker_sql_script = (
+            "umask 077\n"
+            "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
+            'worker_pw="${WORKER_DB_URL#*://openmettle_worker:}"\n'
+            'worker_pw="${worker_pw%%@*}"\n'
+            'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
+            f'printf "%s:5432:openmettle:openmettle_worker:%s\\n" "$(esc "{target_pg_host}")" "$(esc "$worker_pw")" > "$PGPASSFILE"\n'
+            'chmod 0600 "$PGPASSFILE"\n'
+            f'psql -v ON_ERROR_STOP=1 --single-transaction -qtA -h "{target_pg_host}" -p 5432 '
+            "-U openmettle_worker -d openmettle <<'EOSQL'\n"
+            f"{worker_sql_text}\n"
+            "EOSQL\n"
+            'rm -f "$PGPASSFILE"\n'
+        )
+        worker_sql_job = {
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "openmettle-drill-worker-quota-release", "namespace": TARGET_APP_NS, "labels": labels},
+            "spec": {
+                "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                "template": {
+                    "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                    "spec": {
+                        "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                        "securityContext": POD_SEC_CONTEXT,
+                        "containers": [{
+                            "name": "psql-worker", "image": self.pg_client_ref, "imagePullPolicy": "Never",
+                            "command": ["/bin/sh", "-eu", "-c", worker_sql_script],
+                            "env": [{"name": "WORKER_DB_URL",
+                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["worker"], "key": "url"}}}],
+                            "securityContext": CONTAINER_SEC_CONTEXT,
+                            "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                        }],
+                        "volumes": [{"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Mi"}}],
+                    },
+                },
+            },
+        }
+        w_sql_out, _ = self.run_job(TARGET_APP_NS, worker_sql_job)
+        released_lines = [ln.strip() for ln in w_sql_out.splitlines() if ln.strip().isdigit()]
+        # waiting_run_id's 25-token hold is released (1); intent_run_id's 25-token hold stays held (outcome_unknown).
+        self.expect(released_lines == ["1"],
+                    f"expected 1 eligible terminal-run quota reservation released by worker, got {w_sql_out!r}")
+
+        # Step 5e (LAST before starting workloads): release snapshot maintenance, re-verify zero drift, scrub unpacked dir.
+        qv_arg = f' "{smoke.ARTIFACTS_MOUNT_PATH}"' if has_artifacts else ""
+        step5e_script = (
+            "openmettle-admin backup release-maintenance "
+            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-release-maint-1" '
+            '--reason "isolated restore pre-worker reconciliation complete" --abort-active-run\n'
+            f'printf "QUOTA_VERIFY_BEGIN\\n"; openmettle-admin quota verify{qv_arg}; printf "QUOTA_VERIFY_END\\n"\n'
+            f'rm -rf "{UNPACKED_DIR}"\n'
+        )
+        step5e_job = {
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "openmettle-drill-release-maintenance", "namespace": TARGET_APP_NS, "labels": labels},
+            "spec": {
+                "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                "template": {
+                    "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                    "spec": {
+                        "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                        "securityContext": POD_SEC_CONTEXT,
+                        "containers": [{
+                            "name": "release", "image": admin_ref, "imagePullPolicy": "Never",
+                            "command": ["/bin/sh", "-eu", "-c", step5e_script],
+                            "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
+                            "securityContext": CONTAINER_SEC_CONTEXT,
+                            "volumeMounts": [
+                                {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR},
+                                {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH, "readOnly": True},
+                            ],
+                        }],
+                        "volumes": [
+                            {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM}},
+                            {"name": "artifacts", "persistentVolumeClaim": {"claimName": TARGET_ARTIFACTS_CLAIM, "readOnly": True}},
+                        ],
+                    },
+                },
+            },
+        }
+        s5e_out, _ = self.run_job(TARGET_APP_NS, step5e_job)
+        quota_pre = parse_quota_verify_zero(s5e_out.split("QUOTA_VERIFY_BEGIN\n", 1)[1].split("QUOTA_VERIFY_END", 1)[0])
+
         self.passed(
-            "isolated target DB restored, missing payload declared lost, deletion journal replayed, vault rotated, and parked runs cancelled",
-            rebind_barrier_recovered=True,
+            "isolated target DB restored, missing payload declared lost, deletion journal replayed, vault rotated, parked runs & quotas reconciled, and maintenance released",
+            rebind_barrier_recovered=has_artifacts,
             vault_rotated_to=VAULT_KEY_ID_2,
             cancelled_waiting_runs=2,
+            released_terminal_run_holds=1,
             quota_verify=quota_pre,
         )
 
@@ -1874,9 +2401,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.expect(status == 200, f"target /readyz HTTP {status}")
         finally:
             fwd.close()
-        recovery_completed_at = datetime.now(timezone.utc)
 
-        # Live NetworkPolicy isolation probes across target and primary namespaces.
+        # Live NetworkPolicy isolation probes across target/primary app and DB namespaces.
         probe_results = []
         for p in target_isolation_probe_plan():
             res = self.kube("--namespace", p["namespace"], "exec", f"deployment/{p['workload']}",
@@ -1885,25 +2411,26 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             outcome = smoke.probe_outcome(res.returncode, res.stdout, res.stderr, p["http"])
             probe_results.append({k: p[k] for k in ("name", "expect", "control")} | {"outcome": outcome})
         smoke.evaluate_probes(probe_results)
-        self.passed("NetworkPolicy isolates restore target from primary PostgreSQL and gateway",
-                    probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]}
-                            for r in probe_results])
+        self.passed(
+            "NetworkPolicy and PodSecurity isolate restore target and DB namespaces from primary",
+            probes=[{"probe": r["name"], "expect": r["expect"], "outcome": r["outcome"]} for r in probe_results],
+        )
 
-        return {
-            "manifest": manifest_summary,
-            "recovery_started_at": recovery_started_at,
-            "recovery_completed_at": recovery_completed_at,
-        }
+        return {"manifest": manifest_summary}
 
-    def verify_post_restore_state(self, primary_state: dict, recovery_meta: dict) -> None:
-        # Mint fresh post-restore sessions for user_a and user_b (matching bumped access_generation + epoch).
+    def verify_post_restore_state(
+        self, primary_state: dict, recovery_meta: dict, recovery_started_at: datetime
+    ) -> None:
+        # Mint fresh post-restore sessions for user_a, user_b, and disabled user_c.
         sid_a2, cookie_a2, hash_a2 = smoke.session_credential(secrets.token_bytes(64))
         sid_b2, cookie_b2, hash_b2 = smoke.session_credential(secrets.token_bytes(64))
-        self.secrets_to_redact.extend([cookie_a2, cookie_b2])
+        sid_c2, cookie_c2, hash_c2 = smoke.session_credential(secrets.token_bytes(64))
+        self.secrets_to_redact.extend([cookie_a2, cookie_b2, cookie_c2])
         self.psql_superuser(
             TARGET_DB_NS,
             fresh_post_restore_session_sql(USER_A_IDS, sid_a2, smoke.b64url(secrets.token_bytes(32)), hash_a2, "target-a")
-            + fresh_post_restore_session_sql(USER_B_IDS, sid_b2, smoke.b64url(secrets.token_bytes(32)), hash_b2, "target-b"),
+            + fresh_post_restore_session_sql(USER_B_IDS, sid_b2, smoke.b64url(secrets.token_bytes(32)), hash_b2, "target-b")
+            + fresh_post_restore_session_sql(USER_C_IDS, sid_c2, smoke.b64url(secrets.token_bytes(32)), hash_c2, "target-c"),
         )
 
         # Give target worker 3 sweeps to prove zero unsolicited SGLang calls from parked runs/write intents.
@@ -1913,9 +2440,10 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=TARGET_APP_NS)
         try:
-            # 1. Pre-restore session cookies must be rejected (401 unauthenticated).
-            for stale_cookie in (self.cookie_a_pre, self.cookie_b_pre):
-                self.api_call(fwd.port, stale_cookie, "GET", "/v1/quotas/personal", 401)
+            # 1. Pre-restore session cookies AND post-backup disabled user_c's fresh session must return 401.
+            for rejected_cookie in (self.cookie_a_pre, self.cookie_b_pre, self.cookie_c_pre, cookie_c2):
+                self.api_call(fwd.port, rejected_cookie, "GET", "/v1/quotas/personal", 401)
+            self.api_call(fwd.port, cookie_c2, "GET", f"/v1/projects/{primary_state['project_id']}", 401)
 
             # 2. Surviving personal conversation, completed run history, and personal artifact ownership/404 isolation.
             p_conv_id = primary_state["personal_conv"]["conversation_id"]
@@ -1935,11 +2463,11 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.api_call(fwd.port, cookie_b2, "GET", keep_path, 404)
             self.api_call(fwd.port, cookie_b2, "GET", f"{keep_path}/content", 404)
 
-            # 3. Surviving shared project: Viewer user_b can read (200) and is denied writes (403 policy).
+            # 3. Surviving shared project: Viewer user_b downloads shared artifact (200) and is denied writes (403 policy).
             proj_art = primary_state["art_project"]
             proj_art_path = f"/v1/artifacts/{proj_art['artifact_id']}/revisions/{proj_art['revision_id']}"
             _, proj_bytes = self.api_call(fwd.port, cookie_b2, "GET", f"{proj_art_path}/content", 200)
-            self.expect(proj_bytes == b"drill-project-shared-bytes\n", "viewer failed to download project artifact")
+            self.expect(proj_bytes == b"drill-project-shared-bytes\n", "viewer failed to download shared project artifact")
             boundary_deny = f"drill-boundary-{secrets.token_hex(4)}"
             _, deny_body = self.api_call(
                 fwd.port, cookie_b2, "POST",
@@ -1961,9 +2489,17 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.api_call(fwd.port, cookie_b2, "GET", lost_path, 404)
             self.api_call(fwd.port, cookie_b2, "GET", f"{lost_path}/content", 404)
 
-            # 5. Post-backup purged artifact must NOT resurrect; pre-backup retained deadline must stay unchanged.
+            # 5. Post-backup purged revision must remain purged (409 conflict on /content) and retained
+            #    revision must preserve its exact pre-backup purge_after deadline.
             purged = primary_state["art_post_purge"]
-            self.api_call(fwd.port, cookie_a2, "GET", f"/v1/artifacts/{purged['artifact_id']}", 404)
+            purged_rev_path = f"/v1/artifacts/{purged['artifact_id']}/revisions/{purged['revision_id']}"
+            purged_meta = self.api_json(fwd.port, cookie_a2, "GET", purged_rev_path, 200)
+            self.expect(purged_meta.get("state") == "purged",
+                        f"expected post-backup deleted revision state='purged', got {purged_meta!r}")
+            _, purged_content_err = self.api_call(fwd.port, cookie_a2, "GET", f"{purged_rev_path}/content", 409)
+            self.expect(json.loads(purged_content_err).get("code") == "conflict",
+                        f"expected 409 conflict on purged revision /content, got {purged_content_err!r}")
+
             dl = primary_state["art_deadline"]
             dl_meta = self.api_json(fwd.port, cookie_a2, "GET",
                                     f"/v1/artifacts/{dl['artifact_id']}/revisions/{dl['revision_id']}", 200)
@@ -1978,7 +2514,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                         f"unexpected restored connection states: keep={ck.get('state')}, revoke={cr.get('state')}")
             self.api_call(fwd.port, cookie_b2, "GET", f"/v1/connections/{primary_state['conn_revoke_id']}", 404)
 
-            # 7. Stale approval cannot revive (409 conflict) and parked runs are cancelled.
+            # 7. Stale approval cannot revive ("decision": "approve" -> 409 conflict) and parked runs are cancelled.
             parked = primary_state["parked"]
             w_run = self.api_json(fwd.port, cookie_a2, "GET", f"/v1/runs/{parked['waiting_run_id']}", 200)
             i_run = self.api_json(fwd.port, cookie_a2, "GET", f"/v1/runs/{parked['intent_run_id']}", 200)
@@ -1992,7 +2528,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 fwd.port, cookie_a2, "POST",
                 f"/v1/runs/{parked['waiting_run_id']}/approvals/{parked['waiting_approval_id']}/decision",
                 409, key="drill-stale-approval-approve",
-                json_body={"decision": "approved", "binding_digest": parked["waiting_binding_digest"]},
+                json_body={"decision": "approve", "binding_digest": parked["waiting_binding_digest"]},
             )
             self.expect(json.loads(stale_decision).get("code") == "conflict",
                         f"stale approval decision did not fail with 409 conflict: {stale_decision!r}")
@@ -2022,27 +2558,48 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.expect(len(self.standin_records(TARGET_DB_NS)) == 1,
                     "expected exactly 1 upstream gateway call from the fresh post-restore turn")
 
-        # Verify SQL invariants on target: write intent outcome_unknown (rev 1), purged disk file absent,
-        # disconnected ciphertext NULL, original_purge_after exact epoch match, restore_gate open.
-        purged_res_id = primary_state["rev_meta"][primary_state["art_post_purge"]["revision_id"]]["reservation_id"]
+        # Verify SQL invariants on target: write intent outcome_unknown (rev 1), contiguous run_events
+        # sequences matching runs.last_event_sequence, waiting_run quota released vs intent_run quota held,
+        # disconnected ciphertext NULL, exact microsecond purge_after match, restore_gate open, maintenance false.
+        purged_rev_id = primary_state["art_post_purge"]["revision_id"]
+        purged_res_id = primary_state["rev_meta"][purged_rev_id]["reservation_id"]
         dl_rev_id = primary_state["art_deadline"]["revision_id"]
-        expected_orig_epoch = primary_state["rev_meta"][dl_rev_id]["original_purge_epoch"]
+        expected_purge_after_us = primary_state["rev_meta"][dl_rev_id]["purge_after_us"]
+        w_run_id = primary_state["parked"]["waiting_run_id"]
+        i_run_id = primary_state["parked"]["intent_run_id"]
+        i_op_id = primary_state["parked"]["intent_operation_id"]
+
         sql_checks = self.psql_superuser(
             TARGET_DB_NS,
-            f"SELECT (SELECT outcome || ':' || revision::text FROM openmettle.operations"
-            f"        WHERE id = '{primary_state['parked']['intent_operation_id']}'::uuid) || '|' ||"
-            f" (SELECT count(*)::text FROM openmettle.run_events"
-            f"  WHERE run_id = '{primary_state['parked']['intent_run_id']}'::uuid"
-            f"    AND append_key = 'unresolved-write:{primary_state['parked']['intent_operation_id']}') || '|' ||"
-            f" (SELECT (encryption_key_id IS NULL AND access_ciphertext IS NULL AND refresh_ciphertext IS NULL)::text"
-            f"  FROM openmettle.external_connections WHERE id = '{primary_state['conn_revoke_id']}'::uuid) || '|' ||"
-            f" (SELECT extract(epoch FROM original_purge_after)::bigint::text"
-            f"  FROM openmettle.artifact_revisions WHERE id = '{dl_rev_id}'::uuid) || '|' ||"
-            " (SELECT open::text FROM openmettle.restore_reconciliation_gate);",
+            f"SELECT (SELECT outcome || ':' || revision::text FROM openmettle.operations WHERE id = '{i_op_id}'::uuid),"
+            f" (SELECT count(*) FROM openmettle.run_events WHERE run_id = '{i_run_id}'::uuid"
+            f"    AND append_key = 'unresolved-write:{i_op_id}'),"
+            f" (SELECT encryption_key_id IS NULL AND access_ciphertext IS NULL AND refresh_ciphertext IS NULL"
+            f"    FROM openmettle.external_connections WHERE id = '{primary_state['conn_revoke_id']}'::uuid),"
+            f" (SELECT (extract(epoch FROM purge_after) * 1000000)::bigint"
+            f"    FROM openmettle.artifact_revisions WHERE id = '{dl_rev_id}'::uuid),"
+            f" (SELECT state FROM openmettle.artifact_revisions WHERE id = '{purged_rev_id}'::uuid),"
+            " (SELECT open FROM openmettle.restore_reconciliation_gate),"
+            " (SELECT maintenance_active FROM openmettle.backup_maintenance_gate),"
+            f" (SELECT last_event_sequence || ':' || (SELECT count(*) FROM openmettle.run_events WHERE run_id = r.id)"
+            f"         || ':' || (SELECT coalesce(min(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
+            f"         || ':' || (SELECT coalesce(max(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
+            f"    FROM openmettle.runs r WHERE id = '{w_run_id}'::uuid),"
+            f" (SELECT last_event_sequence || ':' || (SELECT count(*) FROM openmettle.run_events WHERE run_id = r.id)"
+            f"         || ':' || (SELECT coalesce(min(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
+            f"         || ':' || (SELECT coalesce(max(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
+            f"    FROM openmettle.runs r WHERE id = '{i_run_id}'::uuid),"
+            f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
+            f"    WHERE run_id = '{w_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens'),"
+            f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
+            f"    WHERE run_id = '{i_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens');",
         ).strip()
+        expected_sql = (
+            f"outcome_unknown:1|1|t|{expected_purge_after_us}|purged|t|f|2:2:1:2|3:3:1:3|released:0|held:25"
+        )
         self.expect(
-            sql_checks == f"outcome_unknown:1|1|t|{expected_orig_epoch}|t",
-            f"unexpected post-restore SQL invariants: {sql_checks!r}",
+            sql_checks == expected_sql,
+            f"unexpected post-restore SQL invariants: got {sql_checks!r}, expected {expected_sql!r}",
         )
 
         api_pods = self.kube_json("--namespace", TARGET_APP_NS, "get", "pods", "--selector",
@@ -2092,7 +2649,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         pv_out, _ = self.run_job(TARGET_APP_NS, post_verify_job)
         quota_post = parse_quota_verify_zero(pv_out)
 
-        # Confirm primary environment remained completely untouched (rev_to_lose still active & 200 on primary!).
+        # Confirm primary environment remained completely untouched (rev_to_lose still active & 200 on primary).
         fwd_pri = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=PRIMARY_APP_NS)
         try:
             lost_on_pri = primary_state["art_to_lose"]
@@ -2105,15 +2662,18 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         finally:
             fwd_pri.close()
 
+        # Full RTO span: recovery_started_at (before target provisioning/media staging) -> recovery_completed_at
+        # (after final post-restore HTTP/SQL acceptance, quota verify, and non-interference check).
+        recovery_completed_at = datetime.now(timezone.utc)
         rpo_rto = evaluate_rpo_rto(
             recovery_meta["manifest"]["quiesced_at"],
             primary_state["cutover_at"],
-            recovery_meta["recovery_started_at"],
-            recovery_meta["recovery_completed_at"],
+            recovery_started_at,
+            recovery_completed_at,
         )
         self.report["rpo_rto"] = rpo_rto
         self.passed(
-            "post-restore HTTP/SQL invariants, non-revival of approvals/intents, primary non-interference, and RPO/RTO bounds verified",
+            "post-restore HTTP/SQL invariants, revoked principal denial, non-revival of approvals/intents, primary non-interference, and RPO/RTO bounds verified",
             quota_verify=quota_post,
             rpo_rto=rpo_rto,
         )
@@ -2123,22 +2683,23 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.build_and_load_images()
         self.pin_digests()
         primary_state = self.setup_primary_and_capture()
+        recovery_started_at = datetime.now(timezone.utc)
         self.provision_target_and_stage_media(primary_state)
         recovery_meta = self.execute_target_restore(primary_state)
-        self.verify_post_restore_state(primary_state, recovery_meta)
+        self.verify_post_restore_state(primary_state, recovery_meta, recovery_started_at)
         self.report["result"] = "passed"
 
     def cleanup(self):
         if self.cluster_attempted:
-            deleted = self.runner.run(["kind", "delete", "cluster", "--name", self.name,
-                                       "--kubeconfig", str(self.kubeconfig)], check=False, timeout=300)
+            deleted = self.runner(["kind", "delete", "cluster", "--name", self.name,
+                                   "--kubeconfig", str(self.kubeconfig)], check=False, timeout=300)
             if deleted.returncode != 0:
                 self.report["cleanup_errors"].append(
                     f"kind delete cluster exited {deleted.returncode}: "
                     f"{smoke.redacted_tail(deleted.stderr.strip(), self.secrets_to_redact, smoke.STDERR_TAIL)}"
                 )
         for image in self.built_images:
-            removed = self.runner.run(["docker", "image", "rm", "--force", image], check=False, timeout=120)
+            removed = self.runner(["docker", "image", "rm", "--force", image], check=False, timeout=120)
             if removed.returncode != 0:
                 self.report["cleanup_errors"].append(f"docker image rm {image} exited {removed.returncode}")
 

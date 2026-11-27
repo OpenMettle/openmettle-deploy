@@ -1,14 +1,15 @@
 //! Kind-only V1-31 restore-drill fixture seeding a parked human-approval `waiting` run and a
-//! revision-zero two-phase external write `intent` via pinned `openmettle-core` store APIs.
+//! revision-zero two-phase external write `intent` via pinned `openmettle-core` store APIs, each
+//! holding a 25-unit `usage_tokens` reservation so pre-worker quota reconciliation is exercised.
 //! Reads `<api_url>\n<worker_url>\n<session_cookie>\n` from stdin so zero credentials appear in argv.
 use openmettle_core::{
     authz::{
         CapabilityGate,
-        approvals::{
-            Destination, EffectClass, EffectPolicy, EndpointKey, Proposal, Review, park,
-        },
+        approvals::{Destination, EffectClass, EffectPolicy, EndpointKey, Proposal, Review, park},
         leases::LeaseSettings,
-        runs::{Admission, AdmissionLimits, ClaimLimits, RunAdmission, admit_run_with_mode, claim_next},
+        runs::{
+            Admission, AdmissionLimits, ClaimLimits, RunAdmission, admit_run_with_mode, claim_next,
+        },
         store::StoreError,
     },
     runs::{Intent, Payload, RunInput, WriteTransaction, record_intent},
@@ -71,7 +72,7 @@ fn proposal(logical_key: &str) -> Proposal {
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [actor, approval] = args.as_slice() else {
-        panic!("usage: drill-fixture <actor_user_id> <actor_approval_id>");
+        panic!("usage: kind-drill-fixture <actor_user_id> <actor_approval_id>");
     };
     let mut lines = io::stdin().lines();
     let api_url = lines.next().expect("api url line").expect("api url");
@@ -116,12 +117,10 @@ async fn main() {
         executing_per_scope: 8,
     };
     let lease_settings = LeaseSettings {
-        lease_duration: Duration::from_secs(60),
-        execution_timeout: Duration::from_secs(300),
-        db_timeout: Duration::from_secs(2),
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(14_400),
     };
 
-    // Helper: create conversation + branch + message + admit + claim + park in `waiting`.
     let mut created_waiting = Vec::new();
     for (idx, idem_key, prop_key) in [
         (1, "drill-waiting-approval-run", "approval-gate-1"),
@@ -155,13 +154,13 @@ async fn main() {
         .await
         .unwrap();
 
+        let input_bytes = format!("{{\"step\":{idx}}}");
         let config_bytes = json!({"execution_mode": "ordinary"}).to_string();
-        let now_ms: i64 = sqlx::query_scalar(
-            "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint",
-        )
-        .fetch_one(&mut api_conn)
-        .await
-        .unwrap();
+        let now_ms: i64 =
+            sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+                .fetch_one(&mut api_conn)
+                .await
+                .unwrap();
         let req = RunAdmission {
             input: RunInput {
                 scope: &scope,
@@ -172,7 +171,7 @@ async fn main() {
                 key: idem_key,
                 format: "openmettle.drill-synthetic",
                 version: 1,
-                input: format!("{{\"step\":{idx}}}").as_bytes(),
+                input: input_bytes.as_bytes(),
                 config: config_bytes.as_bytes(),
             },
             actor_approval_id: approval,
@@ -197,6 +196,29 @@ async fn main() {
             .expect("claimed drill run");
         assert_eq!(claimed.run_id, run_id, "claimed unexpected run");
 
+        // Reserve a 25-token run-level quota hold under the active worker lease before parking so
+        // pre-worker cancellation + `quota_release_terminal_runs` exercises real hold unwinding on
+        // `waiting_run_id` while retaining the hold on `intent_run_id` (`outcome_unknown`).
+        let mut qtx = WriteTransaction::begin(&mut worker_conn).await.unwrap();
+        sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid, $2::uuid)")
+            .bind(&scope)
+            .bind(&claimed.run_id)
+            .execute(qtx.connection().unwrap())
+            .await
+            .expect("lock run actor prefix");
+        sqlx::query(
+            "SELECT openmettle.quota_prepare_turn_round(
+                 $1::uuid, $2::uuid, $3::uuid, 25::bigint, NULL::bigint, false, false, false, true
+             )",
+        )
+        .bind(&scope)
+        .bind(&claimed.run_id)
+        .bind(&claimed.claim_token)
+        .execute(qtx.connection().unwrap())
+        .await
+        .expect("reserve 25 usage_tokens on claimed run");
+        qtx.commit().await.unwrap();
+
         let parked = park(
             &mut worker_conn,
             &claimed.lease(),
@@ -204,7 +226,7 @@ async fn main() {
             &proposal(prop_key),
             &DrillEffectPolicy,
             &lease_settings,
-            Duration::from_secs(7200),
+            Duration::from_secs(7_200),
         )
         .await
         .expect("park run for approval");
