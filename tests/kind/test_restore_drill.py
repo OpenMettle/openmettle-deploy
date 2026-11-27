@@ -250,6 +250,12 @@ class JournalAndRebindParserTest(unittest.TestCase):
         rev_lost = DEFAULT_LOST_REVISION_ID
         scope_id = DEFAULT_FIXTURE_SCOPE_ID
         expected_lost = [(rev_lost, scope_id, DEFAULT_LOST_CONTENT_DIGEST)]
+        hdr = {
+            "expected_origin_us": 1795450000000000,
+            "expected_lifecycle_origin_us": 1795450010500000,
+            "expected_lifecycle_baseline_digest": GENESIS,
+            "expected_connection_origin_us": 1795450010600000,
+        }
 
         def make_export_bytes(
             records: list[str],
@@ -279,7 +285,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         decoded_valid = restore_drill.decode_base64_export_bytes(b64_log)
         wm = restore_drill.verify_persisted_post_restore_journal(
             decoded_valid,
-            expected_origin_us=1795450000000000,
+            **hdr,
             min_seq=5,
             expected_min_digest=min_digest,
             expected_lost_revisions=expected_lost,
@@ -290,7 +296,49 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "raw bytes"):
             restore_drill.verify_persisted_post_restore_journal(
                 valid.decode("utf-8"),  # type: ignore[arg-type]
-                expected_origin_us=1795450000000000,
+                **hdr,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+
+        # Mismatched recovery headers (including None vs non-None) MUST fail:
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "lifecycle_origin mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                **{**hdr, "expected_lifecycle_origin_us": 1795450010500999},
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "lifecycle_origin mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                **{**hdr, "expected_lifecycle_origin_us": None, "expected_lifecycle_baseline_digest": None},
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "lifecycle_baseline mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                **{**hdr, "expected_lifecycle_baseline_digest": DIGEST_B},
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "connection_origin mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                **{**hdr, "expected_connection_origin_us": 1795450010600999},
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "connection_origin mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                **{**hdr, "expected_connection_origin_us": None},
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -304,7 +352,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 decoded_crlf,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -315,7 +363,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "carriage returns"):
             restore_drill.verify_persisted_post_restore_journal(
                 crlf_rehashed,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -325,7 +373,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 tampered,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -346,7 +394,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
             )
             wm_b = restore_drill.verify_persisted_post_restore_journal(
                 ok_baseline,
-                expected_origin_us=1795450000000000,
+                **{**hdr, "expected_lifecycle_baseline_digest": canonical_b_digest},
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -363,7 +411,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "lifecycle baseline digest mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 bad_baseline,
-                expected_origin_us=1795450000000000,
+                **{**hdr, "expected_lifecycle_baseline_digest": raw_text_b_digest},
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -377,7 +425,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "digest at certified seq 5 mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 alt_valid,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -419,7 +467,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing post-watermark artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
                 pre_wm_lost_export,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=lost_at_seq5_chain,
                 expected_lost_revisions=expected_lost,
@@ -450,7 +498,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "requires current retained state"):
             restore_drill.verify_persisted_post_restore_journal(
                 adj_after_restore_bytes,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -478,7 +526,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         )
         wm_purged_after_restore = restore_drill.verify_persisted_post_restore_journal(
             purged_after_restore_bytes,
-            expected_origin_us=1795450000000000,
+            **hdr,
             min_seq=5,
             expected_min_digest=min_digest,
             expected_lost_revisions=expected_lost,
@@ -489,7 +537,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "metadata mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 valid,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=[(rev_lost, scope_id, DIGEST_A)],
@@ -497,7 +545,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "metadata mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 valid,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=[(rev_lost, "33333333-3333-4333-8333-333333333333", DEFAULT_LOST_CONTENT_DIGEST)],
@@ -510,7 +558,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         self.assertEqual(
             restore_drill.verify_persisted_post_restore_journal(
                 long_seq_bytes,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -542,7 +590,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "chain digest mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 bad_chain,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=0,
                 expected_min_digest=GENESIS,
                 expected_lost_revisions=[],
@@ -559,6 +607,9 @@ class JournalAndRebindParserTest(unittest.TestCase):
             restore_drill.verify_persisted_post_restore_journal(
                 malformed_combined,
                 expected_origin_us=1795450000000000,
+                expected_lifecycle_origin_us=None,
+                expected_lifecycle_baseline_digest=None,
+                expected_connection_origin_us=1795450010600000,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -570,6 +621,9 @@ class JournalAndRebindParserTest(unittest.TestCase):
             restore_drill.verify_persisted_post_restore_journal(
                 no_lifecycle,
                 expected_origin_us=1795450000000000,
+                expected_lifecycle_origin_us=None,
+                expected_lifecycle_baseline_digest=None,
+                expected_connection_origin_us=1795450010600000,
                 min_seq=0,
                 expected_min_digest=GENESIS,
                 expected_lost_revisions=expected_lost,
@@ -579,7 +633,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "out of sequence"):
             restore_drill.verify_persisted_post_restore_journal(
                 seq_gap,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -594,7 +648,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "malformed artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
                 missing_purged_us,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -623,7 +677,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "lacks baseline or prior retained commitment"):
             restore_drill.verify_persisted_post_restore_journal(
                 post_lc_purged,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=0,
                 expected_min_digest=GENESIS,
                 expected_lost_revisions=[],
@@ -633,7 +687,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing post-watermark artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
                 other_valid,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=5,
                 expected_min_digest=min_digest,
                 expected_lost_revisions=expected_lost,
@@ -642,7 +696,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "did not advance past 6"):
             restore_drill.verify_persisted_post_restore_journal(
                 valid,
-                expected_origin_us=1795450000000000,
+                **hdr,
                 min_seq=6,
                 expected_min_digest=chains[-1],
                 expected_lost_revisions=expected_lost,
@@ -1397,6 +1451,13 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("openmettle.platform_capability_denies", step6)
         self.assertIn("openmettle.grant_assignments", step6)
         self.assertIn("openmettle.grant_changes", step6)
+        self.assertIn("worker.inference.enabled: true", step6)
+        self.assertIn("worker.inference.enabled: false", step6)
+        self.assertIn("queue_expired", step6)
+        self.assertIn("POST /v1/runs/{run_id}/cancel", step6)
+        self.assertIn("browser.router.initiation", step6)
+        self.assertIn("POST /auth/native/authorize", step6)
+        self.assertIn("200 OK", step6)
 
         m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
         self.assertIsNotNone(m_sh)
@@ -2023,6 +2084,9 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 0,
                 "openmettle.deletion_journal.export/1\n"
                 "origin 1795450000000000\n"
+                "lifecycle_origin 1795450010500000\n"
+                f"lifecycle_baseline {GENESIS}\n"
+                "connection_origin 1795450010600000\n"
                 f"watermark 1795450000000000 5 {chains[4]} 1795450020000000\n"
                 f"sha256 {'c' * 64}\n",
             )

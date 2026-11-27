@@ -331,17 +331,26 @@ def verify_persisted_post_restore_journal(
     raw_bytes: bytes,
     *,
     expected_origin_us: int,
+    expected_lifecycle_origin_us: int | None,
+    expected_lifecycle_baseline_digest: str | None,
+    expected_connection_origin_us: int | None,
     min_seq: int,
     expected_min_digest: str,
     expected_lost_revisions: list[tuple[str, str, str]] | tuple[tuple[str, str, str], ...],
 ) -> dict:
     """Verify a post-restore `deletion_journal` export read back as raw `bytes` against
     `openmettle-core`'s complete `Export::parse` (`src/restore.rs`) and `deletion_journal_replay`
-    (`0042`/`0044`) SHA-256, header, baseline, chain digest, sequence, lifecycle transitions,
-    certified prefix checkpoint (`min_seq`, `expected_min_digest`), and post-watermark
-    `artifact_revision.lost` `(revision_id, scope_id, content_digest)` commitments."""
+    (`0042`/`0044`) SHA-256, header, recovery origin/baseline headers, baseline digest, chain
+    digest, sequence, lifecycle transitions, certified prefix checkpoint (`min_seq`,
+    `expected_min_digest`), and post-watermark `artifact_revision.lost` commitments."""
     if not isinstance(raw_bytes, (bytes, bytearray)):
         raise DrillFailure(f"persisted post-restore journal must be raw bytes, got {type(raw_bytes).__name__}")
+    if (expected_lifecycle_origin_us is None) != (expected_lifecycle_baseline_digest is None):
+        raise DrillFailure("expected_lifecycle_origin_us and expected_lifecycle_baseline_digest must be paired")
+    if expected_lifecycle_baseline_digest is not None and not _is_hex64(expected_lifecycle_baseline_digest):
+        raise DrillFailure(
+            f"invalid expected_lifecycle_baseline_digest for persisted post-restore journal: {expected_lifecycle_baseline_digest!r}"
+        )
     if isinstance(min_seq, bool) or not isinstance(min_seq, int) or min_seq < 0:
         raise DrillFailure(f"invalid min_seq for persisted post-restore journal: {min_seq!r}")
     if not _is_hex64(expected_min_digest):
@@ -610,6 +619,18 @@ def verify_persisted_post_restore_journal(
     if origin_us != expected_origin_us:
         raise DrillFailure(
             f"persisted post-restore journal origin mismatch: got {origin_us}, expected {expected_origin_us}"
+        )
+    if lifecycle_origin_us != expected_lifecycle_origin_us:
+        raise DrillFailure(
+            f"persisted post-restore journal lifecycle_origin mismatch: got {lifecycle_origin_us}, expected {expected_lifecycle_origin_us}"
+        )
+    if lifecycle_baseline_digest != expected_lifecycle_baseline_digest:
+        raise DrillFailure(
+            f"persisted post-restore journal lifecycle_baseline mismatch: got {lifecycle_baseline_digest}, expected {expected_lifecycle_baseline_digest}"
+        )
+    if connection_origin_us != expected_connection_origin_us:
+        raise DrillFailure(
+            f"persisted post-restore journal connection_origin mismatch: got {connection_origin_us}, expected {expected_connection_origin_us}"
         )
     if expected_lost_revisions and watermark[0] <= min_seq:
         raise DrillFailure(
@@ -4270,6 +4291,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         verify_persisted_post_restore_journal(
             persisted_export_bytes,
             expected_origin_us=pre_wm["origin_us"],
+            expected_lifecycle_origin_us=pre_wm["lifecycle_origin_us"],
+            expected_lifecycle_baseline_digest=pre_wm["lifecycle_baseline_digest"],
+            expected_connection_origin_us=pre_wm["connection_origin_us"],
             min_seq=pre_wm["required_seq"],
             expected_min_digest=pre_wm["required_digest"],
             expected_lost_revisions=[(lost_rev_id, lost_meta["scope_id"], lost_meta["sha256"])],
