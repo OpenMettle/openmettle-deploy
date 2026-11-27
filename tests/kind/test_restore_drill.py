@@ -1470,6 +1470,8 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn('code: "provisioning"', step6)
         self.assertIn("GET /v1/runs/{run_id}/approvals", step6)
         self.assertIn('{"items": []}', step6)
+        self.assertGreaterEqual(step6.count("GET /v1/quotas/personal"), 3)
+        self.assertNotIn("`401 unauthenticated` on `/v1/*`", step6)
 
         m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
         self.assertIsNotNone(m_sh)
