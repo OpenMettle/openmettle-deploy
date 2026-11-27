@@ -22,6 +22,7 @@ import smoke  # noqa: E402
 import test_smoke  # noqa: E402
 
 HELM = os.environ.get("HELM", "helm")
+CORE_DIR = os.environ.get("OPENMETTLE_CORE_DIR")
 DIGESTS = {role: "sha256:" + str(i) * 64 for i, role in enumerate(smoke.ROLES, start=1)}
 PG_CLIENT = {"registry": "docker.io", "repository": "library/postgres", "digest": "sha256:" + "9" * 64}
 GENESIS = "0" * 64
@@ -50,7 +51,6 @@ class JournalAndRebindParserTest(unittest.TestCase):
         self.assertEqual(wm["required_seq"], 1)
         self.assertEqual(wm["required_digest"], DIGEST_B)
 
-        # Certified only when stopped-primary (seq, digest) matches exactly:
         self.assertTrue(restore_drill.should_pass_export_complete(wm, (1, DIGEST_B)))
         self.assertFalse(restore_drill.should_pass_export_complete(wm, None))
         self.assertFalse(restore_drill.should_pass_export_complete(wm, (2, DIGEST_B)))
@@ -74,6 +74,16 @@ class JournalAndRebindParserTest(unittest.TestCase):
             gap_args[:4],
             ["restore", "accept-coverage-gap", "--restore-run", run_id],
         )
+
+    def test_stopped_primary_watermark_sql_matches_core_deletion_journal_head_columns(self):
+        sql = restore_drill.stopped_primary_watermark_sql()
+        self.assertIn("SELECT journal_seq, encode(chain_digest, 'hex')", sql)
+        self.assertIn("FROM openmettle.deletion_journal_head", sql)
+        if CORE_DIR:
+            mig28 = (Path(CORE_DIR) / "migrations" / "0028_retention_purge_journal.sql").read_text(encoding="utf-8")
+            self.assertIn("CREATE TABLE openmettle.deletion_journal_head", mig28)
+            self.assertIn("journal_seq bigint NOT NULL", mig28)
+            self.assertIn("chain_digest bytea NOT NULL", mig28)
 
     def test_rejects_malformed_or_unpaired_journal_headers(self):
         with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid deletion journal"):
@@ -196,11 +206,19 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
 
 
 class ChartAndManifestValuesTest(unittest.TestCase):
-    def test_primary_and_target_drill_values_render_cleanly_with_helm(self):
+    def test_drill_inference_document_matches_adr_0043_schema_and_chart_values_render(self):
+        catalog = smoke.smoke_catalog(test_smoke.CATALOG_FIXTURE)
+        for ns in (restore_drill.PRIMARY_APP_NS, restore_drill.TARGET_APP_NS):
+            doc = restore_drill.drill_inference_document(ns, catalog)
+            self.assertEqual(doc["version"], 1)
+            self.assertEqual(doc["installation"], smoke.GATEWAY_INSTALLATION)
+            self.assertEqual(set(doc["routes"]), set(catalog["models"]))
+            for route in doc["routes"].values():
+                self.assertEqual(route["protocol"], "chat_completions")
+                self.assertIn(f".{ns}.svc.cluster.local:8082/v1/chat/completions", route["endpoint"])
+
         if shutil.which(HELM) is None:
             self.skipTest(f"{HELM} not installed")
-        catalog = smoke.smoke_catalog(test_smoke.CATALOG_FIXTURE)
-        self.assertIn("models", restore_drill.drill_inference_document(restore_drill.PRIMARY_APP_NS, catalog))
         for is_target in (False, True):
             vals = restore_drill.drill_chart_values(
                 DIGESTS,
@@ -224,16 +242,14 @@ class ChartAndManifestValuesTest(unittest.TestCase):
             finally:
                 Path(vals_path).unlink(missing_ok=True)
 
-    def test_environment_manifests_enforce_pod_security_default_deny_and_target_db_revocations(self):
+    def test_isolation_manifests_precede_workloads_and_enforce_pod_security_and_db_revocations(self):
         catalog = smoke.smoke_catalog(test_smoke.CATALOG_FIXTURE)
         creds = {k: "x" * 32 for k in ("admin", *smoke.DB_LOGINS)}
         creds["auth_login_key"] = base64.b64encode(b"1" * 32).decode("ascii")
         creds["auth_cursor_key"] = base64.b64encode(b"2" * 32).decode("ascii")
-        bundle = restore_drill.environment_manifests(
+        foundation = restore_drill.isolation_and_config_manifests(
             app_ns=restore_drill.TARGET_APP_NS,
             db_ns=restore_drill.TARGET_DB_NS,
-            postgres_image="postgres:18.1-bookworm@sha256:" + "9" * 64,
-            standin_image="openmettle-smoke.invalid/openmettle/sglang-standin:drill-1",
             passwords=creds,
             catalog=catalog,
             vault_keys=[("vault-k1", "vault-k1.key", creds["auth_login_key"])],
@@ -242,24 +258,33 @@ class ChartAndManifestValuesTest(unittest.TestCase):
             is_target=True,
             run_id="deadbeef",
         )
+        workloads = restore_drill.fixture_workload_manifests(
+            db_ns=restore_drill.TARGET_DB_NS,
+            postgres_image="postgres:18.1-bookworm@sha256:" + "9" * 64,
+            standin_image="openmettle-smoke.invalid/openmettle/sglang-standin:drill-1",
+            is_target=True,
+            run_id="deadbeef",
+        )
+        # Foundation bundle must contain ZERO runnable workloads (Deployments, Pods, Jobs).
+        self.assertFalse(any(i["kind"] in ("Deployment", "Pod", "Job") for i in foundation["items"]))
         for ns_name in (restore_drill.TARGET_APP_NS, restore_drill.TARGET_DB_NS):
-            ns = next(i for i in bundle["items"] if i["kind"] == "Namespace" and i["metadata"]["name"] == ns_name)
+            ns = next(i for i in foundation["items"] if i["kind"] == "Namespace" and i["metadata"]["name"] == ns_name)
             self.assertEqual(ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"], "restricted")
-        pg_dep = next(i for i in bundle["items"] if i["kind"] == "Deployment" and i["metadata"]["name"] == "postgres")
+        pg_dep = next(i for i in workloads["items"] if i["kind"] == "Deployment" and i["metadata"]["name"] == "postgres")
         self.assertEqual(pg_dep["spec"]["template"]["spec"]["securityContext"]["runAsUser"], 999)
-        fixture_secret = next(i for i in bundle["items"] if i["kind"] == "Secret" and i["metadata"]["name"] == "postgres-fixture")
+        fixture_secret = next(i for i in foundation["items"] if i["kind"] == "Secret" and i["metadata"]["name"] == "postgres-fixture")
         provision_sql = fixture_secret["stringData"]["provision.sql"]
         self.assertIn("REVOKE ALL ON DATABASE openmettle FROM PUBLIC;", provision_sql)
         self.assertIn("GRANT CONNECT ON DATABASE openmettle TO openmettle_api", provision_sql)
         self.assertIn("REVOKE ALL ON SCHEMA public FROM PUBLIC;", provision_sql)
         wrong_secret = next(
-            i for i in bundle["items"]
+            i for i in foundation["items"]
             if i["kind"] == "Secret" and i["metadata"]["name"] == restore_drill.WRONG_BACKUP_SECRET
         )
         wrong_doc = json.loads(base64.b64decode(wrong_secret["data"]["keyring.json"]))
         self.assertEqual(wrong_doc["keys"][0]["file"], f"{restore_drill.WRONG_BACKUP_KEYS_DIR}/{smoke.BACKUP_KEY_FILE}")
         db_netpols = [
-            i["metadata"]["name"] for i in bundle["items"]
+            i["metadata"]["name"] for i in foundation["items"]
             if i["kind"] == "NetworkPolicy" and i["metadata"]["namespace"] == restore_drill.TARGET_DB_NS
         ]
         self.assertEqual(sorted(db_netpols), sorted([smoke.NAMESPACE_DENY, "postgres-network", "standin-network"]))
@@ -295,6 +320,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         cat_path.parent.mkdir(parents=True, exist_ok=True)
         cat_path.write_text(json.dumps(test_smoke.CATALOG_FIXTURE), encoding="utf-8")
         self.commands: list[list[str]] = []
+        self.applied_manifests: list[dict] = []
         self.fail_on_target_migrate = False
 
     def _make_core(self):
@@ -406,10 +432,10 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return self._res(1, "", "NotFound")
             if "apply" in argv and input:
                 doc = json.loads(input)
+                self.applied_manifests.append(doc)
                 if doc.get("kind") == "Job":
                     self._last_job = doc["metadata"]["name"]
                     if self.fail_on_target_migrate and self._last_job == "openmettle-drill-migrate":
-                        # Leak a secret in stderr to prove redaction!
                         return self._res(1, "", f"fatal migrate error password={self._leak_secret}")
                 return self._res(0, "")
             if "logs" in argv:
@@ -459,6 +485,21 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "chroma": {"mode": "not_provisioned"},
             }
             return self._res(0, f"MANIFEST_JSON_BEGIN\n{json.dumps(manifest)}\nMANIFEST_JSON_END\n")
+        if name == "openmettle-drill-gap-pg-restore":
+            gap_journal = (
+                "openmettle.deletion_journal.export/1\n"
+                "origin 1795450000000000\n"
+                f"watermark 1795450000000000 2 {DIGEST_A} 1795450010000000\n"
+                f"sha256 {'c' * 64}\n"
+            )
+            return self._res(0, f"GAP_JOURNAL_BEGIN\n{gap_journal}GAP_JOURNAL_END\n")
+        if name == "openmettle-drill-gap-lock":
+            return self._res(
+                0,
+                "restore gate closed: restore_run 77777777-7777-4777-8777-777777777771, origin 1, snapshot 2, required 2, coverage_complete false\n",
+            )
+        if name == "openmettle-drill-gap-accept":
+            return self._res(0, "applied restore.accept_coverage_gap\n")
         if name == "openmettle-drill-pg-restore":
             return self._res(0, "pg_restore.completed\n")
         if name == "openmettle-drill-rebind-failclosed":
@@ -491,14 +532,18 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         if name == "openmettle-drill-worker-quota-release":
             return self._res(0, "1\n")
         if name == "openmettle-drill-release-maintenance":
-            return self._res(0, f"QUOTA_VERIFY_BEGIN\n{qv}QUOTA_VERIFY_END\n")
+            bs = json.dumps({"maintenance_active": False})
+            return self._res(
+                0,
+                f"BACKUP_STATUS_BEGIN\n{bs}\nBACKUP_STATUS_END\n"
+                f"QUOTA_VERIFY_BEGIN\n{qv}QUOTA_VERIFY_END\n",
+            )
         if name == "openmettle-drill-post-verify":
             return self._res(0, qv)
         return self._res(0, "")
 
     def _exec_handler(self, argv: list[str], stdin_text: str | None):
         if "/tmp/kind-drill-fixture" in argv:
-            # Capture the API DB password from stdin so failure test can verify secret redaction!
             if stdin_text:
                 self._leak_secret = stdin_text.splitlines()[0].split("openmettle_api:", 1)[1].split("@", 1)[0]
             return self._res(0, json.dumps({
@@ -518,8 +563,17 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 f"sha256 {'c' * 64}\n",
             )
         if "psql" in argv and stdin_text:
+            if restore_drill.GAP_DB_NAME in argv:
+                return self._res(0, "2|0|0|0|t|1\n")
             if "gateway_requests" in stdin_text:
                 return self._res(0, "11111111-1111-4111-8111-111111111111|handed_off|t|t|1|11|7|t|settled|0|18\n")
+            if "JOIN openmettle.quota_reservations qr" in stdin_text and "last_event_sequence" in stdin_text:
+                # Realistic pre-backup sequences: waiting_run=4, intent_run=5, each holding 25 usage_tokens.
+                return self._res(
+                    0,
+                    "aaaa0000-0000-4000-8000-000000000002|4|25\n"
+                    "aaaa0000-0000-4000-8000-000000000004|5|25\n",
+                )
             if "FROM openmettle.artifact_revisions" in stdin_text and "WHERE id IN" in stdin_text:
                 return self._res(
                     0,
@@ -530,17 +584,20 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if "openmettle.operations" in stdin_text:
                 return self._res(
                     0,
-                    "outcome_unknown:1|1|t|1800000000000000|purged|t|f|2:2:1:2|3:3:1:3|released:0|held:25\n",
+                    "outcome_unknown:1|t|1800000000000000|purged|t|f|"
+                    "5:5:1:5|run-terminal:openmettle.run-cancelled|"
+                    "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
+                    "run-terminal:openmettle.run-cancelled|released:0|held:25\n",
                 )
             if "SELECT state FROM openmettle.artifact_revisions" in stdin_text:
                 return self._res(0, "purged\n")
             if "FROM openmettle.deletion_journal_head" in stdin_text:
+                self.assertIn("SELECT journal_seq", stdin_text)
                 return self._res(0, f"5|{DIGEST_B}\n")
             if "_sqlx_migrations" in stdin_text:
                 return self._res(0, f"{smoke.REQUIRED_MIGRATION}|1|t\n")
             return self._res(0, "")
         if "timeout" in argv:
-            # NetworkPolicy probe: deny primary_db/primary_gw from target namespaces, connect otherwise.
             ns = argv[argv.index("--namespace") + 1]
             target_host = argv[-2] if argv[-1].isdigit() else argv[-3]
             is_http = "/readyz" in argv
@@ -558,12 +615,20 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         if port == 18082 and any(bad == raw_cookie for bad in getattr(self, "_stale_or_disabled_cookies", ())):
             return 401, prob_hdrs, json.dumps({"status": 401, "code": "unauthenticated"}).encode()
         if path == "/v1/quotas/personal" and method == "GET":
+            if raw_cookie == getattr(self, "_cookie_d2", None):
+                return 200, v1_hdrs, json.dumps({"scope_kind": "personal"}).encode()
             return 401, prob_hdrs, json.dumps({"status": 401, "code": "unauthenticated"}).encode()
         if path.startswith("/v1/projects/") and method == "GET":
             return 401, prob_hdrs, json.dumps({"status": 401, "code": "unauthenticated"}).encode()
         if path == "/v1/conversations" and method == "POST":
+            body = json.loads(payload) if payload else {}
+            cid = (
+                "bbbb0000-0000-4000-8000-000000000099"
+                if body.get("scope_id")
+                else "bbbb0000-0000-4000-8000-000000000001"
+            )
             return 201, v1_hdrs, json.dumps({
-                "conversation_id": "bbbb0000-0000-4000-8000-000000000001",
+                "conversation_id": cid,
                 "branch_id": "bbbb0000-0000-4000-8000-000000000002",
             }).encode()
         if path == "/v1/runs" and method == "POST":
@@ -619,13 +684,18 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         if path.startswith("/v1/conversations/") and method == "GET":
             if path.endswith("/messages"):
                 return 200, v1_hdrs, json.dumps({"items": [{"content": smoke.STANDIN_EXPECTED_CONTENT}]}).encode()
+            if "bbbb0000-0000-4000-8000-000000000099" in path:
+                if raw_cookie == getattr(self, "_cookie_d2", None):
+                    return 404, prob_hdrs, json.dumps({"status": 404, "code": "not_found"}).encode()
+                return 200, v1_hdrs, json.dumps({"conversation_id": "bbbb0000-0000-4000-8000-000000000099"}).encode()
             if raw_cookie == self._cookie_b2:
                 return 404, prob_hdrs, json.dumps({"status": 404, "code": "not_found"}).encode()
             return 200, v1_hdrs, json.dumps({"conversation_id": "bbbb0000-0000-4000-8000-000000000001"}).encode()
         if path.startswith("/v1/artifacts/") and method == "GET":
-            # Primary non-interference check on port 18081 vs target port 18082:
             if port == 18081 and "99999999-9999-4999-8999-999999999995/content" in path:
                 return 200, {**v1_hdrs, "content-type": "text/plain"}, b"drill-unrecoverable-payload-bytes\n"
+            if raw_cookie == getattr(self, "_cookie_d2", None):
+                return 404, prob_hdrs, json.dumps({"status": 404, "code": "not_found"}).encode()
             if raw_cookie == self._cookie_b2 and ("99999999-9999-4999-8999-999999999981" in path or "99999999-9999-4999-8999-999999999985" in path):
                 return 404, prob_hdrs, json.dumps({"status": 404, "code": "not_found"}).encode()
             if "99999999-9999-4999-8999-999999999991/content" in path:
@@ -673,10 +743,14 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         def tracked_session_cred(raw):
             sid, cookie, sh = orig_cred(raw)
             session_counter["n"] += 1
-            if session_counter["n"] in (1, 2, 3, 6):
+            # 1..4 are pre-restore sessions (a,b,c,d); 5..8 are post-restore sessions (a2,b2,c2,d2),
+            # where 7 is disabled user_c and 8 is active non-member user_d.
+            if session_counter["n"] in (1, 2, 3, 4, 7):
                 outer._stale_or_disabled_cookies = (*getattr(outer, "_stale_or_disabled_cookies", ()), cookie)
-            elif session_counter["n"] == 5:
+            elif session_counter["n"] == 6:
                 outer._cookie_b2 = cookie
+            elif session_counter["n"] == 8:
+                outer._cookie_d2 = cookie
             return sid, cookie, sh
 
         def fake_standin_get(port, path):
@@ -700,13 +774,22 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             rc = restore_drill.main(["--core-dir", str(self.tmp), "--report", str(report_file)])
         return rc, json.loads(report_file.read_text(encoding="utf-8"))
 
-    def test_full_orchestration_passes_and_cleans_up_via_callable_only_runner(self):
+    def test_full_orchestration_passes_and_applies_policies_before_workloads(self):
         rc, summary = self._run_drill()
         self.assertEqual(rc, 0, summary.get("error"))
         self.assertEqual(summary["result"], "passed")
         self.assertEqual(summary["classification"], "dev")
         self.assertTrue(summary["rpo_rto"]["rpo_met"])
-        self.assertTrue(summary["rpo_rto"]["rto_met"])
+        self.assertTrue(summary["rto"]["rto_met"] if "rto" in summary else summary["rpo_rto"]["rto_met"])
+        # First kubectl apply must be the primary foundation list (Namespaces + NetworkPolicies, zero Deployments)
+        # strictly before the second kubectl apply (primary Deployments).
+        self.assertEqual(self.applied_manifests[0]["kind"], "List")
+        self.assertFalse(any(i["kind"] == "Deployment" for i in self.applied_manifests[0]["items"]))
+        self.assertTrue(any(i["kind"] == "NetworkPolicy" for i in self.applied_manifests[0]["items"]))
+        self.assertTrue(any(i["kind"] == "Deployment" for i in self.applied_manifests[1]["items"]))
+        # Verify uncertified coverage-gap scenario was also exercised:
+        check_names = [c["name"] for c in summary["checks"]]
+        self.assertTrue(any("coverage-gap" in n for n in check_names))
         self.assertTrue(any(cmd[:3] == ["kind", "delete", "cluster"] for cmd in self.commands))
         self.assertTrue(any(cmd[:4] == ["docker", "image", "rm", "--force"] for cmd in self.commands))
 

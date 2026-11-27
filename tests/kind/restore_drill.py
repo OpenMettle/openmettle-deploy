@@ -48,6 +48,8 @@ RECOVERY_DB_CLIENT_LABEL = "openmettle.dev/recovery-db-client"
 RECOVERY_NETPOL = "openmettle-target-recovery-egress"
 DB_PROBE = "db-probe"
 DB_PROBE_LABELS = {"app.kubernetes.io/name": DB_PROBE}
+GAP_DB_NAME = "openmettle_gap"
+GAP_OWNER_SECRET = "openmettle-owner-gap-database"
 
 TARGET_ARTIFACTS_CLAIM = "openmettle-target-artifacts"
 TARGET_RECOVERY_MEDIA_CLAIM = "openmettle-target-recovery-media"
@@ -81,6 +83,11 @@ USER_C_IDS = {
     "user": "00000000-0000-4000-8000-00000000c302",
     "identity": "00000000-0000-4000-8000-00000000c303",
     "approval": "00000000-0000-4000-8000-00000000c304",
+}
+USER_D_IDS = {
+    "user": "00000000-0000-4000-8000-00000000c402",
+    "identity": "00000000-0000-4000-8000-00000000c403",
+    "approval": "00000000-0000-4000-8000-00000000c404",
 }
 
 RPO_TARGET_SECONDS = 86_400
@@ -149,6 +156,11 @@ class DrillFailure(Exception):
 
 
 # --- Pure logic (unit-tested in test_restore_drill.py) -------------------------------------
+
+
+def stopped_primary_watermark_sql() -> str:
+    """SQL query reading the stopped primary's authoritative `(journal_seq, chain_digest)`."""
+    return "SELECT journal_seq, encode(chain_digest, 'hex') FROM openmettle.deletion_journal_head WHERE id;"
 
 
 def parse_journal_export_watermarks(text: str) -> dict:
@@ -553,77 +565,52 @@ def seed_users_sql(
     sess_a: tuple[str, str, str],
     sess_b: tuple[str, str, str],
     sess_c: tuple[str, str, str],
+    sess_d: tuple[str, str, str],
 ) -> str:
-    """Seed `user_a`, `user_b`, and `user_c` with active approvals, browser sessions, storage
-    limits and personal + project `usage_tokens` defaults on primary PostgreSQL."""
-    for sid, lid, sh in (sess_a, sess_b, sess_c):
+    """Seed `user_a`, `user_b`, `user_c` (post-backup disabled), and `user_d` (active non-member)
+    with approvals, browser sessions, storage limits and personal/project `usage_tokens` defaults."""
+    users = (
+        ("a", "01", USER_A_IDS, sess_a),
+        ("b", "02", USER_B_IDS, sess_b),
+        ("c", "03", USER_C_IDS, sess_c),
+        ("d", "04", USER_D_IDS, sess_d),
+    )
+    for _, _, _, (sid, lid, sh) in users:
         if not (smoke.B64_ID.fullmatch(sid) and smoke.B64_ID.fullmatch(lid) and re.fullmatch(r"[0-9a-f]{64}", sh)):
             raise DrillFailure("malformed synthetic session seed values")
-    sid_a, login_a, hash_a = sess_a
-    sid_b, login_b, hash_b = sess_b
-    sid_c, login_c, hash_c = sess_c
     p_id = USER_A_IDS["provider"]
     exp = smoke.SESSION_EXPIRES_MS
     by = "'restore-drill', 'synthetic restore drill fixture'"
-    return f"""\
+    sql = f"""\
 INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason)
     VALUES ('{p_id}', '{smoke.SESSION_ISSUER}', '{smoke.SESSION_CLIENT}', {by});
 INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
     VALUES ('{p_id}', 'r1');
-INSERT INTO openmettle.users (id)
-    VALUES ('{USER_A_IDS["user"]}'), ('{USER_B_IDS["user"]}'), ('{USER_C_IDS["user"]}');
-INSERT INTO openmettle.scopes (kind, personal_user_id)
-    VALUES ('personal', '{USER_A_IDS["user"]}'),
-           ('personal', '{USER_B_IDS["user"]}'),
-           ('personal', '{USER_C_IDS["user"]}');
+"""
+    for tag, hex_bind, ids, (sid, lid, sh) in users:
+        sql += f"""\
+INSERT INTO openmettle.users (id) VALUES ('{ids["user"]}');
+INSERT INTO openmettle.scopes (kind, personal_user_id) VALUES ('personal', '{ids["user"]}');
 INSERT INTO openmettle.user_identities (id, user_id, issuer, subject)
-    VALUES ('{USER_A_IDS["identity"]}', '{USER_A_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-a'),
-           ('{USER_B_IDS["identity"]}', '{USER_B_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-b'),
-           ('{USER_C_IDS["identity"]}', '{USER_C_IDS["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-c');
+    VALUES ('{ids["identity"]}', '{ids["user"]}', '{smoke.SESSION_ISSUER}', 'drill-user-{tag}');
 INSERT INTO openmettle.local_identity_approvals (id, provider_id, identity_id, active, expires_ms, changed_by, change_reason)
-    VALUES ('{USER_A_IDS["approval"]}', '{p_id}', '{USER_A_IDS["identity"]}', true, {exp}, {by}),
-           ('{USER_B_IDS["approval"]}', '{p_id}', '{USER_B_IDS["identity"]}', true, {exp}, {by}),
-           ('{USER_C_IDS["approval"]}', '{p_id}', '{USER_C_IDS["identity"]}', true, {exp}, {by});
+    VALUES ('{ids["approval"]}', '{p_id}', '{ids["identity"]}', true, {exp}, {by});
 INSERT INTO openmettle.login_nonce_reservations (key_id, nonce)
-    VALUES ('drill-a', substring(sha256(convert_to('{login_a}', 'UTF8')) FROM 1 FOR 12)),
-           ('drill-b', substring(sha256(convert_to('{login_b}', 'UTF8')) FROM 1 FOR 12)),
-           ('drill-c', substring(sha256(convert_to('{login_c}', 'UTF8')) FROM 1 FOR 12));
+    VALUES ('drill-{tag}', substring(sha256(convert_to('{lid}', 'UTF8')) FROM 1 FOR 12));
 INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
         key_id, nonce, ciphertext, consumed, session_issued)
-    SELECT '{login_a}', decode('01', 'hex'), {exp}, sha256(convert_to('{login_a}:s', 'UTF8')),
-           sha256(convert_to('{login_a}:n', 'UTF8')), sha256(convert_to('{login_a}:c', 'UTF8')),
+    SELECT '{lid}', decode('{hex_bind}', 'hex'), {exp}, sha256(convert_to('{lid}:s', 'UTF8')),
+           sha256(convert_to('{lid}:n', 'UTF8')), sha256(convert_to('{lid}:c', 'UTF8')),
            key_id, nonce, NULL, true, true
-      FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-a';
-INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
-        key_id, nonce, ciphertext, consumed, session_issued)
-    SELECT '{login_b}', decode('02', 'hex'), {exp}, sha256(convert_to('{login_b}:s', 'UTF8')),
-           sha256(convert_to('{login_b}:n', 'UTF8')), sha256(convert_to('{login_b}:c', 'UTF8')),
-           key_id, nonce, NULL, true, true
-      FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-b';
-INSERT INTO openmettle.login_transactions (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
-        key_id, nonce, ciphertext, consumed, session_issued)
-    SELECT '{login_c}', decode('03', 'hex'), {exp}, sha256(convert_to('{login_c}:s', 'UTF8')),
-           sha256(convert_to('{login_c}:n', 'UTF8')), sha256(convert_to('{login_c}:c', 'UTF8')),
-           key_id, nonce, NULL, true, true
-      FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-c';
+      FROM openmettle.login_nonce_reservations WHERE key_id = 'drill-{tag}';
 INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
         issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
         user_generation, created_ms, expires_ms)
-    SELECT '{sid_a}', decode('{hash_a}', 'hex'), '{login_a}', '{p_id}', '{USER_A_IDS["identity"]}',
-           '{USER_A_IDS["approval"]}', '{USER_A_IDS["user"]}', '{smoke.SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {exp}
+    SELECT '{sid}', decode('{sh}', 'hex'), '{lid}', '{p_id}', '{ids["identity"]}',
+           '{ids["approval"]}', '{ids["user"]}', '{smoke.SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {exp}
       FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}';
-INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
-        issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
-        user_generation, created_ms, expires_ms)
-    SELECT '{sid_b}', decode('{hash_b}', 'hex'), '{login_b}', '{p_id}', '{USER_B_IDS["identity"]}',
-           '{USER_B_IDS["approval"]}', '{USER_B_IDS["user"]}', '{smoke.SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {exp}
-      FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}';
-INSERT INTO openmettle.local_sessions (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
-        issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
-        user_generation, created_ms, expires_ms)
-    SELECT '{sid_c}', decode('{hash_c}', 'hex'), '{login_c}', '{p_id}', '{USER_C_IDS["identity"]}',
-           '{USER_C_IDS["approval"]}', '{USER_C_IDS["user"]}', '{smoke.SESSION_CLIENT}', max(epoch), 1, 0, 0, 0, 1, {exp}
-      FROM openmettle.login_provider_revisions WHERE provider_id = '{p_id}';
+"""
+    sql += f"""\
 UPDATE openmettle.storage_instance
     SET instance_budget_bytes = {STORAGE_BUDGET_BYTES},
         personal_limit_bytes = {SCOPE_STORAGE_LIMIT_BYTES},
@@ -632,6 +619,7 @@ INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
     VALUES ('personal', 'usage_tokens', {smoke.PERSONAL_TOKEN_LIMIT}),
            ('project', 'usage_tokens', {smoke.PERSONAL_TOKEN_LIMIT});
 """
+    return sql
 
 
 def fresh_post_restore_session_sql(
@@ -682,36 +670,18 @@ def ns_peer(namespace: str, labels: dict) -> dict:
     }
 
 
-def db_url(db_namespace: str, role: str, password: str) -> str:
+def db_url(db_namespace: str, role: str, password: str, *, dbname: str = "openmettle") -> str:
     host = f"postgres.{db_namespace}.svc.cluster.local"
-    return f"postgres://{smoke.DB_ROLE[role]}:{password}@{host}:5432/openmettle?sslmode=disable"
+    return f"postgres://{smoke.DB_ROLE[role]}:{password}@{host}:5432/{dbname}?sslmode=disable"
 
 
 def drill_inference_document(app_namespace: str, catalog: dict) -> dict:
-    gateway_url = f"http://{smoke.GATEWAY_WORKLOAD}.{app_namespace}.svc.cluster.local:8082/v1/chat/completions"
-    provider_name = catalog["models"][smoke.CATALOG_MODEL]["pin"]["provider"]
-    return {
-        "version": 1,
-        "catalog_file": smoke.INFERENCE_CATALOG_PATH,
-        "providers": {
-            provider_name: {
-                "protocol": "sglang_chat_completions",
-                "endpoint": gateway_url,
-                "private_cidrs": list(smoke.CLUSTER_PRIVATE_CIDRS),
-                "trust": {"roots": "native"},
-                "connect_timeout_ms": 5000,
-                "total_timeout_ms": 30000,
-            },
-        },
-        "models": {
-            smoke.CATALOG_MODEL: {
-                "installation": smoke.GATEWAY_INSTALLATION,
-                "upstream_model": smoke.CATALOG_MODEL,
-                "context_window_tokens": 8192,
-                "max_output_tokens": 512,
-            },
-        },
-    }
+    """Reuse `smoke.smoke_inference_document` (ADR 0043 `installation` + `routes` schema) for `app_namespace`."""
+    doc = smoke.smoke_inference_document(catalog, tls=False)
+    endpoint = f"http://{smoke.GATEWAY_WORKLOAD}.{app_namespace}.svc.cluster.local:8082/v1/chat/completions"
+    for route in doc["routes"].values():
+        route["endpoint"] = endpoint
+    return doc
 
 
 def drill_chart_values(
@@ -823,12 +793,21 @@ def drill_chart_values(
     return values
 
 
-def environment_manifests(
+def target_db_acl_sql(dbname: str = "openmettle") -> str:
+    """PUBLIC revocations and runtime CONNECT grants omitted by `pg_dump --schema=openmettle`."""
+    return (
+        f"REVOKE ALL ON DATABASE {dbname} FROM PUBLIC;\n"
+        f"GRANT CONNECT ON DATABASE {dbname} TO "
+        "openmettle_api, openmettle_worker, openmettle_issuance, openmettle_gateway;\n"
+        f"\\connect {dbname}\n"
+        "REVOKE ALL ON SCHEMA public FROM PUBLIC;\n"
+    )
+
+
+def isolation_and_config_manifests(
     *,
     app_ns: str,
     db_ns: str,
-    postgres_image: str,
-    standin_image: str,
     passwords: dict,
     catalog: dict,
     vault_keys: list[tuple[str, str, str]],
@@ -837,7 +816,8 @@ def environment_manifests(
     is_target: bool,
     run_id: str,
 ) -> dict:
-    """Kubernetes manifests for either the primary or isolated restore-target environment."""
+    """Phase 1 manifests (`Namespace`, `NetworkPolicy`, `Secret`, `ConfigMap`, `PVC`) applied
+    strictly BEFORE any database or stand-in `Deployment` is submitted."""
     labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
     restricted_ns_labels = {
         **labels,
@@ -850,15 +830,7 @@ def environment_manifests(
     )
     sql += "CREATE DATABASE openmettle OWNER openmettle_owner;\n"
     if is_target:
-        # pg_dump --schema=openmettle omits database and public-schema ACLs; openmettle-migrate
-        # enforces these boundaries whenever _sqlx_migrations already records version >= 1.
-        sql += (
-            "REVOKE ALL ON DATABASE openmettle FROM PUBLIC;\n"
-            "GRANT CONNECT ON DATABASE openmettle TO "
-            "openmettle_api, openmettle_worker, openmettle_issuance, openmettle_gateway;\n"
-            "\\connect openmettle\n"
-            "REVOKE ALL ON SCHEMA public FROM PUBLIC;\n"
-        )
+        sql += target_db_acl_sql("openmettle")
 
     vault_keyring = json.dumps({
         "version": 1,
@@ -877,7 +849,6 @@ def environment_manifests(
     pg_ingress_peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": app_ns}}}]
     if not is_target:
         pg_ingress_peers.append({"podSelector": {"matchLabels": DB_PROBE_LABELS}})
-
     gateway_labels = {
         "app.kubernetes.io/name": "openmettle-core",
         "app.kubernetes.io/instance": RELEASE,
@@ -887,65 +858,6 @@ def environment_manifests(
     items: list[dict] = [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": app_ns, "labels": restricted_ns_labels}},
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": db_ns, "labels": restricted_ns_labels}},
-        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-         "metadata": {"name": "postgres-fixture", "namespace": db_ns, "labels": labels},
-         "stringData": {"admin-password": passwords["admin"], "provision.sql": sql}},
-        {"apiVersion": "apps/v1", "kind": "Deployment",
-         "metadata": {"name": "postgres", "namespace": db_ns, "labels": labels},
-         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
-                  "selector": {"matchLabels": smoke.POSTGRES_LABELS},
-                  "template": {"metadata": {"labels": smoke.POSTGRES_LABELS}, "spec": {
-                      "automountServiceAccountToken": False, "enableServiceLinks": False,
-                      "securityContext": PG_POD_SEC_CONTEXT,
-                      "containers": [{
-                          "name": "postgres", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
-                          "env": [{"name": "POSTGRES_USER", "value": "fixture_admin"},
-                                  {"name": "POSTGRES_DB", "value": "fixture"},
-                                  {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
-                                  {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {
-                                      "name": "postgres-fixture", "key": "admin-password"}}}],
-                          "ports": [{"name": "postgres", "containerPort": 5432}],
-                          "readinessProbe": {"exec": {"command": [
-                              "pg_isready", "-h", "127.0.0.1", "-U", "fixture_admin", "-d", "fixture"]},
-                              "periodSeconds": 2, "failureThreshold": 2},
-                          "securityContext": CONTAINER_SEC_CONTEXT,
-                          "volumeMounts": [
-                              {"name": "data", "mountPath": "/var/lib/postgresql"},
-                              {"name": "run", "mountPath": "/run/postgresql"},
-                              {"name": "tmp", "mountPath": "/tmp"},
-                              {"name": "init", "mountPath": "/docker-entrypoint-initdb.d", "readOnly": True}],
-                      }],
-                      "volumes": [
-                          {"name": "data", "emptyDir": {}},
-                          {"name": "run", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}},
-                          {"name": "tmp", "emptyDir": {}},
-                          {"name": "init", "secret": {"secretName": "postgres-fixture",
-                                                      "items": [{"key": "provision.sql", "path": "provision.sql"}]}}],
-                  }}}},
-        {"apiVersion": "v1", "kind": "Service",
-         "metadata": {"name": "postgres", "namespace": db_ns, "labels": labels},
-         "spec": {"selector": smoke.POSTGRES_LABELS,
-                  "ports": [{"name": "postgres", "port": 5432, "targetPort": "postgres"}]}},
-        {"apiVersion": "apps/v1", "kind": "Deployment",
-         "metadata": {"name": smoke.STANDIN, "namespace": db_ns, "labels": labels},
-         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
-                  "selector": {"matchLabels": smoke.STANDIN_LABELS},
-                  "template": {"metadata": {"labels": smoke.STANDIN_LABELS}, "spec": {
-                      "automountServiceAccountToken": False, "enableServiceLinks": False,
-                      "securityContext": POD_SEC_CONTEXT,
-                      "containers": [{
-                          "name": smoke.STANDIN, "image": standin_image, "imagePullPolicy": "Never",
-                          "ports": [{"name": "http", "containerPort": smoke.STANDIN_PORT}],
-                          "readinessProbe": {"httpGet": {"path": "/healthz", "port": "http"},
-                                             "periodSeconds": 2, "failureThreshold": 3},
-                          "securityContext": CONTAINER_SEC_CONTEXT,
-                      }],
-                  }}}},
-        {"apiVersion": "v1", "kind": "Service",
-         "metadata": {"name": smoke.STANDIN, "namespace": db_ns, "labels": labels},
-         "spec": {"type": "ClusterIP", "selector": smoke.STANDIN_LABELS,
-                  "ports": [{"name": "http", "port": smoke.STANDIN_PORT, "targetPort": "http"}]}},
-        # Default-deny + explicit NetworkPolicies in BOTH app_ns and db_ns.
         {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
          "metadata": {"name": smoke.NAMESPACE_DENY, "namespace": app_ns, "labels": labels},
          "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}},
@@ -979,38 +891,24 @@ def environment_manifests(
              "ingress": [{"from": [ns_peer(app_ns, gateway_labels)],
                           "ports": [{"protocol": "TCP", "port": smoke.STANDIN_PORT}]}],
          }},
+        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+         "metadata": {"name": "postgres-fixture", "namespace": db_ns, "labels": labels},
+         "stringData": {"admin-password": passwords["admin"], "provision.sql": sql}},
     ]
     if not is_target:
-        # Dedicated control client in primary-db proving primary PostgreSQL accepts 5432/TCP
-        # while target-db pods are blocked by NetworkPolicy.
-        items += [
-            {"apiVersion": "apps/v1", "kind": "Deployment",
-             "metadata": {"name": DB_PROBE, "namespace": db_ns, "labels": labels},
-             "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
-                      "selector": {"matchLabels": DB_PROBE_LABELS},
-                      "template": {"metadata": {"labels": DB_PROBE_LABELS}, "spec": {
-                          "automountServiceAccountToken": False, "enableServiceLinks": False,
-                          "securityContext": PG_POD_SEC_CONTEXT,
-                          "containers": [{
-                              "name": "probe", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
-                              "command": ["sleep", "3600"],
-                              "securityContext": CONTAINER_SEC_CONTEXT,
-                              "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
-                          }],
-                          "volumes": [{"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "4Mi"}}],
-                      }}}},
-            {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
-             "metadata": {"name": "db-probe-egress", "namespace": db_ns, "labels": labels},
-             "spec": {
-                 "podSelector": {"matchLabels": DB_PROBE_LABELS},
-                 "policyTypes": ["Ingress", "Egress"],
-                 "egress": [
-                     dns_egress,
-                     {"to": [{"podSelector": {"matchLabels": smoke.POSTGRES_LABELS}}],
-                      "ports": [{"protocol": "TCP", "port": 5432}]},
-                 ],
-             }},
-        ]
+        items.append({
+            "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+            "metadata": {"name": "db-probe-egress", "namespace": db_ns, "labels": labels},
+            "spec": {
+                "podSelector": {"matchLabels": DB_PROBE_LABELS},
+                "policyTypes": ["Ingress", "Egress"],
+                "egress": [
+                    dns_egress,
+                    {"to": [{"podSelector": {"matchLabels": smoke.POSTGRES_LABELS}}],
+                     "ports": [{"protocol": "TCP", "port": 5432}]},
+                ],
+            },
+        })
     items += [
         {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
          "metadata": {"name": smoke.SECRET[role], "namespace": app_ns, "labels": labels},
@@ -1070,6 +968,89 @@ def environment_manifests(
                 "metadata": {"name": claim_name, "namespace": app_ns, "labels": labels},
                 "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "64Mi"}}},
             })
+    return {"apiVersion": "v1", "kind": "List", "items": items}
+
+
+def fixture_workload_manifests(
+    *, db_ns: str, postgres_image: str, standin_image: str, is_target: bool, run_id: str
+) -> dict:
+    """Phase 2 fixture `Deployment` and `Service` manifests applied AFTER `default-deny` policies."""
+    labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
+    items: list[dict] = [
+        {"apiVersion": "apps/v1", "kind": "Deployment",
+         "metadata": {"name": "postgres", "namespace": db_ns, "labels": labels},
+         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                  "selector": {"matchLabels": smoke.POSTGRES_LABELS},
+                  "template": {"metadata": {"labels": smoke.POSTGRES_LABELS}, "spec": {
+                      "automountServiceAccountToken": False, "enableServiceLinks": False,
+                      "securityContext": PG_POD_SEC_CONTEXT,
+                      "containers": [{
+                          "name": "postgres", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
+                          "env": [{"name": "POSTGRES_USER", "value": "fixture_admin"},
+                                  {"name": "POSTGRES_DB", "value": "fixture"},
+                                  {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
+                                  {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {
+                                      "name": "postgres-fixture", "key": "admin-password"}}}],
+                          "ports": [{"name": "postgres", "containerPort": 5432}],
+                          "readinessProbe": {"exec": {"command": [
+                              "pg_isready", "-h", "127.0.0.1", "-U", "fixture_admin", "-d", "fixture"]},
+                              "periodSeconds": 2, "failureThreshold": 2},
+                          "securityContext": CONTAINER_SEC_CONTEXT,
+                          "volumeMounts": [
+                              {"name": "data", "mountPath": "/var/lib/postgresql"},
+                              {"name": "run", "mountPath": "/run/postgresql"},
+                              {"name": "tmp", "mountPath": "/tmp"},
+                              {"name": "init", "mountPath": "/docker-entrypoint-initdb.d", "readOnly": True}],
+                      }],
+                      "volumes": [
+                          {"name": "data", "emptyDir": {}},
+                          {"name": "run", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}},
+                          {"name": "tmp", "emptyDir": {}},
+                          {"name": "init", "secret": {"secretName": "postgres-fixture",
+                                                      "items": [{"key": "provision.sql", "path": "provision.sql"}]}}],
+                  }}}},
+        {"apiVersion": "v1", "kind": "Service",
+         "metadata": {"name": "postgres", "namespace": db_ns, "labels": labels},
+         "spec": {"selector": smoke.POSTGRES_LABELS,
+                  "ports": [{"name": "postgres", "port": 5432, "targetPort": "postgres"}]}},
+        {"apiVersion": "apps/v1", "kind": "Deployment",
+         "metadata": {"name": smoke.STANDIN, "namespace": db_ns, "labels": labels},
+         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                  "selector": {"matchLabels": smoke.STANDIN_LABELS},
+                  "template": {"metadata": {"labels": smoke.STANDIN_LABELS}, "spec": {
+                      "automountServiceAccountToken": False, "enableServiceLinks": False,
+                      "securityContext": POD_SEC_CONTEXT,
+                      "containers": [{
+                          "name": smoke.STANDIN, "image": standin_image, "imagePullPolicy": "Never",
+                          "ports": [{"name": "http", "containerPort": smoke.STANDIN_PORT}],
+                          "readinessProbe": {"httpGet": {"path": "/healthz", "port": "http"},
+                                             "periodSeconds": 2, "failureThreshold": 3},
+                          "securityContext": CONTAINER_SEC_CONTEXT,
+                      }],
+                  }}}},
+        {"apiVersion": "v1", "kind": "Service",
+         "metadata": {"name": smoke.STANDIN, "namespace": db_ns, "labels": labels},
+         "spec": {"type": "ClusterIP", "selector": smoke.STANDIN_LABELS,
+                  "ports": [{"name": "http", "port": smoke.STANDIN_PORT, "targetPort": "http"}]}},
+    ]
+    if not is_target:
+        items.append({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": DB_PROBE, "namespace": db_ns, "labels": labels},
+            "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                     "selector": {"matchLabels": DB_PROBE_LABELS},
+                     "template": {"metadata": {"labels": DB_PROBE_LABELS}, "spec": {
+                         "automountServiceAccountToken": False, "enableServiceLinks": False,
+                         "securityContext": PG_POD_SEC_CONTEXT,
+                         "containers": [{
+                             "name": "probe", "image": postgres_image, "imagePullPolicy": "IfNotPresent",
+                             "command": ["sleep", "3600"],
+                             "securityContext": CONTAINER_SEC_CONTEXT,
+                             "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                         }],
+                         "volumes": [{"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "4Mi"}}],
+                     }}},
+        })
     return {"apiVersion": "v1", "kind": "List", "items": items}
 
 
@@ -1382,10 +1363,11 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.secrets_to_redact.extend(creds.values())
         return creds
 
-    def psql_superuser(self, db_ns: str, sql: str) -> str:
+    def psql_superuser(self, db_ns: str, sql: str, *, dbname: str = "openmettle", single_tx: bool = True) -> str:
+        tx_flags = ["--single-transaction"] if single_tx else []
         return self.kube("--namespace", db_ns, "exec", "--stdin", "deployment/postgres", "--",
-                         "psql", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-qtA",
-                         "-U", "fixture_admin", "-d", "openmettle", input=sql).stdout
+                         "psql", "-v", "ON_ERROR_STOP=1", *tx_flags, "-qtA",
+                         "-U", "fixture_admin", "-d", dbname, input=sql).stdout
 
     def standin_records(self, db_ns: str) -> list[dict]:
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{smoke.STANDIN}", smoke.STANDIN_PORT, namespace=db_ns)
@@ -1459,16 +1441,22 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.vault_k1_b64, self.vault_k2_b64, self.backup_k1_b64, self.wrong_backup_b64,
         ])
 
-        primary_env = environment_manifests(
+        # Apply Namespaces + NetworkPolicies + Secrets/ConfigMaps/PVCs FIRST, before any Deployment.
+        primary_foundation = isolation_and_config_manifests(
             app_ns=PRIMARY_APP_NS, db_ns=PRIMARY_DB_NS,
-            postgres_image=self.core.POSTGRES_IMAGE, standin_image=self.standin_image,
             passwords=self.primary_passwords, catalog=self.catalog,
             vault_keys=[(VAULT_KEY_ID_1, VAULT_KEY_FILE_1, self.vault_k1_b64)],
             backup_key_b64=self.backup_k1_b64, wrong_backup_key_b64=None,
             is_target=False, run_id=self.run_id,
         )
+        primary_workloads = fixture_workload_manifests(
+            db_ns=PRIMARY_DB_NS, postgres_image=self.core.POSTGRES_IMAGE,
+            standin_image=self.standin_image, is_target=False, run_id=self.run_id,
+        )
         self.verify_identity()
-        self.kube("apply", "--filename", "-", input=json.dumps(primary_env))
+        self.kube("apply", "--filename", "-", input=json.dumps(primary_foundation))
+        self.verify_identity()
+        self.kube("apply", "--filename", "-", input=json.dumps(primary_workloads))
         for dep in ("postgres", smoke.STANDIN, DB_PROBE):
             self.kube("--namespace", PRIMARY_DB_NS, "rollout", "status", f"deployment/{dep}",
                       "--timeout=300s", timeout=330)
@@ -1483,15 +1471,17 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.helm_ns(PRIMARY_APP_NS, "install", RELEASE, str(CHART), "--values", str(primary_vals),
                      "--wait=watcher", "--timeout", smoke.HELM_TIMEOUT)
 
-        # Seed user_a, user_b, and user_c sessions.
+        # Seed user_a, user_b, user_c (post-backup disabled), and user_d (active non-member).
         sid_a, cookie_a, hash_a = smoke.session_credential(secrets.token_bytes(64))
         sid_b, cookie_b, hash_b = smoke.session_credential(secrets.token_bytes(64))
         sid_c, cookie_c, hash_c = smoke.session_credential(secrets.token_bytes(64))
+        sid_d, cookie_d, hash_d = smoke.session_credential(secrets.token_bytes(64))
         self.cookie_a_pre = cookie_a
         self.cookie_b_pre = cookie_b
         self.cookie_c_pre = cookie_c
+        self.cookie_d_pre = cookie_d
         self.secrets_to_redact.extend([
-            cookie_a, cookie_b, cookie_c,
+            cookie_a, cookie_b, cookie_c, cookie_d,
             "secret-access-keep-1", "secret-refresh-keep-1",
             "secret-access-revoke-1", "secret-refresh-revoke-1",
         ])
@@ -1501,6 +1491,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 (sid_a, smoke.b64url(secrets.token_bytes(32)), hash_a),
                 (sid_b, smoke.b64url(secrets.token_bytes(32)), hash_b),
                 (sid_c, smoke.b64url(secrets.token_bytes(32)), hash_c),
+                (sid_d, smoke.b64url(secrets.token_bytes(32)), hash_d),
             ),
         )
 
@@ -1539,11 +1530,15 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                           json_body={"grantee": {"kind": "user", "grantee_id": USER_C_IDS["user"]}, "role": "viewer"})
             project_conv = self.api_json(fwd.port, cookie_a, "POST", "/v1/conversations", 201,
                                          key="drill-conv-project", json_body={"scope_id": project_scope_id})
+            # Share project_conv with the project so Viewer user_b can read it while non-member user_d gets 404.
+            self.api_json(fwd.port, cookie_a, "PUT",
+                          f"/v1/conversations/{project_conv['conversation_id']}/shares", 200,
+                          key="drill-conv-project-share",
+                          json_body={"grantee": {"kind": "project"}, "access": "read"})
 
             art_keep = self.upload_artifact(fwd.port, cookie_a, "drill-art-keep", b"drill-personal-keep-bytes\n")
             art_project = self.upload_artifact(fwd.port, cookie_a, "drill-art-proj", b"drill-project-shared-bytes\n",
                                                scope_id=project_scope_id)
-            # Explicit resource share so project Viewer user_b is authorized to download art_project.
             self.api_json(fwd.port, cookie_a, "PUT", f"/v1/artifacts/{art_project['artifact_id']}/shares", 200,
                           key="drill-art-proj-share",
                           json_body={"grantee": {"kind": "project"}, "access": "read"})
@@ -1622,6 +1617,26 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.kube("--namespace", PRIMARY_APP_NS, "rollout", "status", f"deployment/{FULLNAME}-worker",
                   "--timeout=120s", timeout=150)
 
+        # Verify pre-backup run event sequences and 25-unit quota holds before backup capture.
+        pre_runs_raw = self.psql_superuser(
+            PRIMARY_DB_NS,
+            "SELECT r.id::text, r.last_event_sequence, qr.held_units"
+            " FROM openmettle.runs r"
+            " JOIN openmettle.quota_reservations qr"
+            "   ON qr.run_id = r.id AND qr.gateway_request_id IS NULL AND qr.resource_kind = 'usage_tokens'"
+            f" WHERE r.id IN ('{parked['waiting_run_id']}'::uuid, '{parked['intent_run_id']}'::uuid);",
+        )
+        pre_run_seq: dict[str, int] = {}
+        for row in pre_runs_raw.splitlines():
+            if row:
+                rid, seq_s, held_s = row.split("|")
+                self.expect(int(held_s) == 25, f"expected 25-token hold on {rid} before backup, got {held_s}")
+                pre_run_seq[rid] = int(seq_s)
+        self.expect(
+            set(pre_run_seq) == {parked["waiting_run_id"], parked["intent_run_id"]},
+            f"missing pre-backup run sequence metadata: {pre_run_seq!r}",
+        )
+
         res_ids_raw = self.psql_superuser(
             PRIMARY_DB_NS,
             "SELECT id::text, reservation_id::text,"
@@ -1686,7 +1701,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         )
 
         # Fence/stop primary api and worker before recording the authoritative final journal watermark
-        # and exporting post-backup-journal.export so `--export-complete` is genuinely certified.
+        # (`journal_seq, chain_digest`) and exporting post-backup-journal.export.
         self.verify_identity()
         for comp in ("api", "worker"):
             self.kube("--namespace", PRIMARY_APP_NS, "scale", f"deployment/{FULLNAME}-{comp}", "--replicas=0")
@@ -1700,10 +1715,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 timeout=60,
             )
 
-        wm_row = self.psql_superuser(
-            PRIMARY_DB_NS,
-            "SELECT seq, encode(chain_digest, 'hex') FROM openmettle.deletion_journal_head WHERE id;",
-        ).strip()
+        wm_row = self.psql_superuser(PRIMARY_DB_NS, stopped_primary_watermark_sql()).strip()
         wm_seq_s, wm_digest_s = wm_row.split("|")
         stopped_primary_watermark = (int(wm_seq_s), wm_digest_s)
 
@@ -1774,13 +1786,14 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "conn_keep_id": conn_keep["connection_id"],
             "conn_revoke_id": conn_revoke["connection_id"],
             "parked": parked,
+            "pre_run_seq": pre_run_seq,
         }
 
     def provision_target_and_stage_media(self, primary_state: dict) -> None:
         self.target_passwords = self.new_credentials()
-        target_env = environment_manifests(
+        # Phase 1: Namespaces + NetworkPolicies + Secrets/ConfigMaps/PVCs FIRST.
+        target_foundation = isolation_and_config_manifests(
             app_ns=TARGET_APP_NS, db_ns=TARGET_DB_NS,
-            postgres_image=self.core.POSTGRES_IMAGE, standin_image=self.standin_image,
             passwords=self.target_passwords, catalog=self.catalog,
             vault_keys=[
                 (VAULT_KEY_ID_1, VAULT_KEY_FILE_1, self.vault_k1_b64),
@@ -1789,8 +1802,15 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             backup_key_b64=self.backup_k1_b64, wrong_backup_key_b64=self.wrong_backup_b64,
             is_target=True, run_id=self.run_id,
         )
+        # Phase 2: Database & stand-in Deployments AFTER default-deny policies exist.
+        target_workloads = fixture_workload_manifests(
+            db_ns=TARGET_DB_NS, postgres_image=self.core.POSTGRES_IMAGE,
+            standin_image=self.standin_image, is_target=True, run_id=self.run_id,
+        )
         self.verify_identity()
-        self.kube("apply", "--filename", "-", input=json.dumps(target_env))
+        self.kube("apply", "--filename", "-", input=json.dumps(target_foundation))
+        self.verify_identity()
+        self.kube("apply", "--filename", "-", input=json.dumps(target_workloads))
         for dep in ("postgres", smoke.STANDIN):
             self.kube("--namespace", TARGET_DB_NS, "rollout", "status", f"deployment/{dep}",
                       "--timeout=300s", timeout=330)
@@ -1844,6 +1864,189 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.kube("--namespace", PRIMARY_APP_NS, "delete", "pod", src_pod, "--wait=true", timeout=120)
             self.kube("--namespace", TARGET_APP_NS, "delete", "pod", dst_pod, "--wait=true", timeout=120)
 
+    def exercise_uncertified_coverage_gap(self) -> None:
+        """Exercise the uncertified `restore accept-coverage-gap` path against an isolated scratch
+        database (`openmettle_gap`) restored from `/var/recovery/unpacked/pg.dump`, verifying
+        `reauth_required`, cleared ciphertexts, deactivated shares, and audit persistence."""
+        admin_ref = self.report["images"]["admin"]["reference"]
+        migrate_ref = self.report["images"]["migrate"]["reference"]
+        target_pg_host = f"postgres.{TARGET_DB_NS}.svc.cluster.local"
+        labels = {"openmettle.dev/environment": "dev", RUN_LABEL: self.run_id}
+
+        self.psql_superuser(
+            TARGET_DB_NS,
+            f"CREATE DATABASE {GAP_DB_NAME} OWNER openmettle_owner;\n" + target_db_acl_sql(GAP_DB_NAME),
+            dbname="fixture",
+            single_tx=False,
+        )
+        gap_secret = {
+            "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+            "metadata": {"name": GAP_OWNER_SECRET, "namespace": TARGET_APP_NS, "labels": labels},
+            "stringData": {"url": db_url(TARGET_DB_NS, "migrate", self.target_passwords["migrate"], dbname=GAP_DB_NAME)},
+        }
+        self.verify_identity()
+        self.kube("apply", "--filename", "-", input=json.dumps(gap_secret))
+        try:
+            pg_gap_script = (
+                "umask 077\n"
+                "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
+                'owner_pw="${OWNER_DB_URL#*://openmettle_owner:}"\n'
+                'owner_pw="${owner_pw%%@*}"\n'
+                'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
+                f'printf "%s:5432:{GAP_DB_NAME}:openmettle_owner:%s\\n" "$(esc "{target_pg_host}")" "$(esc "$owner_pw")" > "$PGPASSFILE"\n'
+                'chmod 0600 "$PGPASSFILE"\n'
+                "pg_restore --format=custom --no-owner --exit-on-error "
+                f'--host="{target_pg_host}" --port=5432 --username=openmettle_owner --dbname={GAP_DB_NAME} '
+                f'"{UNPACKED_DIR}/pg.dump"\n'
+                'rm -f "$PGPASSFILE"\n'
+                f'printf "GAP_JOURNAL_BEGIN\\n"; cat "{UNPACKED_DIR}/deletion-journal.bin"; printf "GAP_JOURNAL_END\\n"\n'
+            )
+            pg_gap_job = {
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "openmettle-drill-gap-pg-restore", "namespace": TARGET_APP_NS, "labels": labels},
+                "spec": {
+                    "backoffLimit": 0, "activeDeadlineSeconds": 180,
+                    "template": {
+                        "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                        "spec": {
+                            "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                            "securityContext": POD_SEC_CONTEXT,
+                            "containers": [{
+                                "name": "pg-restore", "image": self.pg_client_ref, "imagePullPolicy": "Never",
+                                "command": ["/bin/sh", "-eu", "-c", pg_gap_script],
+                                "env": [{"name": "OWNER_DB_URL",
+                                         "valueFrom": {"secretKeyRef": {"name": GAP_OWNER_SECRET, "key": "url"}}}],
+                                "securityContext": CONTAINER_SEC_CONTEXT,
+                                "volumeMounts": [
+                                    {"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR, "readOnly": True},
+                                    {"name": "tmp", "mountPath": "/tmp"},
+                                ],
+                            }],
+                            "volumes": [
+                                {"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM, "readOnly": True}},
+                                {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}},
+                            ],
+                        },
+                    },
+                },
+            }
+            gap_restore_out, _ = self.run_job(TARGET_APP_NS, pg_gap_job)
+            gap_journal_text = gap_restore_out.split("GAP_JOURNAL_BEGIN\n", 1)[1].split("GAP_JOURNAL_END", 1)[0]
+            gap_wm = parse_journal_export_watermarks(gap_journal_text)
+            gap_export_complete = should_pass_export_complete(gap_wm, None)
+            self.expect(not gap_export_complete, "uncertified backup journal unexpectedly marked export_complete")
+
+            gap_migrate_job = {
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "openmettle-drill-gap-migrate", "namespace": TARGET_APP_NS, "labels": labels},
+                "spec": {
+                    "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                    "template": {
+                        "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                        "spec": {
+                            "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                            "securityContext": POD_SEC_CONTEXT,
+                            "containers": [{
+                                "name": "migrate", "image": migrate_ref, "imagePullPolicy": "Never",
+                                "env": [{"name": "OPENMETTLE_MIGRATE_DATABASE_URL",
+                                         "valueFrom": {"secretKeyRef": {"name": GAP_OWNER_SECRET, "key": "url"}}}],
+                                "securityContext": CONTAINER_SEC_CONTEXT,
+                            }],
+                        },
+                    },
+                },
+            }
+            self.run_job(TARGET_APP_NS, gap_migrate_job)
+
+            gap_lock_argv = " ".join(f'"{a}"' for a in restore_lock_args(gap_wm, export_complete=gap_export_complete))
+            gap_lock_job = {
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "openmettle-drill-gap-lock", "namespace": TARGET_APP_NS, "labels": labels},
+                "spec": {
+                    "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                    "template": {
+                        "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                        "spec": {
+                            "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                            "securityContext": POD_SEC_CONTEXT,
+                            "containers": [{
+                                "name": "gap-lock", "image": admin_ref, "imagePullPolicy": "Never",
+                                "command": ["/bin/sh", "-eu", "-c", f"openmettle-admin {gap_lock_argv}\n"],
+                                "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                         "valueFrom": {"secretKeyRef": {"name": GAP_OWNER_SECRET, "key": "url"}}}],
+                                "securityContext": CONTAINER_SEC_CONTEXT,
+                            }],
+                        },
+                    },
+                },
+            }
+            gap_lock_out, _ = self.run_job(TARGET_APP_NS, gap_lock_job)
+            gap_run_id = parse_restore_lock_run_id(gap_lock_out)
+
+            gap_accept_argv = " ".join(
+                f'"{a}"'
+                for a in accept_coverage_gap_args(
+                    gap_run_id,
+                    DRILL_OPERATOR_ID,
+                    f"drill-gap-{gap_run_id}",
+                    "uncertified post-backup window during V1-31 coverage-gap check",
+                )
+            )
+            gap_accept_script = (
+                f'openmettle-admin restore replay --db-only "{UNPACKED_DIR}/deletion-journal.bin"\n'
+                f"openmettle-admin {gap_accept_argv}\n"
+            )
+            gap_accept_job = {
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "openmettle-drill-gap-accept", "namespace": TARGET_APP_NS, "labels": labels},
+                "spec": {
+                    "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                    "template": {
+                        "metadata": {"labels": {**labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                        "spec": {
+                            "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                            "securityContext": POD_SEC_CONTEXT,
+                            "containers": [{
+                                "name": "gap-accept", "image": admin_ref, "imagePullPolicy": "Never",
+                                "command": ["/bin/sh", "-eu", "-c", gap_accept_script],
+                                "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                         "valueFrom": {"secretKeyRef": {"name": GAP_OWNER_SECRET, "key": "url"}}}],
+                                "securityContext": CONTAINER_SEC_CONTEXT,
+                                "volumeMounts": [{"name": "scratch", "mountPath": RECOVERY_SCRATCH_DIR, "readOnly": True}],
+                            }],
+                            "volumes": [{"name": "scratch", "persistentVolumeClaim": {"claimName": TARGET_RECOVERY_SCRATCH_CLAIM, "readOnly": True}}],
+                        },
+                    },
+                },
+            }
+            gap_accept_out, _ = self.run_job(TARGET_APP_NS, gap_accept_job)
+            self.expect("applied restore.accept_coverage_gap" in gap_accept_out,
+                        f"expected restore.accept_coverage_gap confirmation, got {gap_accept_out!r}")
+
+            gap_sql = self.psql_superuser(
+                TARGET_DB_NS,
+                "SELECT (SELECT count(*) FROM openmettle.external_connections WHERE state = 'reauth_required'),"
+                " (SELECT count(*) FROM openmettle.external_connections WHERE state = 'authorized'),"
+                " (SELECT count(*) FROM openmettle.external_connections"
+                "   WHERE encryption_key_id IS NOT NULL OR access_ciphertext IS NOT NULL OR refresh_ciphertext IS NOT NULL),"
+                " (SELECT count(*) FROM openmettle.external_connection_shares WHERE active),"
+                " (SELECT coverage_complete FROM openmettle.restore_reconciliation_gate),"
+                " (SELECT count(*) FROM openmettle.authorization_audit WHERE action = 'restore.accept_coverage_gap');",
+                dbname=GAP_DB_NAME,
+            ).strip()
+            self.expect(gap_sql == "2|0|0|0|t|1",
+                        f"unexpected post-accept-coverage-gap SQL state: {gap_sql!r}")
+            self.passed("uncertified export coverage-gap path transitions connections to reauth_required, clears ciphertexts, and deactivates shares")
+        finally:
+            self.verify_identity()
+            self.kube("--namespace", TARGET_APP_NS, "delete", "secret", GAP_OWNER_SECRET, "--ignore-not-found=true")
+            self.psql_superuser(
+                TARGET_DB_NS,
+                f"DROP DATABASE IF EXISTS {GAP_DB_NAME} WITH (FORCE);",
+                dbname="fixture",
+                single_tx=False,
+            )
+
     def execute_target_restore(self, primary_state: dict) -> dict:
         admin_ref = self.report["images"]["admin"]["reference"]
         migrate_ref = self.report["images"]["migrate"]["reference"]
@@ -1864,17 +2067,14 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         good_vt_cfg = f"{smoke.VAULT_KEYS_DIR}/keyring.json"
         wrong_bk_cfg = f"{WRONG_BACKUP_KEYS_DIR}/keyring.json"
         neg_script = (
-            # 1. Positive control proving staged /etc/openmettle/{backup,vault}-keys load and verify cleanly:
             f'OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
             f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}"\n'
-            # 2. Negative: identical vault==backup keyring path must be refused:
             f'if OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_bk_cfg}" '
             f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{good_bk_cfg}" '
             '2>/tmp/neg-same-path.err; then\n'
             '  echo "ERROR: identical vault/backup keyring path unexpectedly succeeded" >&2; exit 1\n'
             "fi\n"
             'grep -q "distinct from VAULT_KEYS_CONFIG" /tmp/neg-same-path.err\n'
-            # 3. Negative: distinct vault path & file containing identical 32-byte backup key material:
             "umask 077 && mkdir -p /tmp/dup-vault && chmod 0700 /tmp/dup-vault\n"
             f'cp -- "{smoke.BACKUP_KEYS_DIR}/{BACKUP_KEY_FILE}" /tmp/dup-vault/dup.key && chmod 0400 /tmp/dup-vault/dup.key\n'
             'printf \'{"version":1,"active_key_id":"dup-v1","keys":[{"id":"dup-v1","file":"/tmp/dup-vault/dup.key"}]}\\n\' '
@@ -1885,14 +2085,12 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             '  echo "ERROR: duplicate vault/backup key bytes unexpectedly succeeded" >&2; exit 1\n'
             "fi\n"
             'grep -q "backup key material must be distinct from vault keys" /tmp/neg-dup-bytes.err\n'
-            # 4. Negative: wrong 32-byte backup key reaches AEAD verification and fails:
             f'if OPENMETTLE_API_VAULT_KEYS_CONFIG="{good_vt_cfg}" '
             f'openmettle-admin backup verify --backup-dir "{backup_dir}" --backup-keys-config "{wrong_bk_cfg}" '
             '2>/tmp/neg-wrong-key.err; then\n'
             '  echo "ERROR: wrong backup key unexpectedly verified" >&2; exit 1\n'
             "fi\n"
             'grep -q "backup verification failed" /tmp/neg-wrong-key.err\n'
-            # 5. Negative: bit-flipped pg.dump.enc verified with the GOOD backup key fails AEAD/digest check:
             f'cp -a "{backup_dir}" /tmp/tampered-backup\n'
             "chmod -R u+w /tmp/tampered-backup\n"
             'size=$(wc -c < /tmp/tampered-backup/pg.dump.enc | tr -d " ")\n'
@@ -2003,6 +2201,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.passed("backup preflight verified, negative tamper/key checks refused, and archive unpacked",
                     **manifest_summary)
 
+        # Exercise the uncertified coverage-gap flow on an isolated scratch database before scrubbing unpacked files.
+        self.exercise_uncertified_coverage_gap()
+
         # Step 3: Restore pg.dump with 0600 PGPASSFILE (no password in argv) + run openmettle-migrate.
         target_pg_host = f"postgres.{TARGET_DB_NS}.svc.cluster.local"
         pg_restore_script = (
@@ -2084,9 +2285,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.expect(db_post_migrate == f"{REQUIRED_MIGRATION}|1|t",
                     f"unexpected target post-migrate DB state: {db_post_migrate!r}")
 
-        # Step 4: Certify `--export-complete` against the stopped-primary watermark (falling back to
-        # `restore accept-coverage-gap` if uncertified), copy artifacts omitting rev_to_lose, prove
-        # `storage rebind` fails closed, then replay --db-only -> declare-lost -> rebind -> replay -> quota verify.
+        # Step 4: Certify `--export-complete` against the stopped-primary watermark, copy artifacts
+        # omitting rev_to_lose, prove `storage rebind` fails closed, then replay --db-only -> declare-lost
+        # -> rebind -> replay -> quota verify.
         watermarks = parse_journal_export_watermarks(self.journal_text)
         self.expect(watermarks["required_seq"] > manifest_summary["journal_seq"],
                     "post-backup journal export did not advance past backup snapshot journal_seq")
@@ -2157,19 +2358,6 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         s4b_init, s4b_key_mounts, s4b_key_vols = staged_keyring_mounts(
             admin_ref, [("vault", smoke.VAULT_KEYS_SECRET, smoke.VAULT_KEYS_DIR)]
         )
-        gap_line = ""
-        if not export_complete:
-            gap_argv = " ".join(
-                f'"{a}"'
-                for a in accept_coverage_gap_args(
-                    restore_run_id,
-                    DRILL_OPERATOR_ID,
-                    f"drill-gap-{restore_run_id}",
-                    "post-export primary activity before loss cannot be ruled out",
-                )
-            )
-            gap_line = f"openmettle-admin {gap_argv}\n"
-
         if has_artifacts:
             replay_and_rebind_lines = (
                 f'openmettle-admin restore replay --db-only "{selected_journal}"\n'
@@ -2178,22 +2366,20 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 f'--request-key "drill-lost-{lost_rev_id}" '
                 '--reason "simulated unrecoverable disk payload during V1-31 isolated restore drill"\n'
                 f'openmettle-admin storage rebind "{smoke.ARTIFACTS_MOUNT_PATH}" --replace-adoption-run "{barrier_uuid}"\n'
-                + gap_line
-                + f'openmettle-admin restore replay "{selected_journal}" "{smoke.ARTIFACTS_MOUNT_PATH}"\n'
-                + f'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify "{smoke.ARTIFACTS_MOUNT_PATH}"; printf "QUOTA_STAGE4_END\\n"\n'
+                f'openmettle-admin restore replay "{selected_journal}" "{smoke.ARTIFACTS_MOUNT_PATH}"\n'
+                f'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify "{smoke.ARTIFACTS_MOUNT_PATH}"; printf "QUOTA_STAGE4_END\\n"\n'
             )
         else:
             replay_and_rebind_lines = (
-                gap_line
-                + f'openmettle-admin restore replay "{selected_journal}"\n'
-                + 'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify; printf "QUOTA_STAGE4_END\\n"\n'
+                f'openmettle-admin restore replay "{selected_journal}"\n'
+                'printf "QUOTA_STAGE4_BEGIN\\n"; openmettle-admin quota verify; printf "QUOTA_STAGE4_END\\n"\n'
             )
 
         step4b_script = (
             replay_and_rebind_lines
             + 'printf "VAULT_BEFORE_BEGIN\\n"; openmettle-admin vault status; printf "VAULT_BEFORE_END\\n"\n'
             + f'openmettle-admin vault rotate --vault-keys "{good_vt_cfg}" '
-              f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-vault-rotate-1" '
+              f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-vault-rotate-{restore_run_id}" '
               '--reason "rotate recovered external connections to vault-k2"\n'
             + 'printf "VAULT_AFTER_BEGIN\\n"; openmettle-admin vault status; printf "VAULT_AFTER_END\\n"\n'
         )
@@ -2328,16 +2514,17 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         }
         w_sql_out, _ = self.run_job(TARGET_APP_NS, worker_sql_job)
         released_lines = [ln.strip() for ln in w_sql_out.splitlines() if ln.strip().isdigit()]
-        # waiting_run_id's 25-token hold is released (1); intent_run_id's 25-token hold stays held (outcome_unknown).
         self.expect(released_lines == ["1"],
                     f"expected 1 eligible terminal-run quota reservation released by worker, got {w_sql_out!r}")
 
-        # Step 5e (LAST before starting workloads): release snapshot maintenance, re-verify zero drift, scrub unpacked dir.
+        # Step 5e (LAST before starting workloads): release snapshot maintenance using restore_run_id-bound
+        # request key, verify `backup status` reports `maintenance_active: false`, re-verify zero drift, scrub unpacked dir.
         qv_arg = f' "{smoke.ARTIFACTS_MOUNT_PATH}"' if has_artifacts else ""
         step5e_script = (
             "openmettle-admin backup release-maintenance "
-            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-release-maint-1" '
+            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-release-maint-{restore_run_id}" '
             '--reason "isolated restore pre-worker reconciliation complete" --abort-active-run\n'
+            'printf "BACKUP_STATUS_BEGIN\\n"; openmettle-admin backup status; printf "BACKUP_STATUS_END\\n"\n'
             f'printf "QUOTA_VERIFY_BEGIN\\n"; openmettle-admin quota verify{qv_arg}; printf "QUOTA_VERIFY_END\\n"\n'
             f'rm -rf "{UNPACKED_DIR}"\n'
         )
@@ -2371,6 +2558,11 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             },
         }
         s5e_out, _ = self.run_job(TARGET_APP_NS, step5e_job)
+        backup_status = json.loads(
+            s5e_out.split("BACKUP_STATUS_BEGIN\n", 1)[1].split("BACKUP_STATUS_END", 1)[0]
+        )
+        self.expect(backup_status.get("maintenance_active") is False,
+                    f"expected maintenance_active=false before starting target workloads, got {backup_status!r}")
         quota_pre = parse_quota_verify_zero(s5e_out.split("QUOTA_VERIFY_BEGIN\n", 1)[1].split("QUOTA_VERIFY_END", 1)[0])
 
         self.passed(
@@ -2421,16 +2613,18 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
     def verify_post_restore_state(
         self, primary_state: dict, recovery_meta: dict, recovery_started_at: datetime
     ) -> None:
-        # Mint fresh post-restore sessions for user_a, user_b, and disabled user_c.
+        # Mint fresh post-restore sessions for user_a, user_b, disabled user_c, and non-member user_d.
         sid_a2, cookie_a2, hash_a2 = smoke.session_credential(secrets.token_bytes(64))
         sid_b2, cookie_b2, hash_b2 = smoke.session_credential(secrets.token_bytes(64))
         sid_c2, cookie_c2, hash_c2 = smoke.session_credential(secrets.token_bytes(64))
-        self.secrets_to_redact.extend([cookie_a2, cookie_b2, cookie_c2])
+        sid_d2, cookie_d2, hash_d2 = smoke.session_credential(secrets.token_bytes(64))
+        self.secrets_to_redact.extend([cookie_a2, cookie_b2, cookie_c2, cookie_d2])
         self.psql_superuser(
             TARGET_DB_NS,
             fresh_post_restore_session_sql(USER_A_IDS, sid_a2, smoke.b64url(secrets.token_bytes(32)), hash_a2, "target-a")
             + fresh_post_restore_session_sql(USER_B_IDS, sid_b2, smoke.b64url(secrets.token_bytes(32)), hash_b2, "target-b")
-            + fresh_post_restore_session_sql(USER_C_IDS, sid_c2, smoke.b64url(secrets.token_bytes(32)), hash_c2, "target-c"),
+            + fresh_post_restore_session_sql(USER_C_IDS, sid_c2, smoke.b64url(secrets.token_bytes(32)), hash_c2, "target-c")
+            + fresh_post_restore_session_sql(USER_D_IDS, sid_d2, smoke.b64url(secrets.token_bytes(32)), hash_d2, "target-d"),
         )
 
         # Give target worker 3 sweeps to prove zero unsolicited SGLang calls from parked runs/write intents.
@@ -2441,9 +2635,11 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=TARGET_APP_NS)
         try:
             # 1. Pre-restore session cookies AND post-backup disabled user_c's fresh session must return 401.
-            for rejected_cookie in (self.cookie_a_pre, self.cookie_b_pre, self.cookie_c_pre, cookie_c2):
+            for rejected_cookie in (self.cookie_a_pre, self.cookie_b_pre, self.cookie_c_pre, self.cookie_d_pre, cookie_c2):
                 self.api_call(fwd.port, rejected_cookie, "GET", "/v1/quotas/personal", 401)
             self.api_call(fwd.port, cookie_c2, "GET", f"/v1/projects/{primary_state['project_id']}", 401)
+            # Active non-member user_d is authenticated (200 on personal quotas).
+            self.api_json(fwd.port, cookie_d2, "GET", "/v1/quotas/personal", 200)
 
             # 2. Surviving personal conversation, completed run history, and personal artifact ownership/404 isolation.
             p_conv_id = primary_state["personal_conv"]["conversation_id"]
@@ -2463,11 +2659,18 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.api_call(fwd.port, cookie_b2, "GET", keep_path, 404)
             self.api_call(fwd.port, cookie_b2, "GET", f"{keep_path}/content", 404)
 
-            # 3. Surviving shared project: Viewer user_b downloads shared artifact (200) and is denied writes (403 policy).
+            # 3. Surviving shared project: project_conv readable by user_a & Viewer user_b (200), 404 for
+            #    authenticated non-member user_d; shared artifact downloadable by user_b (200) and Viewer writes 403.
+            proj_conv_id = primary_state["project_conv"]["conversation_id"]
+            self.api_json(fwd.port, cookie_a2, "GET", f"/v1/conversations/{proj_conv_id}", 200)
+            self.api_json(fwd.port, cookie_b2, "GET", f"/v1/conversations/{proj_conv_id}", 200)
+            self.api_call(fwd.port, cookie_d2, "GET", f"/v1/conversations/{proj_conv_id}", 404)
+
             proj_art = primary_state["art_project"]
             proj_art_path = f"/v1/artifacts/{proj_art['artifact_id']}/revisions/{proj_art['revision_id']}"
             _, proj_bytes = self.api_call(fwd.port, cookie_b2, "GET", f"{proj_art_path}/content", 200)
             self.expect(proj_bytes == b"drill-project-shared-bytes\n", "viewer failed to download shared project artifact")
+            self.api_call(fwd.port, cookie_d2, "GET", f"{proj_art_path}/content", 404)
             boundary_deny = f"drill-boundary-{secrets.token_hex(4)}"
             _, deny_body = self.api_call(
                 fwd.port, cookie_b2, "POST",
@@ -2558,9 +2761,10 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.expect(len(self.standin_records(TARGET_DB_NS)) == 1,
                     "expected exactly 1 upstream gateway call from the fresh post-restore turn")
 
-        # Verify SQL invariants on target: write intent outcome_unknown (rev 1), contiguous run_events
-        # sequences matching runs.last_event_sequence, waiting_run quota released vs intent_run quota held,
-        # disconnected ciphertext NULL, exact microsecond purge_after match, restore_gate open, maintenance false.
+        # Verify SQL invariants on target: write intent outcome_unknown (rev 1), exact post-backup
+        # run_events appended in order & contiguous with runs.last_event_sequence, waiting_run quota
+        # released vs intent_run 25-token quota held, disconnected ciphertext NULL, exact microsecond
+        # purge_after match, restore_gate open, maintenance false.
         purged_rev_id = primary_state["art_post_purge"]["revision_id"]
         purged_res_id = primary_state["rev_meta"][purged_rev_id]["reservation_id"]
         dl_rev_id = primary_state["art_deadline"]["revision_id"]
@@ -2568,12 +2772,13 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         w_run_id = primary_state["parked"]["waiting_run_id"]
         i_run_id = primary_state["parked"]["intent_run_id"]
         i_op_id = primary_state["parked"]["intent_operation_id"]
+        w_expected_seq = primary_state["pre_run_seq"][w_run_id] + 1
+        i_unresolved_seq = primary_state["pre_run_seq"][i_run_id] + 1
+        i_expected_seq = primary_state["pre_run_seq"][i_run_id] + 2
 
         sql_checks = self.psql_superuser(
             TARGET_DB_NS,
             f"SELECT (SELECT outcome || ':' || revision::text FROM openmettle.operations WHERE id = '{i_op_id}'::uuid),"
-            f" (SELECT count(*) FROM openmettle.run_events WHERE run_id = '{i_run_id}'::uuid"
-            f"    AND append_key = 'unresolved-write:{i_op_id}'),"
             f" (SELECT encryption_key_id IS NULL AND access_ciphertext IS NULL AND refresh_ciphertext IS NULL"
             f"    FROM openmettle.external_connections WHERE id = '{primary_state['conn_revoke_id']}'::uuid),"
             f" (SELECT (extract(epoch FROM purge_after) * 1000000)::bigint"
@@ -2585,17 +2790,26 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f"         || ':' || (SELECT coalesce(min(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
             f"         || ':' || (SELECT coalesce(max(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
             f"    FROM openmettle.runs r WHERE id = '{w_run_id}'::uuid),"
+            f" (SELECT append_key || ':' || format FROM openmettle.run_events"
+            f"    WHERE run_id = '{w_run_id}'::uuid AND sequence = {w_expected_seq}),"
             f" (SELECT last_event_sequence || ':' || (SELECT count(*) FROM openmettle.run_events WHERE run_id = r.id)"
             f"         || ':' || (SELECT coalesce(min(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
             f"         || ':' || (SELECT coalesce(max(sequence), 0) FROM openmettle.run_events WHERE run_id = r.id)"
             f"    FROM openmettle.runs r WHERE id = '{i_run_id}'::uuid),"
+            f" (SELECT append_key FROM openmettle.run_events"
+            f"    WHERE run_id = '{i_run_id}'::uuid AND sequence = {i_unresolved_seq}),"
+            f" (SELECT append_key || ':' || format FROM openmettle.run_events"
+            f"    WHERE run_id = '{i_run_id}'::uuid AND sequence = {i_expected_seq}),"
             f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
             f"    WHERE run_id = '{w_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens'),"
             f" (SELECT state || ':' || held_units::text FROM openmettle.quota_reservations"
             f"    WHERE run_id = '{i_run_id}'::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens');",
         ).strip()
         expected_sql = (
-            f"outcome_unknown:1|1|t|{expected_purge_after_us}|purged|t|f|2:2:1:2|3:3:1:3|released:0|held:25"
+            f"outcome_unknown:1|t|{expected_purge_after_us}|purged|t|f|"
+            f"{w_expected_seq}:{w_expected_seq}:1:{w_expected_seq}|run-terminal:openmettle.run-cancelled|"
+            f"{i_expected_seq}:{i_expected_seq}:1:{i_expected_seq}|unresolved-write:{i_op_id}|"
+            "run-terminal:openmettle.run-cancelled|released:0|held:25"
         )
         self.expect(
             sql_checks == expected_sql,

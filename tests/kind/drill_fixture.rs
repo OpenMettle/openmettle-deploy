@@ -176,7 +176,7 @@ async fn main() {
             },
             actor_approval_id: approval,
             capabilities: &[],
-            requested_rounds: None,
+            requested_rounds: Some(1),
             now_ms,
             cost_qualified: None,
         };
@@ -218,6 +218,16 @@ async fn main() {
         .await
         .expect("reserve 25 usage_tokens on claimed run");
         qtx.commit().await.unwrap();
+
+        let held_units: i64 = sqlx::query_scalar(
+            "SELECT held_units FROM openmettle.quota_reservations
+              WHERE run_id = $1::uuid AND gateway_request_id IS NULL AND resource_kind = 'usage_tokens'",
+        )
+        .bind(&claimed.run_id)
+        .fetch_one(&mut worker_conn)
+        .await
+        .expect("read seeded run quota hold");
+        assert_eq!(held_units, 25, "expected 25-token single-round reservation");
 
         let parked = park(
             &mut worker_conn,

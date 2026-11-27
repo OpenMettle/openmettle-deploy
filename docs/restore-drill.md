@@ -7,8 +7,8 @@ This runbook defines the repeatable Kubernetes recovery and isolated-target rest
 ## Scope and safety boundaries
 
 1. **Isolated target only.** Always restore into a separate namespace or cluster, a fresh PostgreSQL database (`openmettle`) with freshly generated role passwords, and a fresh artifact `PersistentVolumeClaim`. Never run `pg_restore`, `storage rebind` or `restore replay` against a live primary database or mounted primary artifact volume.
-2. **Default-deny network and Pod Security isolation before restore.** Apply `pod-security.kubernetes.io/enforce=restricted` and namespace-wide `default-deny` `NetworkPolicy` manifests across both the target application namespace and any in-cluster target database namespace before creating recovery `Job`s or workloads, so target pods cannot reach primary PostgreSQL, primary `openmettle-gateway` Services, or unapproved external endpoints. Keep `backup.suspend: true` (or `backup.enabled: false`) on the drill target so it cannot write to or prune a shared backup destination.
-3. **Separate backup and vault key custody.** `OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG` and `OPENMETTLE_API_VAULT_KEYS_CONFIG` / `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` must remain distinct Secrets, files, and 32-byte key material (`ADR 0045`, `ADR 0046`). `openmettle-admin` refuses overlapping paths or duplicate key bytes.
+2. **Default-deny network and Pod Security isolation before workloads.** Apply `pod-security.kubernetes.io/enforce=restricted` and namespace-wide `default-deny` `NetworkPolicy` manifests across both the target application namespace and any in-cluster target database namespace **before** submitting database fixtures, recovery `Job`s, or runtime workloads, so target pods cannot reach primary PostgreSQL, primary `openmettle-gateway` Services, or unapproved external endpoints at any point in their lifecycle. Keep `backup.suspend: true` (or `backup.enabled: false`) on the drill target so it cannot write to or prune a shared backup destination.
+3. **Separate backup and vault key custody.** `OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG` and `OPENMETTLE_API_VAULT_KEYS_CONFIG` / `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` must remain distinct Secrets, files, and 32-byte key material (`ADR 0045`, `ADR 0046`). `openmettle-admin` refuses overlapping paths, inodes, or duplicate key bytes whenever `OPENMETTLE_API_VAULT_KEYS_CONFIG` is set in the preflight environment.
 4. **RPO / RTO targets.** Single-node v1 targets **RPO <= 24 hours** (`86,400 s` between the restored backup's `quiesced_at` timestamp and incident/drill cutover) and **RTO <= 4 hours** (`14,400 s` from recovery initiation — before target provisioning and media staging — through final post-restore HTTP/SQL acceptance and `quota verify` completion).
 5. **Explicit non-goals.** Legacy Open WebUI database or file import is excluded from v1 recovery (`ADR 0003`). Optional Graphiti (`neo4j.dump`) and Chroma (`chroma.archive` or `qualified_rebuild`) recovery steps apply only when `manifest.json` records a provisioned state other than `not_provisioned`.
 
@@ -16,10 +16,12 @@ This runbook defines the repeatable Kubernetes recovery and isolated-target rest
 
 ## Step 1 — Preflight verification and unpacking
 
-Stage the backup keyring at its declared path (`/etc/openmettle/backup-keys` via a `Memory` `emptyDir` `initContainer` writing `0400` files owned by UID `65532` and mounted `readOnly: true` with `subPath: keys`), mount the backup destination PVC `readOnly: true`, and mount an isolated scratch PVC at `/var/recovery`:
+Stage **both** the backup keyring (`/etc/openmettle/backup-keys`) and the target vault keyring (`/etc/openmettle/vault-keys`) via `Memory` `emptyDir` `initContainer`s writing `0400` files owned by UID `65532` and mounted `readOnly: true` with `subPath: keys`, mount the backup destination PVC `readOnly: true`, mount an isolated scratch PVC at `/var/recovery`, and export `OPENMETTLE_API_VAULT_KEYS_CONFIG` so `BackupKeyRing::load_from_config` enforces backup/vault key separation during preflight:
 
 ```sh
-# 1. Verify backup-meta.json, encrypted manifest, and AEAD stream tags for all components.
+export OPENMETTLE_API_VAULT_KEYS_CONFIG=/etc/openmettle/vault-keys/keyring.json
+
+# 1. Verify backup-meta.json, backup/vault key separation, encrypted manifest, and AEAD stream tags.
 openmettle-admin backup verify \
   --backup-dir /var/backups/openmettle/<backup-dir> \
   --backup-keys-config /etc/openmettle/backup-keys/keyring.json
@@ -34,7 +36,7 @@ openmettle-admin backup unpack \
 `backup unpack` writes `pg.dump`, `gateway-entitlements.json`, `deletion-journal.bin`, `artifacts/` (with `revisions/`, `staging/`, and `.openmettle-volume-id` sentinels when pinned), `config/` (including `vault-key-inventory.json`), optional `neo4j.dump`, optional `chroma.archive`, and plaintext `manifest.json`. Inspect `/var/recovery/unpacked/manifest.json` before touching PostgreSQL or PVCs:
 
 - **Schema compatibility:** `schema_version` must be `<=` the migration version shipped by the target chart's `CORE_COMMIT` (`45` at `87a395e`). Never restore a newer schema dump onto an older `openmettle-core` binary.
-- **Required vault key IDs:** check `vault_required_key_ids` (and `/var/recovery/unpacked/config/vault-key-inventory.json`). Every listed key ID must exist in the target `vault.existingSecret` keyring before starting `api`/`worker` or running `openmettle-admin vault rotate`.
+- **Required vault key IDs:** check `vault_required_key_ids` (and `/var/recovery/unpacked/config/vault-key-inventory.json`). Every listed key ID must exist in `/etc/openmettle/vault-keys/keyring.json` before starting `api`/`worker` or running `openmettle-admin vault rotate`.
 - **Artifact volume mode:** check `artifact_volume.volume_id` (non-null UUID when artifact storage is pinned; `null` on storage-disabled deployments).
 - **Optional stores:** check `graphiti_neo4j.status` (`"not_provisioned"` or `"offline_dump"`) and `chroma.mode` (`"not_provisioned"`, `"archive"` or `"qualified_rebuild"`). If `neo4j.dump` is unpacked, restore Neo4j offline (`neo4j-admin database load`) before enabling Graphiti; if `chroma.archive` is unpacked, restore Chroma's persistent directory from `chroma.archive`; if `chroma.mode` is `"qualified_rebuild"`, rebuild `chroma_vector_embeddings` offline against `chroma.qualification_ref` before opening retrieval traffic.
 - **RPO anchor:** record `quiesced_at` and `deletion_journal.journal_seq`.
@@ -43,7 +45,7 @@ openmettle-admin backup unpack \
 
 ## Step 2 — Provision isolated target namespace and PostgreSQL roles
 
-1. Create the target namespace(s) with `pod-security.kubernetes.io/enforce=restricted` and apply namespace-wide `default-deny` `NetworkPolicy` manifests plus explicit egress/ingress rules allowing target recovery Jobs to reach only CoreDNS (`53/UDP`, `53/TCP`) and the **isolated target** PostgreSQL endpoint (`5432/TCP`).
+1. Create the target namespace(s) with `pod-security.kubernetes.io/enforce=restricted` and apply namespace-wide `default-deny` `NetworkPolicy` manifests plus explicit egress/ingress rules allowing target recovery Jobs to reach only CoreDNS (`53/UDP`, `53/TCP`) and the **isolated target** PostgreSQL endpoint (`5432/TCP`) **before** creating any Pods, Jobs, or Deployments.
 2. On the isolated target PostgreSQL 18 instance, create the five disjoint login roles with fresh random passwords, create the `openmettle` database owned by `openmettle_owner`, and apply the required `PUBLIC` revocations and runtime `CONNECT` grants (`pg_dump --schema=openmettle` omits database and `public`-schema ACLs, which `openmettle-migrate` verifies when schema `>= 1` is already recorded):
 
 ```sql
@@ -88,7 +90,7 @@ rm -f "$PGPASSFILE"
 ```
 
 2. Run `openmettle-migrate` (`OPENMETTLE_MIGRATE_DATABASE_URL` = target `openmettle_owner` URL) so any forward migrations between `manifest.json`'s `schema_version` and `CORE_COMMIT` apply cleanly, role boundaries (`src/boundaries.sql`) are verified, and global/schema owner default-ACL revocations (`pg_default_acl` `defaclnamespace = 0`) are re-established.
-3. Because `backup capture` runs inside an active maintenance window (`ADR 0046`), the restored `openmettle.backup_maintenance_gate` row boots with `maintenance_active = true` (`publishing` state in `openmettle.backup_runs`). Keep maintenance active until Step 5e completes.
+3. Because `backup capture` exports its `pg_dump` snapshot inside an active maintenance window while the `openmettle.backup_runs` row is in `'draining'` state (prior to post-dump publication, `ADR 0046`), `openmettle.backup_maintenance_gate.maintenance_active = true` is the recovery invariant after `pg_restore` + `openmettle-migrate`. Keep maintenance active until Step 5e completes.
 
 ---
 
@@ -98,8 +100,8 @@ rm -f "$PGPASSFILE"
 
 Carry a single verified journal export file (`SELECTED_JOURNAL` — either a newer off-host `openmettle-admin journal export` file from the same installation `origin`, or `/var/recovery/unpacked/deletion-journal.bin`) through both `restore lock` and `restore replay`:
 
-- **When to pass `--export-complete`:** Pass `--export-complete` on `restore lock` **only** when `SELECTED_JOURNAL`'s `(seq, digest)` matches an independently recorded final watermark captured *after* all primary writes, purges, and external-connection revocations stopped (for example, a clean maintenance-window backup with zero post-backup primary writes before loss, or a fresh `openmettle-admin journal export` taken from an intact stopped/fenced primary). Never pass `--export-complete` merely because an external export has a higher `seq` than the backup.
-- **When post-export primary activity cannot be ruled out:** Whenever writes, purges, or connection revocations could have occurred on primary *after* `SELECTED_JOURNAL` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock` (note the printed `restore_run <RESTORE_RUN_UUID>`), and record audited break-glass acceptance before opening the gate (per `ADR 0045`, `restore accept-coverage-gap` also conservatively transitions `authorized` external connections to `reauth_required`, clears encrypted tokens, and deactivates active connection shares):
+- **When to pass `--export-complete`:** Pass `--export-complete` on `restore lock` **only** when `SELECTED_JOURNAL`'s `(seq, digest)` matches an independently recorded final `(journal_seq, chain_digest)` watermark captured *after* all primary writes, purges, and external-connection revocations stopped (for example, a clean maintenance-window backup with zero post-backup primary writes before loss, or a fresh `openmettle-admin journal export` taken from an intact stopped/fenced primary). Never pass `--export-complete` merely because an external export has a higher `seq` than the backup.
+- **When post-export primary activity cannot be ruled out:** Whenever writes, purges, or connection revocations could have occurred on primary *after* `SELECTED_JOURNAL` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock`, record the printed `restore_run <RESTORE_RUN_UUID>`, and run audited break-glass acceptance before opening the gate (per `ADR 0045`, `restore accept-coverage-gap` also conservatively transitions `authorized` external connections to `reauth_required`, clears encrypted tokens, and deactivates active connection shares):
 
 ```sh
 openmettle-admin restore accept-coverage-gap \
@@ -109,7 +111,7 @@ openmettle-admin restore accept-coverage-gap \
   --reason "post-export primary activity before loss cannot be ruled out"
 ```
 
-Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`) and lock the gate:
+Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`), lock the gate, and record the printed `restore_run <RESTORE_RUN_UUID>` (also used in Step 5e):
 
 ```sh
 # Include --export-complete ONLY when (REQUIRED_SEQ, REQUIRED_DIGEST_HEX) is certified complete after primary quiescence.
@@ -239,7 +241,7 @@ openmettle-admin vault status
 openmettle-admin vault rotate \
   --vault-keys /etc/openmettle/vault-keys/keyring.json \
   --operator-id "$OPERATOR_UUID" \
-  --request-key "restore-vault-rotate-1" \
+  --request-key "restore-vault-rotate-$RESTORE_RUN_UUID" \
   --reason "re-seal recovered external connections onto target vault key"
 ```
 
@@ -326,16 +328,18 @@ SELECT openmettle.quota_release_terminal_runs(
 );
 ```
 
-### 5e. Release snapshot maintenance gate, re-verify accounting, and scrub staging
+### 5e. Release snapshot maintenance gate, verify `maintenance_active = false`, re-verify accounting, and scrub staging
 
-Run `backup release-maintenance` **last** (after Steps 5a–5d complete), re-verify zero drift, and remove plaintext staging:
+Run `backup release-maintenance` **last** (after Steps 5a–5d complete), binding `--request-key` to `RESTORE_RUN_UUID` so a repeated recovery against a backup carrying an earlier recovery's `authorization_audit` row never short-circuits as an idempotent replay, verify `"maintenance_active": false` via `openmettle-admin backup status`, re-verify zero drift, and remove plaintext staging:
 
 ```sh
 openmettle-admin backup release-maintenance \
   --operator-id "$OPERATOR_UUID" \
-  --request-key "restore-release-maintenance-1" \
+  --request-key "restore-release-maintenance-$RESTORE_RUN_UUID" \
   --reason "isolated restore pre-worker reconciliation complete" \
   --abort-active-run
+
+openmettle-admin backup status
 
 # Include /var/lib/openmettle/artifacts when manifest.artifact_volume.volume_id is non-null:
 openmettle-admin quota verify /var/lib/openmettle/artifacts
@@ -350,7 +354,7 @@ rm -rf /var/recovery/unpacked
 2. Wait for `Deployment/<release>-api`, `Deployment/<release>-worker`, and any configured `Deployment/<release>-gateway-*` to report Ready and `GET /readyz` -> `200`.
 3. Verify post-restore functional and security invariants before recording `recovery_completed_at` and signing off:
    - Pre-restore session cookies/tokens and post-backup disabled accounts return `401 unauthenticated`.
-   - Newly authenticated sessions see surviving personal and project conversations, shared project artifacts, and authorized connections with intact ownership and role boundaries (`404 not_found` across personal scopes and non-members; `403 policy` on `Viewer` writes).
+   - Newly authenticated sessions see surviving personal and shared project conversations, shared project artifacts, and authorized connections with intact ownership and role boundaries (`404 not_found` across personal scopes and authenticated non-members; `403 policy` on `Viewer` writes).
    - Revisions declared lost in Step 4c return `200` metadata (`state: "lost"`, non-null `lost_at`) and `410 Gone` (`code: "payload_lost"`) on `/content` for authorized readers, while remaining `404` for unauthorized callers.
    - Post-backup purged revisions (`409 conflict` on `/content`, `state = 'purged'`, `0` resurrected files on disk) and revoked/disconnected connections (`404` for former sharees; `NULL` ciphertext) remain purged/revoked.
    - Retained revisions keep their exact pre-backup `purge_after` deadline (not reset from wall-clock restore time).
