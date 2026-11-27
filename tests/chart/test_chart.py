@@ -3158,7 +3158,7 @@ class BackupCronJobTest(Rendered):
             "backup=null",
         ]
         cases = (
-            ((), [*common_optional, "database.issuance=null"]),
+            ((), [*common_optional, "database.issuance=null", "api.settings.issuanceDbMaxConnections=null"]),
             (("auth-enabled.yaml",), common_optional),
         )
         for overlays, unset_optional in cases:
@@ -3168,11 +3168,15 @@ class BackupCronJobTest(Rendered):
                     self.assertEqual(res.returncode, 0, res.stderr)
                     docs = [d for d in yaml.safe_load_all(res.stdout) if d]
                     self.assertEqual(docs, render(overlays))
-        for extra in ((), (SKIP,)):
-            with self.subTest(auth_enabled_missing_issuance=True, extra=extra):
-                res = helm_template(("auth-enabled.yaml",), ["database.issuance=null"], extra=extra)
-                self.assertNotEqual(res.returncode, 0)
-                self.assertIn("issuance", res.stderr)
+        for missing_auth_field, needle in (
+            ("database.issuance=null", "issuance"),
+            ("api.settings.issuanceDbMaxConnections=null", "issuanceDbMaxConnections"),
+        ):
+            for extra in ((), (SKIP,)):
+                with self.subTest(missing_auth_field=missing_auth_field, extra=extra):
+                    res = helm_template(("auth-enabled.yaml",), [missing_auth_field], extra=extra)
+                    self.assertNotEqual(res.returncode, 0)
+                    self.assertIn(needle, res.stderr)
 
     def test_rendered_keyring_staging_scripts_enforce_referenced_and_non_dot_keys(self):
         """Executes rendered stage-vault-keys and prepare-backup-runtime scripts against valid, missing and dot-prefixed keys."""

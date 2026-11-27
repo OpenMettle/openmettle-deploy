@@ -457,6 +457,9 @@
           "database": {
             "required": ["issuance"],
             "properties": {"issuance": {"properties": {"existingSecret": {"minLength": 1}}}}
+          },
+          "api": {
+            "properties": {"settings": {"required": ["issuanceDbMaxConnections"]}}
           }
         }
       },
@@ -766,7 +769,7 @@
       "description": "processSettings plus the API-only session issuance pool size (core ADR 0030), with the same 1-64 bound as dbMaxConnections.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["dbMaxConnections", "dbTimeoutMs", "shutdownTimeoutMs", "issuanceDbMaxConnections"],
+      "required": ["dbMaxConnections", "dbTimeoutMs", "shutdownTimeoutMs"],
       "properties": {
         "dbMaxConnections": {"$ref": "#/$defs/processSettings/properties/dbMaxConnections"},
         "dbTimeoutMs": {"$ref": "#/$defs/processSettings/properties/dbTimeoutMs"},
