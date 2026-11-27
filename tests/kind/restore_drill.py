@@ -237,9 +237,15 @@ def decode_base64_export_bytes(b64_text: str) -> bytes:
 def _parse_i64(raw: str, label: str) -> int:
     if not re.fullmatch(r"[+-]?[0-9]+", raw, re.ASCII):
         raise DrillFailure(f"malformed {label} integer in journal export: {raw!r}")
-    val = int(raw)
+    neg = raw.startswith("-")
+    digits = raw[1:] if raw[0] in "+-" else raw
+    stripped = digits.lstrip("0") or "0"
+    if len(stripped) > 19:
+        raise DrillFailure(f"out-of-range {label} integer in journal export")
+    mag = int(stripped)
+    val = -mag if neg else mag
     if val < -(2**63) or val > (2**63 - 1):
-        raise DrillFailure(f"out-of-range {label} integer in journal export: {raw!r}")
+        raise DrillFailure(f"out-of-range {label} integer in journal export")
     return val
 
 
@@ -326,14 +332,20 @@ def verify_persisted_post_restore_journal(
     *,
     expected_origin_us: int,
     min_seq: int,
-    lost_revision_ids: list[str] | tuple[str, ...],
+    expected_min_digest: str,
+    expected_lost_revisions: list[tuple[str, str, str]] | tuple[tuple[str, str, str], ...],
 ) -> dict:
     """Verify a post-restore `deletion_journal` export read back as raw `bytes` against
     `openmettle-core`'s complete `Export::parse` (`src/restore.rs`) and `deletion_journal_replay`
-    (`0042`/`0044`) SHA-256, header, baseline, chain digest, sequence, per-event-kind, and
-    watermark invariants plus expected `artifact_revision.lost` IDs."""
+    (`0042`/`0044`) SHA-256, header, baseline, chain digest, sequence, lifecycle transitions,
+    certified prefix checkpoint (`min_seq`, `expected_min_digest`), and post-watermark
+    `artifact_revision.lost` `(revision_id, scope_id, content_digest)` commitments."""
     if not isinstance(raw_bytes, (bytes, bytearray)):
         raise DrillFailure(f"persisted post-restore journal must be raw bytes, got {type(raw_bytes).__name__}")
+    if isinstance(min_seq, bool) or not isinstance(min_seq, int) or min_seq < 0:
+        raise DrillFailure(f"invalid min_seq for persisted post-restore journal: {min_seq!r}")
+    if not _is_hex64(expected_min_digest):
+        raise DrillFailure(f"invalid expected_min_digest for persisted post-restore journal: {expected_min_digest!r}")
     raw = bytes(raw_bytes)
     idx = raw.rfind(b"\nsha256 ")
     if idx == -1:
@@ -377,7 +389,8 @@ def verify_persisted_post_restore_journal(
     genesis = "0" * 64
     lifecycle_origin_us: int | None = None
     lifecycle_baseline_digest: str | None = None
-    baseline_entities: set[str] = set()
+    ever_retained_or_baseline: set[str] = set()
+    current_state: dict[str, str] = {}
     if (peek := peek_line()) is not None and peek.startswith("lifecycle_origin"):
         lc_parts = (next_line() or "").split(" ")
         if len(lc_parts) != 2 or lc_parts[0] != "lifecycle_origin":
@@ -416,7 +429,8 @@ def verify_persisted_post_restore_journal(
             if pol_rev is not None and pol_rev <= 0:
                 raise DrillFailure("non-positive baseline policy revision in journal export")
             folded = _baseline_step(folded, entity, scope, state, r_us, a_us, p_us, content, pol_rev)
-            baseline_entities.add(entity)
+            ever_retained_or_baseline.add(entity)
+            current_state[entity] = state
             prev_entity = entity
         if folded != lifecycle_baseline_digest:
             raise DrillFailure("lifecycle baseline digest mismatch in journal export")
@@ -428,9 +442,7 @@ def verify_persisted_post_restore_journal(
             raise DrillFailure("malformed connection_origin in journal export")
         connection_origin_us = _parse_i64(co_parts[1], "connection_origin")
 
-    records: list[tuple[int, str, str, str]] = []
-    retained_entities: set[str] = set()
-    terminal_entities: set[str] = set()
+    records: list[tuple[int, str, str, str, str, str]] = []
     prev_chain = genesis
     watermark: tuple[int, str] | None = None
     while (line := next_line()) is not None:
@@ -479,20 +491,19 @@ def verify_persisted_post_restore_journal(
                 raise DrillFailure(
                     f"journal record {seq} chain digest mismatch: got {chain}, expected {expected_chain}"
                 )
-            if entity in terminal_entities:
+            if current_state.get(entity) in ("purged", "lost"):
                 raise DrillFailure(f"journal record {seq} conflicts with prior terminal revision commitment")
             if (
                 lifecycle_origin_us is not None
                 and at_us > lifecycle_origin_us
-                and entity not in baseline_entities
-                and entity not in retained_entities
+                and entity not in ever_retained_or_baseline
             ):
                 raise DrillFailure(
                     f"post-upgrade purge record {seq} for {entity} lacks baseline or prior retained commitment"
                 )
-            terminal_entities.add(entity)
+            current_state[entity] = "purged"
             prev_chain = chain
-            records.append((seq, kind, entity, chain))
+            records.append((seq, kind, entity, scope, content, chain))
         elif len(fields) == 11 and watermark is None:
             seq_s, at_s, kind, entity, scope, after_s, purged_s, content, policy_s, chain, retained_s = fields
             is_conn = kind in (
@@ -556,18 +567,25 @@ def verify_persisted_post_restore_journal(
                     f"journal record {seq} chain digest mismatch: got {chain}, expected {expected_chain}"
                 )
             if kind == "artifact_revision.retained":
-                if entity in terminal_entities:
-                    raise DrillFailure(f"journal record {seq} cannot retain terminal revision {entity}")
-                retained_entities.add(entity)
-            elif kind in ("artifact_revision.deadline_adjusted", "artifact_revision.restored"):
-                if entity in terminal_entities or (entity not in baseline_entities and entity not in retained_entities):
+                if current_state.get(entity) in ("purging", "purged", "lost"):
+                    raise DrillFailure(f"journal record {seq} cannot retain revision in state {current_state[entity]!r}")
+                ever_retained_or_baseline.add(entity)
+                current_state[entity] = "retained"
+            elif kind == "artifact_revision.deadline_adjusted":
+                if current_state.get(entity) != "retained" or entity not in ever_retained_or_baseline:
                     raise DrillFailure(
-                        f"journal record {seq} {kind} for {entity} lacks baseline or prior retained commitment"
+                        f"journal record {seq} {kind} for {entity} requires current retained state and prior commitment"
                     )
+            elif kind == "artifact_revision.restored":
+                if current_state.get(entity) != "retained" or entity not in ever_retained_or_baseline:
+                    raise DrillFailure(
+                        f"journal record {seq} {kind} for {entity} requires current retained state and prior commitment"
+                    )
+                current_state[entity] = "active"
             elif kind == "artifact_revision.lost":
-                if entity in terminal_entities:
+                if current_state.get(entity) in ("purged", "lost"):
                     raise DrillFailure(f"journal record {seq} conflicts with prior terminal revision commitment")
-                terminal_entities.add(entity)
+                current_state[entity] = "lost"
             elif kind == "external_connection.disconnected":
                 expected_conn_digest = hashlib.sha256(f"disconnect:{entity}:{pol}".encode("utf-8")).hexdigest()
                 if content != expected_conn_digest:
@@ -579,13 +597,13 @@ def verify_persisted_post_restore_journal(
                         f"invalid external_connection.credential_superseded content digest at seq {seq}"
                     )
             prev_chain = chain
-            records.append((seq, kind, entity, chain))
+            records.append((seq, kind, entity, scope, content, chain))
         else:
             raise DrillFailure(f"malformed line in journal export: {line!r}")
 
     if watermark is None:
         raise DrillFailure("missing watermark in journal export")
-    expected_tail = (records[-1][0], records[-1][3]) if records else (0, genesis)
+    expected_tail = (records[-1][0], records[-1][5]) if records else (0, genesis)
     if watermark != expected_tail:
         raise DrillFailure(f"watermark {watermark!r} does not match last record {expected_tail!r}")
 
@@ -593,22 +611,43 @@ def verify_persisted_post_restore_journal(
         raise DrillFailure(
             f"persisted post-restore journal origin mismatch: got {origin_us}, expected {expected_origin_us}"
         )
-    if lost_revision_ids and watermark[0] <= min_seq:
+    if expected_lost_revisions and watermark[0] <= min_seq:
         raise DrillFailure(
             f"persisted post-restore journal seq {watermark[0]} did not advance past {min_seq}"
         )
-    if not lost_revision_ids and watermark[0] < min_seq:
+    if not expected_lost_revisions and watermark[0] < min_seq:
         raise DrillFailure(
             f"persisted post-restore journal seq {watermark[0]} regressed behind {min_seq}"
         )
 
-    lost_revs = {entity for _, kind, entity, _ in records if kind == "artifact_revision.lost"}
-    for rev_id in lost_revision_ids:
-        if not smoke.UUID.fullmatch(rev_id):
-            raise DrillFailure(f"invalid expected lost revision UUID: {rev_id!r}")
-        if rev_id not in lost_revs:
+    if min_seq == 0:
+        if expected_min_digest != genesis:
             raise DrillFailure(
-                f"persisted post-restore journal export missing artifact_revision.lost for {rev_id}"
+                f"persisted post-restore journal digest at certified seq 0 mismatch: got {genesis}, expected {expected_min_digest}"
+            )
+    elif records[min_seq - 1][5] != expected_min_digest:
+        raise DrillFailure(
+            f"persisted post-restore journal digest at certified seq {min_seq} mismatch: "
+            f"got {records[min_seq - 1][5]}, expected {expected_min_digest}"
+        )
+
+    post_min_lost = {
+        entity: (scope, content)
+        for seq, kind, entity, scope, content, _ in records
+        if kind == "artifact_revision.lost" and seq > min_seq
+    }
+    for rev_id, exp_scope, exp_sha256 in expected_lost_revisions:
+        if not (smoke.UUID.fullmatch(rev_id) and smoke.UUID.fullmatch(exp_scope) and _is_hex64(exp_sha256)):
+            raise DrillFailure(f"invalid expected lost revision descriptor: {(rev_id, exp_scope, exp_sha256)!r}")
+        observed = post_min_lost.get(rev_id)
+        if observed is None:
+            raise DrillFailure(
+                f"persisted post-restore journal export missing post-watermark artifact_revision.lost for {rev_id} beyond seq {min_seq}"
+            )
+        if observed != (exp_scope, exp_sha256):
+            raise DrillFailure(
+                f"persisted post-restore artifact_revision.lost metadata mismatch for {rev_id}: "
+                f"got {observed!r}, expected {(exp_scope, exp_sha256)!r}"
             )
     return {
         "origin_us": origin_us,
@@ -2756,7 +2795,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
 
         res_ids_raw = self.psql_superuser(
             PRIMARY_DB_NS,
-            "SELECT id::text, reservation_id::text,"
+            "SELECT id::text, scope_id::text, reservation_id::text,"
             " coalesce((extract(epoch FROM purge_after) * 1000000)::bigint::text, ''),"
             " size_bytes, encode(content_digest, 'hex')"
             " FROM openmettle.artifact_revisions"
@@ -2766,8 +2805,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         rev_meta = {}
         for row in res_ids_raw.splitlines():
             if row:
-                rid, res_id, purge_after_us, size_s, sha_hex = row.split("|")
+                rid, scope_id, res_id, purge_after_us, size_s, sha_hex = row.split("|")
                 rev_meta[rid] = {
+                    "scope_id": scope_id,
                     "reservation_id": res_id,
                     "purge_after_us": purge_after_us,
                     "size_bytes": int(size_s),
@@ -4225,11 +4265,14 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         persisted_export_b64, _ = self.run_job(TARGET_APP_NS, read_post_export_job)
         persisted_export_bytes = decode_base64_export_bytes(persisted_export_b64)
         pre_wm = recovery_meta["pre_restore_journal_watermarks"]
+        lost_rev_id = primary_state["art_to_lose"]["revision_id"]
+        lost_meta = primary_state["rev_meta"][lost_rev_id]
         verify_persisted_post_restore_journal(
             persisted_export_bytes,
             expected_origin_us=pre_wm["origin_us"],
             min_seq=pre_wm["required_seq"],
-            lost_revision_ids=[primary_state["art_to_lose"]["revision_id"]],
+            expected_min_digest=pre_wm["required_digest"],
+            expected_lost_revisions=[(lost_rev_id, lost_meta["scope_id"], lost_meta["sha256"])],
         )
 
         # Confirm primary environment remained completely untouched (rev_to_lose still active & 200 on primary).

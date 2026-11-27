@@ -31,22 +31,26 @@ DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
 DEFAULT_LOST_REVISION_ID = "99999999-9999-4999-8999-999999999995"
 DEFAULT_FIXTURE_SCOPE_ID = "22222222-2222-4222-8222-222222222222"
+DEFAULT_LOST_CONTENT_DIGEST = hashlib.sha256(b"drill-unrecoverable-payload-bytes\n").hexdigest()
 
 
 def build_six_record_journal_fixture(
     lost_entity: str = DEFAULT_LOST_REVISION_ID,
     scope_id: str = DEFAULT_FIXTURE_SCOPE_ID,
+    *,
+    purged_content_digest: str = DIGEST_A,
+    lost_content_digest: str = DEFAULT_LOST_CONTENT_DIGEST,
 ) -> tuple[list[str], list[str], bytes]:
     """Build a six-record deletion journal fixture with valid `deletion_journal_digest` chains."""
     conn_id = "11111111-1111-4111-8111-111111111115"
     conn_disconnect_digest = hashlib.sha256(f"disconnect:{conn_id}:1".encode("utf-8")).hexdigest()
     specs = [
-        (1, 1795450010000000, "artifact_revision.purged", "11111111-1111-4111-8111-111111111111", scope_id, None, 1795450009000000, 1795450010000000, DIGEST_A, 1),
+        (1, 1795450010000000, "artifact_revision.purged", "11111111-1111-4111-8111-111111111111", scope_id, None, 1795450009000000, 1795450010000000, purged_content_digest, 1),
         (2, 1795450011000000, "artifact_revision.retained", "11111111-1111-4111-8111-111111111112", scope_id, 1795450011000000, 1795450020000000, None, DIGEST_A, 1),
         (3, 1795450012000000, "artifact_revision.deadline_adjusted", "11111111-1111-4111-8111-111111111112", scope_id, 1795450011000000, 1795450025000000, None, DIGEST_A, 2),
         (4, 1795450013000000, "artifact_revision.restored", "11111111-1111-4111-8111-111111111112", scope_id, None, None, None, DIGEST_A, None),
         (5, 1795450014000000, "external_connection.disconnected", conn_id, scope_id, None, None, None, conn_disconnect_digest, 1),
-        (6, 1795450015000000, "artifact_revision.lost", lost_entity, scope_id, None, None, 1795450015000000, DIGEST_A, None),
+        (6, 1795450015000000, "artifact_revision.lost", lost_entity, scope_id, None, None, 1795450015000000, lost_content_digest, None),
     ]
     records: list[str] = []
     chains: list[str] = []
@@ -245,6 +249,7 @@ class JournalAndRebindParserTest(unittest.TestCase):
     def test_verify_persisted_post_restore_journal_checks_sha256_watermark_and_lost_records(self):
         rev_lost = DEFAULT_LOST_REVISION_ID
         scope_id = DEFAULT_FIXTURE_SCOPE_ID
+        expected_lost = [(rev_lost, scope_id, DEFAULT_LOST_CONTENT_DIGEST)]
 
         def make_export_bytes(
             records: list[str],
@@ -267,19 +272,28 @@ class JournalAndRebindParserTest(unittest.TestCase):
             return body_b + trailer
 
         base_records, chains, valid = build_six_record_journal_fixture(rev_lost, scope_id)
+        min_digest = chains[4]
         self.assertEqual(chains[0], "15cf6556c7336ea2839a714d64201432a08031de004b90a6eec4d2f7caee26c1")
         # Round-trip via base64 even with `\r\n` log line-ending normalization.
         b64_log = base64.encodebytes(valid).decode("ascii").replace("\n", "\r\n").replace("\r\n", "\n")
         decoded_valid = restore_drill.decode_base64_export_bytes(b64_log)
         wm = restore_drill.verify_persisted_post_restore_journal(
-            decoded_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            decoded_valid,
+            expected_origin_us=1795450000000000,
+            min_seq=5,
+            expected_min_digest=min_digest,
+            expected_lost_revisions=expected_lost,
         )
         self.assertEqual(wm["required_seq"], 6)
         self.assertEqual(wm["required_digest"], chains[-1])
 
         with self.assertRaisesRegex(restore_drill.DrillFailure, "raw bytes"):
             restore_drill.verify_persisted_post_restore_journal(
-                valid.decode("utf-8"), expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]  # type: ignore[arg-type]
+                valid.decode("utf-8"),  # type: ignore[arg-type]
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         # CRLF regression: stored CRLF export transferred safely over base64 + text logs still fails SHA-256!
@@ -289,20 +303,32 @@ class JournalAndRebindParserTest(unittest.TestCase):
         self.assertEqual(decoded_crlf, crlf_stored)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
-                decoded_crlf, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                decoded_crlf,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         # Even if CRLF bytes carry a matching SHA-256 over the CRLF body, CR bytes in body MUST fail closed.
         crlf_rehashed = make_export_bytes(base_records, seq=6, tail_chain=chains[-1], eol="\r\n", sum_eol="\n")
         with self.assertRaisesRegex(restore_drill.DrillFailure, "carriage returns"):
             restore_drill.verify_persisted_post_restore_journal(
-                crlf_rehashed, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                crlf_rehashed,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         tampered = valid.replace(rev_lost.encode("ascii"), b"99999999-9999-4999-8999-999999999999")
         with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
-                tampered, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                tampered,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         # Baseline canonical integer parsing & hashing (`01` and `+1` accepted and hashed as `1`, not raw text):
@@ -319,7 +345,11 @@ class JournalAndRebindParserTest(unittest.TestCase):
                 base_records, seq=6, tail_chain=chains[-1], baseline_lines=[b_line], baseline_digest=canonical_b_digest
             )
             wm_b = restore_drill.verify_persisted_post_restore_journal(
-                ok_baseline, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                ok_baseline,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
             self.assertEqual(wm_b["lifecycle_baseline_digest"], canonical_b_digest)
 
@@ -332,8 +362,176 @@ class JournalAndRebindParserTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "lifecycle baseline digest mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
-                bad_baseline, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                bad_baseline,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
+
+        # Divergent pre-watermark history (different chain digest at min_seq=5) MUST fail certified checkpoint check:
+        _, alt_chains, alt_valid = build_six_record_journal_fixture(
+            rev_lost, scope_id, purged_content_digest=DIGEST_B
+        )
+        self.assertNotEqual(alt_chains[4], min_digest)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "digest at certified seq 5 mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                alt_valid,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+
+        # Loss recorded at or before min_seq MUST NOT satisfy a post-watermark declared loss:
+        lost_at_seq5_chain = restore_drill.compute_journal_record_chain_digest(
+            chains[3],
+            seq=5,
+            kind="artifact_revision.lost",
+            entity=rev_lost,
+            scope=scope_id,
+            recorded_us=1795450014000000,
+            purged_us=1795450014000000,
+            content_digest=DEFAULT_LOST_CONTENT_DIGEST,
+            policy_rev=None,
+        )
+        other_rev = "99999999-9999-4999-8999-999999999999"
+        lost_at_seq6_chain = restore_drill.compute_journal_record_chain_digest(
+            lost_at_seq5_chain,
+            seq=6,
+            kind="artifact_revision.lost",
+            entity=other_rev,
+            scope=scope_id,
+            recorded_us=1795450015000000,
+            purged_us=1795450015000000,
+            content_digest=DEFAULT_LOST_CONTENT_DIGEST,
+            policy_rev=None,
+        )
+        pre_wm_lost_export = make_export_bytes(
+            [
+                *base_records[:4],
+                f"5 1795450014000000 artifact_revision.lost {rev_lost} {scope_id} - 1795450014000000 {DEFAULT_LOST_CONTENT_DIGEST} - {lost_at_seq5_chain} -",
+                f"6 1795450015000000 artifact_revision.lost {other_rev} {scope_id} - 1795450015000000 {DEFAULT_LOST_CONTENT_DIGEST} - {lost_at_seq6_chain} -",
+            ],
+            seq=6,
+            tail_chain=lost_at_seq6_chain,
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "missing post-watermark artifact_revision.lost"):
+            restore_drill.verify_persisted_post_restore_journal(
+                pre_wm_lost_export,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=lost_at_seq5_chain,
+                expected_lost_revisions=expected_lost,
+            )
+
+        # Restored revision returning to `active` cannot later take `deadline_adjusted` without re-retaining,
+        # whereas `restored` -> `purged` (seq <= lifecycle_origin) or fresh `retained` -> `purged` is allowed:
+        adj_after_restore_chain = restore_drill.compute_journal_record_chain_digest(
+            chains[-1],
+            seq=7,
+            kind="artifact_revision.deadline_adjusted",
+            entity="11111111-1111-4111-8111-111111111112",
+            scope=scope_id,
+            recorded_us=1795450016000000,
+            retained_us=1795450011000000,
+            after_us=1795450026000000,
+            content_digest=DIGEST_A,
+            policy_rev=3,
+        )
+        adj_after_restore_bytes = make_export_bytes(
+            [
+                *base_records,
+                f"7 1795450016000000 artifact_revision.deadline_adjusted 11111111-1111-4111-8111-111111111112 {scope_id} 1795450026000000 - {DIGEST_A} 3 {adj_after_restore_chain} 1795450011000000",
+            ],
+            seq=7,
+            tail_chain=adj_after_restore_chain,
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "requires current retained state"):
+            restore_drill.verify_persisted_post_restore_journal(
+                adj_after_restore_bytes,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )
+
+        purged_after_restore_chain = restore_drill.compute_journal_record_chain_digest(
+            chains[-1],
+            seq=7,
+            kind="artifact_revision.purged",
+            entity="11111111-1111-4111-8111-111111111112",
+            scope=scope_id,
+            recorded_us=1795450016000000,
+            after_us=1795450025000000,
+            purged_us=1795450016000000,
+            content_digest=DIGEST_A,
+            policy_rev=2,
+        )
+        purged_after_restore_bytes = make_export_bytes(
+            [
+                *base_records,
+                f"7 1795450016000000 artifact_revision.purged 11111111-1111-4111-8111-111111111112 {scope_id} 1795450025000000 1795450016000000 {DIGEST_A} 2 {purged_after_restore_chain}",
+            ],
+            seq=7,
+            tail_chain=purged_after_restore_chain,
+        )
+        wm_purged_after_restore = restore_drill.verify_persisted_post_restore_journal(
+            purged_after_restore_bytes,
+            expected_origin_us=1795450000000000,
+            min_seq=5,
+            expected_min_digest=min_digest,
+            expected_lost_revisions=expected_lost,
+        )
+        self.assertEqual(wm_purged_after_restore["required_seq"], 7)
+
+        # Expected scope_id / content_digest mismatch on artifact_revision.lost MUST fail:
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "metadata mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=[(rev_lost, scope_id, DIGEST_A)],
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "metadata mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=[(rev_lost, "33333333-3333-4333-8333-333333333333", DEFAULT_LOST_CONTENT_DIGEST)],
+            )
+
+        # Long zero-padded decimal integers (>4300 digits) match Rust i64::from_str, and true overflow raises DrillFailure:
+        zero_padded_seq = ("+" + ("0" * 5000) + "1")
+        long_seq_records = [f"{zero_padded_seq} " + base_records[0].split(" ", 1)[1], *base_records[1:]]
+        long_seq_bytes = make_export_bytes(long_seq_records, seq=6, tail_chain=chains[-1])
+        self.assertEqual(
+            restore_drill.verify_persisted_post_restore_journal(
+                long_seq_bytes,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
+            )["required_seq"],
+            6,
+        )
+        long_wm_text = (
+            "openmettle.deletion_journal.export/1\n"
+            f"origin {'0' * 5000}1\n"
+            f"watermark +{'0' * 5000}1 {'0' * 5000}0 {GENESIS} 2\n"
+            f"sha256 {GENESIS}\n"
+        )
+        self.assertEqual(restore_drill.parse_journal_export_watermarks(long_wm_text)["origin_us"], 1)
+        overflow_wm_text = (
+            "openmettle.deletion_journal.export/1\n"
+            f"origin 1{'0' * 5000}\n"
+            f"watermark 1 0 {GENESIS} 2\n"
+            f"sha256 {GENESIS}\n"
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "out-of-range"):
+            restore_drill.parse_journal_export_watermarks(overflow_wm_text)
 
         # Bad chain digest on record 1 even with matching watermark & file sha256 MUST fail replay parity:
         bad_chain = make_export_bytes(
@@ -343,7 +541,11 @@ class JournalAndRebindParserTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "chain digest mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
-                bad_chain, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[]
+                bad_chain,
+                expected_origin_us=1795450000000000,
+                min_seq=0,
+                expected_min_digest=GENESIS,
+                expected_lost_revisions=[],
             )
 
         # Retained Review #15 malformed fixture (starts at seq 6, omits lifecycle_origin, '-' for purged_us):
@@ -355,20 +557,32 @@ class JournalAndRebindParserTest(unittest.TestCase):
         )
         with self.assertRaises(restore_drill.DrillFailure):
             restore_drill.verify_persisted_post_restore_journal(
-                malformed_combined, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                malformed_combined,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         # Individual Export::parse rejection cases:
         no_lifecycle = make_export_bytes([base_records[-1]], seq=6, tail_chain=chains[-1], with_lifecycle=False)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing lifecycle_origin"):
             restore_drill.verify_persisted_post_restore_journal(
-                no_lifecycle, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[rev_lost]
+                no_lifecycle,
+                expected_origin_us=1795450000000000,
+                min_seq=0,
+                expected_min_digest=GENESIS,
+                expected_lost_revisions=expected_lost,
             )
 
         seq_gap = make_export_bytes([base_records[-1]], seq=6, tail_chain=chains[-1], with_lifecycle=True)
         with self.assertRaisesRegex(restore_drill.DrillFailure, "out of sequence"):
             restore_drill.verify_persisted_post_restore_journal(
-                seq_gap, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                seq_gap,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         missing_purged_us = make_export_bytes(
@@ -379,7 +593,11 @@ class JournalAndRebindParserTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "malformed artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
-                missing_purged_us, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                missing_purged_us,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         # Post-lifecycle purged without baseline/prior retained MUST fail replay parity:
@@ -404,18 +622,30 @@ class JournalAndRebindParserTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "lacks baseline or prior retained commitment"):
             restore_drill.verify_persisted_post_restore_journal(
-                post_lc_purged, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[]
+                post_lc_purged,
+                expected_origin_us=1795450000000000,
+                min_seq=0,
+                expected_min_digest=GENESIS,
+                expected_lost_revisions=[],
             )
 
-        _, _, other_valid = build_six_record_journal_fixture("99999999-9999-4999-8999-999999999999", scope_id)
-        with self.assertRaisesRegex(restore_drill.DrillFailure, "missing artifact_revision.lost"):
+        _, _, other_valid = build_six_record_journal_fixture(other_rev, scope_id)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "missing post-watermark artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
-                other_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+                other_valid,
+                expected_origin_us=1795450000000000,
+                min_seq=5,
+                expected_min_digest=min_digest,
+                expected_lost_revisions=expected_lost,
             )
 
         with self.assertRaisesRegex(restore_drill.DrillFailure, "did not advance past 6"):
             restore_drill.verify_persisted_post_restore_journal(
-                valid, expected_origin_us=1795450000000000, min_seq=6, lost_revision_ids=[rev_lost]
+                valid,
+                expected_origin_us=1795450000000000,
+                min_seq=6,
+                expected_min_digest=chains[-1],
+                expected_lost_revisions=expected_lost,
             )
 
 
@@ -1160,6 +1390,13 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("openmettle.local_sessions", step6)
         self.assertIn("closed_signin_pending_auth_verification", step6)
         self.assertIn("docs/operator/login-admission-limit.psql", step6)
+        self.assertIn("503 Service Unavailable", step6)
+        self.assertIn("404 Not Found", step6)
+        self.assertIn("openmettle.user_capability_grants", step6)
+        self.assertIn("openmettle.user_capability_denies", step6)
+        self.assertIn("openmettle.platform_capability_denies", step6)
+        self.assertIn("openmettle.grant_assignments", step6)
+        self.assertIn("openmettle.grant_changes", step6)
 
         m_sh = _re.search(r"```sh\n(.*?)\n[ \t]*```", step5b, _re.DOTALL)
         self.assertIsNotNone(m_sh)
@@ -1812,12 +2049,13 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                     "aaaa0000-0000-4000-8000-000000000004|5|25\n",
                 )
             if "FROM openmettle.artifact_revisions" in stdin_text and "WHERE id IN" in stdin_text:
+                scope_id = DEFAULT_FIXTURE_SCOPE_ID
                 return self._res(
                     0,
-                    f"99999999-9999-4999-8999-999999999993|99999999-9999-4999-8999-999999999990|1800000000000000|27|{'1' * 64}\n"
-                    f"99999999-9999-4999-8999-999999999994|99999999-9999-4999-8999-999999999991||30|{'2' * 64}\n"
-                    f"99999999-9999-4999-8999-999999999995|99999999-9999-4999-8999-999999999995||34|{'3' * 64}\n"
-                    f"99999999-9999-4999-8999-999999999997|99999999-9999-4999-8999-999999999997||37|{'4' * 64}\n",
+                    f"99999999-9999-4999-8999-999999999993|{scope_id}|99999999-9999-4999-8999-999999999990|1800000000000000|27|{'1' * 64}\n"
+                    f"99999999-9999-4999-8999-999999999994|{scope_id}|99999999-9999-4999-8999-999999999991||30|{'2' * 64}\n"
+                    f"{DEFAULT_LOST_REVISION_ID}|{scope_id}|{DEFAULT_LOST_REVISION_ID}||34|{DEFAULT_LOST_CONTENT_DIGEST}\n"
+                    f"99999999-9999-4999-8999-999999999997|{scope_id}|99999999-9999-4999-8999-999999999997||37|{'4' * 64}\n",
                 )
             if "DO $provider_epoch$" in stdin_text and "setval" not in stdin_text:
                 if self.transport_fail_on_epoch_probe:
