@@ -185,10 +185,59 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
 
    If `already_purged = true`, **do not** run `storage declare-lost` — step 4 below (`storage rebind --replace-adoption-run "$BARRIER_UUID"`) completes that already-journaled purge cleanly.
 
-2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. First verify `/var/recovery/unpacked/artifacts/revisions` itself is a readable, searchable, listable non-symlink directory (so missing directory permissions cannot make `-e "$cand"` return false on an intact file); similarly inspect `/var/backups/openmettle` if present before treating a `backup-*` glob as empty. Then require `$cand` to be a readable regular non-symlink file and verify its byte length and SHA-256 against `(size_bytes, sha256)` from step 1 without masking exit status behind pipelines; any directory-inspection, read, stat, or digest failure **must stop reconciliation immediately** rather than falling through to `storage declare-lost`. If verified intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
+2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. First verify `/var/recovery/unpacked/artifacts/revisions` itself is a readable, searchable, listable non-symlink directory (so missing directory permissions cannot make `-e "$cand"` return false on an intact file); similarly walk every component of `/var/backups/openmettle` from `/` so an inaccessible ancestor or directory stops reconciliation instead of letting `-e "$media_dir"` return false (`EACCES`) on an existing media directory. Then require `$cand` to be a readable regular non-symlink file and verify its byte length and SHA-256 against `(size_bytes, sha256)` from step 1 without masking exit status behind pipelines; any directory-inspection, read, stat, or digest failure **must stop reconciliation immediately** rather than falling through to `storage declare-lost`. If verified intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
 
    ```sh
    set -eu
+   check_no_media_archives() {
+     media_target="$1"
+     if [ ! -d "/" ] || [ ! -x "/" ]; then
+       echo "ERROR: root directory / is inaccessible; refusing storage declare-lost" >&2
+       exit 1
+     fi
+     cur=""
+     rest="${media_target#/}"
+     while [ -n "$rest" ]; do
+       case "$rest" in
+         */*)
+           comp="${rest%%/*}"
+           rest="${rest#*/}"
+           ;;
+         *)
+           comp="$rest"
+           rest=""
+           ;;
+       esac
+       [ -n "$comp" ] || continue
+       next_path="$cur/$comp"
+       if [ -z "$rest" ]; then
+         if [ ! -e "$next_path" ] && [ ! -L "$next_path" ]; then
+           return 0
+         fi
+         if [ -L "$next_path" ] || [ ! -d "$next_path" ] || [ ! -r "$next_path" ] || [ ! -x "$next_path" ] || ! ls -A -- "$next_path" >/dev/null; then
+           echo "ERROR: recovery media directory $next_path is inaccessible or not a directory; refusing storage declare-lost" >&2
+           exit 1
+         fi
+         for archive_cand in "$next_path"/backup-*; do
+           if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then
+             echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2
+             exit 1
+           fi
+         done
+         return 0
+       else
+         if [ ! -e "$next_path" ] && [ ! -L "$next_path" ]; then
+           return 0
+         fi
+         if [ ! -d "$next_path" ] || [ ! -x "$next_path" ]; then
+           echo "ERROR: recovery media ancestor $next_path is inaccessible or not a directory; refusing storage declare-lost" >&2
+           exit 1
+         fi
+         cur="$next_path"
+       fi
+     done
+   }
+
    rev_dir="/var/recovery/unpacked/artifacts/revisions"
    if [ -L "$rev_dir" ] || [ ! -d "$rev_dir" ] || [ ! -r "$rev_dir" ] || [ ! -x "$rev_dir" ] || ! ls -A -- "$rev_dir" >/dev/null; then
      echo "ERROR: staging revisions directory $rev_dir is missing or inaccessible; refusing storage declare-lost" >&2
@@ -212,19 +261,7 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
      fi
    fi
    if [ "$recovered" -eq 0 ]; then
-     media_dir="/var/backups/openmettle"
-     if [ -e "$media_dir" ] || [ -L "$media_dir" ]; then
-       if [ -L "$media_dir" ] || [ ! -d "$media_dir" ] || [ ! -r "$media_dir" ] || [ ! -x "$media_dir" ] || ! ls -A -- "$media_dir" >/dev/null; then
-         echo "ERROR: recovery media directory $media_dir is inaccessible; refusing storage declare-lost" >&2
-         exit 1
-       fi
-     fi
-     for archive_cand in "$media_dir"/backup-*; do
-       if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then
-         echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2
-         exit 1
-       fi
-     done
+     check_no_media_archives "/var/backups/openmettle"
    fi
    ```
 
@@ -345,6 +382,7 @@ Bumping provider generation fences pre-restore cookies/bearers and pending login
 
 - Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), family-policy schedules and model rules (`openmettle.family_policies`, `openmettle.family_policy_models` `rule_kind IN ('disabled', 'study_allow')`, audited under `family_policy.*` in `openmettle.authorization_audit`, `ADR 0044`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records.
   - Because `openmettle-admin family set-policy` replaces `zone`, `quiet`, `study`, and `override_group_schedules` (`ADR 0044`), run **`openmettle-admin family set-model` directly** when an active `openmettle.family_policies` row already exists in the restored snapshot and only model rules (`family_policy.model_*`) changed post-backup (preserving existing schedules). Run `openmettle-admin family set-policy` **with the complete audited schedule** (`--zone`, plus `--quiet`, `--study`, and `--override-group-schedules` whenever set in `authorization_audit.details`) only when `family_policy.set` occurred post-backup (or `family clear-policy` for `family_policy.clear`).
+  - Reconcile the **final** post-backup state once per grantee policy and once per `(rule_kind, model)` rule (folding intermediate toggles such as `disable -> enable -> disable` or earlier schedule edits rather than replaying superseded events whose request keys would collide and be skipped as idempotent replays), or include the unique `$AUDIT_ROW_ID` in the SHA-256 request-key input if replaying ordered audit rows individually.
   - Always derive `--request-key` from a fixed-width SHA-256 hash (`restore-fp-$RESTORE_RUN_UUID-<hash>` / `restore-fm-$RESTORE_RUN_UUID-<hash>`, 112 bytes <= the CLI's 128-byte limit) so valid model identifiers up to 256 UTF-8 bytes remain recoverable:
 
   ```sh
@@ -361,10 +399,10 @@ Bumping provider generation fences pre-restore cookies/bearers and pending login
     --request-key "$fm_key" \
     --reason "reconcile post-backup disabled model rule before reopening inference"
 
-  # Case 2: family_policy.set also occurred post-backup (supply the complete recorded schedule
-  # before re-applying post-backup model rules; omit --quiet/--study/--override-group-schedules
+  # Case 2: family_policy.set also occurred post-backup (supply the complete final schedule
+  # before re-applying final post-backup model rules; omit --quiet/--study/--override-group-schedules
   # only when those fields were unset in authorization_audit.details):
-  fp_hash="$(printf '%s\0%s\0set' "$RESTORE_RUN_UUID" "$RESTRICTED_USER_UUID" | sha256sum)"
+  fp_hash="$(printf '%s\0%s\0set\0%s\0%s\0%s\0%s' "$RESTORE_RUN_UUID" "$RESTRICTED_USER_UUID" "$POLICY_TZ" "${QUIET_WINDOW:-}" "${STUDY_WINDOW:-}" "${OVERRIDE_FLAG:-0}" | sha256sum)"
   fp_key="restore-fp-$RESTORE_RUN_UUID-${fp_hash%% *}"
   openmettle-admin family set-policy \
     --user "$RESTRICTED_USER_UUID" \

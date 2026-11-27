@@ -315,7 +315,8 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         lost_sha = hashlib.sha256(lost_bytes).hexdigest()
 
         barrier = "55555555-5555-4555-8555-555555555555"
-        media = tmp / "media"
+        media_parent = tmp / "media_parent"
+        media = media_parent / "openmettle"
         script = restore_drill.build_step4c_reconcile_lines(
             selected_journal=str(tmp / "post.export"),
             artifacts_mount=str(artifacts),
@@ -393,12 +394,24 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
             self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
 
         # Negative test 4: if any encrypted backup archive copy remains reachable under `recovery_media_dir`,
-        # OR `recovery_media_dir` itself exists but is inaccessible as non-root, `storage declare-lost`
-        # MUST be refused before executing.
+        # OR `recovery_media_dir` itself or any ancestor directory is inaccessible as non-root,
+        # `storage declare-lost` MUST be refused before executing.
         (artifacts / "revisions" / rec_res).unlink(missing_ok=True)
-        log_file.write_text("", encoding="utf-8")
         (media / "backup-20261127T090000Z-66666666-6666-4666-8666-666666666666").mkdir(parents=True)
         if os.geteuid() != 0:
+            log_file.write_text("", encoding="utf-8")
+            media_parent.chmod(0o000)
+            try:
+                res_parent_unreadable = subprocess.run(
+                    ["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True
+                )
+            finally:
+                media_parent.chmod(0o700)
+            self.assertNotEqual(res_parent_unreadable.returncode, 0)
+            self.assertIn("recovery media ancestor", res_parent_unreadable.stderr)
+            self.assertIn("inaccessible", res_parent_unreadable.stderr)
+            self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+
             log_file.write_text("", encoding="utf-8")
             media.chmod(0o000)
             try:
@@ -411,6 +424,7 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
             self.assertIn("recovery media directory", res_media_unreadable.stderr)
             self.assertIn("inaccessible", res_media_unreadable.stderr)
             self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+        log_file.write_text("", encoding="utf-8")
         res_avail = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
         self.assertNotEqual(res_avail.returncode, 0)
         self.assertIn("remains available", res_avail.stderr)
@@ -432,6 +446,38 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertNotIn("family set-policy", model_only)
         self.assertIn("openmettle-admin family set-model --user", model_only)
         self.assertIn("--kind disabled --model 'a' --enable", model_only)
+
+        # Repeated toggles (`disable -> enable -> disable`) or repeated `set-policy` updates fold
+        # cleanly to one final authoritative command so `openmettle-admin` idempotent request-key
+        # replay cannot leave stale state active.
+        toggled_enable = restore_drill.build_family_policy_reconcile_lines(
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            [{"user_id": uid, "policy": None, "models": [("disabled", "a", True), ("disabled", "a", False), ("disabled", "a", True)]}],
+        )
+        toggled_lines = [ln for ln in toggled_enable.splitlines() if ln.strip()]
+        self.assertEqual(len(toggled_lines), 1)
+        self.assertIn("--kind disabled --model 'a' --enable", toggled_lines[0])
+
+        toggled_disable = restore_drill.build_family_policy_reconcile_lines(
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            [{"user_id": uid, "policy": None, "models": [("disabled", "a", True), ("disabled", "a", False)]}],
+        )
+        self.assertEqual(len([ln for ln in toggled_disable.splitlines() if ln.strip()]), 1)
+        self.assertIn("--kind disabled --model 'a' --disable", toggled_disable)
+
+        repeated_policy = restore_drill.build_family_policy_reconcile_lines(
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            [
+                {"user_id": uid, "policy": {"zone": "UTC"}, "models": []},
+                {"user_id": uid, "policy": {"zone": "Europe/London", "quiet": "22:00-07:00"}, "models": []},
+            ],
+        )
+        rp_lines = [ln for ln in repeated_policy.splitlines() if ln.strip()]
+        self.assertEqual(len(rp_lines), 1)
+        self.assertIn('--zone "Europe/London" --quiet "22:00-07:00"', rp_lines[0])
 
         # Policy + model change passes the complete recorded schedule (--zone, --quiet, --study,
         # --override-group-schedules) before set-model.
@@ -1201,7 +1247,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if "EXISTS (SELECT 1 FROM openmettle.login_provider_revisions WHERE epoch = 41)" in stdin_text:
                 return self._res(0, "100|0|f\n")
             if "family_policy_permits(" in stdin_text:
-                return self._res(0, "t\n")
+                self.assertIn("::text", stdin_text)
+                return self._res(0, "true\n")
             if "FROM openmettle.runs r WHERE r.id =" in stdin_text and "openmettle.run_events" in stdin_text:
                 return self._res(0, self.forced_run_diag_row + "\n")
             if "openmettle.operations" in stdin_text:
@@ -1217,7 +1264,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 q_end = int(qm.group(3)) * 60 + int(qm.group(4))
                 return self._res(
                     0,
-                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|Europe/London:{q_start}:{q_end}:960:1080:t:2|t|1800000000000000|purged|t|f|"
+                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|Europe/London:{q_start}:{q_end}:960:1080:true:2|t|1800000000000000|purged|t|f|"
                     "5:5:1:5|run-terminal:openmettle.run-cancelled|"
                     "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
                     "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1\n",
@@ -1294,7 +1341,10 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return 200, v1_hdrs, json.dumps({"items": []}).encode()
             run_id = path.rsplit("/", 1)[1]
             if self.forced_run_poll_state is not None and not run_id.startswith("aaaa0000"):
-                state = self.forced_run_poll_state
+                if isinstance(self.forced_run_poll_state, list):
+                    state = self.forced_run_poll_state.pop(0) if len(self.forced_run_poll_state) > 1 else self.forced_run_poll_state[0]
+                else:
+                    state = self.forced_run_poll_state
                 if hasattr(self, "_fake_clock"):
                     self._fake_clock["t"] += 25.0
             else:
@@ -1595,6 +1645,14 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertEqual(rc_fail, 1)
         self.assertIn("entered terminal state 'failed'", sum_fail["error"])
         self.assertIn("test-upstream-timeout", sum_fail["error"])
+
+        # Non-terminal `cancelling` MUST continue polling until `cancelled` + `run-terminal` arrive.
+        self.forced_run_poll_state = ["cancelling", "cancelled"]
+        self.forced_run_diag_row = "cancelled||revoked|1:run-terminal:openmettle.run-cancelled:{\"reason\":\"revoked\"}"
+        rc_cancelling, sum_cancelling = self._run_drill()
+        self.assertEqual(rc_cancelling, 1)
+        self.assertIn("entered terminal state 'cancelled'", sum_cancelling["error"])
+        self.assertIn("openmettle.run-cancelled", sum_cancelling["error"])
 
         self._fake_clock = {"t": 1000.0}
         self.forced_run_poll_state = "queued"

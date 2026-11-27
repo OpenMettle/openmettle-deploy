@@ -730,47 +730,40 @@ def build_family_policy_reconcile_lines(
         "override_group_schedules": bool}` carrying the complete recorded schedule when
         `family_policy.set` occurred post-backup
       - `models`: sequence of `(kind, model, enable)` tuples (`kind` in `{"disabled",
-        "study_allow"}`, `enable` bool). Uses SHA-256-bounded request keys (`<= 128` bytes for
-        every valid 1..=256-byte model identifier).
+        "study_allow"}`, `enable` bool).
+
+    Validates all inputs in order and folds repeated updates per `(user_id, rule_kind, model)`
+    and grantee policy to the final audited state so toggle sequences such as
+    `disable -> enable -> disable` (or repeated `set-policy` schedule changes) never collide on
+    idempotent `--request-key` replay and leave the wrong state active. Uses SHA-256-bounded
+    request keys (`<= 128` bytes for every valid 1..=256-byte model identifier).
     """
     for label, val in (("operator_id", operator_id), ("restore_run_id", restore_run_id)):
         if not smoke.UUID.fullmatch(val):
             raise DrillFailure(f"invalid {label} UUID: {val!r}")
-    lines: list[str] = []
+    per_user: dict[str, dict] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             raise DrillFailure(f"expected family policy reconcile entry dict, got {entry!r}")
         user_id = entry.get("user_id", "")
         if not smoke.UUID.fullmatch(user_id):
             raise DrillFailure(f"invalid restricted user UUID: {user_id!r}")
+        state = per_user.setdefault(user_id, {"policy": None, "models": {}})
         policy = entry.get("policy")
         if policy == "clear":
-            policy_key = _family_request_key("restore-fp", restore_run_id, user_id, "clear")
-            lines.append(
-                f'openmettle-admin family clear-policy --user "{user_id}" '
-                f'--operator-id "{operator_id}" --request-key "{policy_key}" '
-                '--reason "reconcile post-backup family policy clearance before reopening inference"'
-            )
+            state["policy"] = "clear"
         elif isinstance(policy, dict):
             zone = policy.get("zone", "")
             if not isinstance(zone, str) or not re.fullmatch(r"[A-Za-z0-9/+_.-]{1,128}", zone):
                 raise DrillFailure(f"invalid family policy timezone: {zone!r}")
             quiet = policy.get("quiet")
             study = policy.get("study")
-            override = bool(policy.get("override_group_schedules", False))
-            parts = [f'openmettle-admin family set-policy --user "{user_id}" --zone "{zone}"']
-            if quiet is not None:
-                parts.append(f'--quiet "{_validate_hhmm_window("quiet", quiet)}"')
-            if study is not None:
-                parts.append(f'--study "{_validate_hhmm_window("study", study)}"')
-            if override:
-                parts.append("--override-group-schedules")
-            policy_key = _family_request_key("restore-fp", restore_run_id, user_id, "set")
-            parts.append(
-                f'--operator-id "{operator_id}" --request-key "{policy_key}" '
-                '--reason "reconcile post-backup family policy before reopening inference"'
-            )
-            lines.append(" ".join(parts))
+            state["policy"] = {
+                "zone": zone,
+                "quiet": _validate_hhmm_window("quiet", quiet) if quiet is not None else None,
+                "study": _validate_hhmm_window("study", study) if study is not None else None,
+                "override_group_schedules": bool(policy.get("override_group_schedules", False)),
+            }
         elif policy is not None:
             raise DrillFailure(f"invalid family policy directive: {policy!r}")
 
@@ -780,6 +773,42 @@ def build_family_policy_reconcile_lines(
             if not isinstance(enable, bool):
                 raise DrillFailure(f"invalid family policy enable flag: {enable!r}")
             _validate_model_name(model)
+            key = (kind, model)
+            state["models"].pop(key, None)
+            state["models"][key] = enable
+
+    lines: list[str] = []
+    for user_id, state in per_user.items():
+        final_policy = state["policy"]
+        if isinstance(final_policy, dict):
+            zone = final_policy["zone"]
+            quiet = final_policy["quiet"]
+            study = final_policy["study"]
+            override = final_policy["override_group_schedules"]
+            parts = [f'openmettle-admin family set-policy --user "{user_id}" --zone "{zone}"']
+            if quiet is not None:
+                parts.append(f'--quiet "{quiet}"')
+            if study is not None:
+                parts.append(f'--study "{study}"')
+            if override:
+                parts.append("--override-group-schedules")
+            policy_key = _family_request_key(
+                "restore-fp",
+                restore_run_id,
+                user_id,
+                "set",
+                zone,
+                quiet or "",
+                study or "",
+                "1" if override else "0",
+            )
+            parts.append(
+                f'--operator-id "{operator_id}" --request-key "{policy_key}" '
+                '--reason "reconcile post-backup family policy before reopening inference"'
+            )
+            lines.append(" ".join(parts))
+
+        for (kind, model), enable in state["models"].items():
             state_bit = "1" if enable else "0"
             model_key = _family_request_key("restore-fm", restore_run_id, user_id, kind, model, state_bit)
             flag = "--enable" if enable else "--disable"
@@ -788,6 +817,14 @@ def build_family_policy_reconcile_lines(
                 f'--model {_sh_quote(model)} {flag} '
                 f'--operator-id "{operator_id}" --request-key "{model_key}" '
                 '--reason "reconcile post-backup family model rule before reopening inference"'
+            )
+
+        if final_policy == "clear":
+            policy_key = _family_request_key("restore-fp", restore_run_id, user_id, "clear")
+            lines.append(
+                f'openmettle-admin family clear-policy --user "{user_id}" '
+                f'--operator-id "{operator_id}" --request-key "{policy_key}" '
+                '--reason "reconcile post-backup family policy clearance before reopening inference"'
             )
     return ("\n".join(lines) + "\n") if lines else ""
 
@@ -809,9 +846,9 @@ def build_step4c_reconcile_lines(
        files by byte length + SHA-256 without masking read/stat/digest exit codes (aborting
        reconciliation rather than falling through to `storage declare-lost` on error), and
        restore any intact payload (`chmod 0600`),
-    3) verify recovery_media_dir (when present) is inspectable and contains no remaining backup
-       archive before reserving `storage declare-lost` strictly for revisions confirmed
-       absent/corrupt in all recovery copies,
+    3) walk every path component of recovery_media_dir from `/` to verify positive proof that
+       the path is either genuinely absent below searchable ancestors or an inspectable directory
+       holding zero remaining `backup-*` archives before invoking `storage declare-lost`,
     4) resume `storage rebind --replace-adoption-run` -> `restore replay` -> `quota verify`."""
     _validate_posix_abs_path("selected_journal", selected_journal)
     _validate_posix_abs_path("artifacts_mount", artifacts_mount)
@@ -822,6 +859,54 @@ def build_step4c_reconcile_lines(
     lines = [f'openmettle-admin restore replay --db-only "{selected_journal}"']
     if failed_revisions:
         lines.append(
+            "check_no_media_archives() {\n"
+            '  media_target="$1"\n'
+            '  if [ ! -d "/" ] || [ ! -x "/" ]; then\n'
+            '    echo "ERROR: root directory / is inaccessible; refusing storage declare-lost" >&2\n'
+            "    exit 1\n"
+            "  fi\n"
+            '  cur=""\n'
+            '  rest="${media_target#/}"\n'
+            '  while [ -n "$rest" ]; do\n'
+            '    case "$rest" in\n'
+            "      */*)\n"
+            '        comp="${rest%%/*}"\n'
+            '        rest="${rest#*/}"\n'
+            "        ;;\n"
+            "      *)\n"
+            '        comp="$rest"\n'
+            '        rest=""\n'
+            "        ;;\n"
+            "    esac\n"
+            '    [ -n "$comp" ] || continue\n'
+            '    next_path="$cur/$comp"\n'
+            '    if [ -z "$rest" ]; then\n'
+            '      if [ ! -e "$next_path" ] && [ ! -L "$next_path" ]; then\n'
+            "        return 0\n"
+            "      fi\n"
+            '      if [ -L "$next_path" ] || [ ! -d "$next_path" ] || [ ! -r "$next_path" ] || [ ! -x "$next_path" ] || ! ls -A -- "$next_path" >/dev/null; then\n'
+            '        echo "ERROR: recovery media directory $next_path is inaccessible or not a directory; refusing storage declare-lost" >&2\n'
+            "        exit 1\n"
+            "      fi\n"
+            '      for archive_cand in "$next_path"/backup-*; do\n'
+            '        if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then\n'
+            '          echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2\n'
+            "          exit 1\n"
+            "        fi\n"
+            "      done\n"
+            "      return 0\n"
+            "    else\n"
+            '      if [ ! -e "$next_path" ] && [ ! -L "$next_path" ]; then\n'
+            "        return 0\n"
+            "      fi\n"
+            '      if [ ! -d "$next_path" ] || [ ! -x "$next_path" ]; then\n'
+            '        echo "ERROR: recovery media ancestor $next_path is inaccessible or not a directory; refusing storage declare-lost" >&2\n'
+            "        exit 1\n"
+            "      fi\n"
+            '      cur="$next_path"\n'
+            "    fi\n"
+            "  done\n"
+            "}\n"
             f'rev_dir="{unpacked_dir}/artifacts/revisions"\n'
             'if [ -L "$rev_dir" ] || [ ! -d "$rev_dir" ] || [ ! -r "$rev_dir" ] || [ ! -x "$rev_dir" ] || ! ls -A -- "$rev_dir" >/dev/null; then\n'
             '  echo "ERROR: staging revisions directory $rev_dir is missing or inaccessible; refusing storage declare-lost" >&2\n'
@@ -867,18 +952,7 @@ def build_step4c_reconcile_lines(
             "  fi\n"
             "fi\n"
             'if [ "$recovered" -eq 0 ]; then\n'
-            f'  if [ -e "{recovery_media_dir}" ] || [ -L "{recovery_media_dir}" ]; then\n'
-            f'    if [ -L "{recovery_media_dir}" ] || [ ! -d "{recovery_media_dir}" ] || [ ! -r "{recovery_media_dir}" ] || [ ! -x "{recovery_media_dir}" ] || ! ls -A -- "{recovery_media_dir}" >/dev/null; then\n'
-            f'      echo "ERROR: recovery media directory {recovery_media_dir} is inaccessible; refusing storage declare-lost" >&2\n'
-            "      exit 1\n"
-            "    fi\n"
-            "  fi\n"
-            f'  for archive_cand in "{recovery_media_dir}"/backup-*; do\n'
-            '    if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then\n'
-            '      echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2\n'
-            "      exit 1\n"
-            "    fi\n"
-            "  done\n"
+            f'  check_no_media_archives "{recovery_media_dir}"\n'
             f'  openmettle-admin storage declare-lost "{artifacts_mount}" '
             f'--revision "{rev_id}" --operator-id "{operator_id}" '
             f'--request-key "drill-lost-{rev_id}" '
@@ -1723,7 +1797,9 @@ class RestoreDrill:
             last_state = last_doc.get("state")
             if last_state == "succeeded":
                 return last_doc
-            if last_state not in ("queued", "running", "waiting"):
+            if last_state in ("failed", "cancelled", "interrupted") or last_state not in (
+                "queued", "running", "waiting", "cancelling", "reconciling"
+            ):
                 diag = self._run_diagnostics(db_ns, run_id)
                 raise DrillFailure(
                     f"{description}: run {run_id} entered terminal state {last_state!r} "
@@ -2050,7 +2126,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f"SELECT openmettle.family_policy_permits('{USER_D_IDS['user']}'::uuid, "
             f"'{USER_D_IDS['approval']}'::uuid, '{smoke.CATALOG_MODEL}', now())::text;",
         ).strip()
-        self.expect(pre_permits == "t", f"expected user_d pre-backup family schedule to permit model, got {pre_permits!r}")
+        self.expect(pre_permits == "true", f"expected user_d pre-backup family schedule to permit model, got {pre_permits!r}")
         pre_family_schedule = {
             "zone": "Europe/London",
             "quiet_start": q_start,
@@ -3518,7 +3594,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         sched = primary_state["pre_family_schedule"]
         expected_family_state = (
             f"{sched['zone']}:{sched['quiet_start']}:{sched['quiet_end']}:"
-            f"{sched['study_start']}:{sched['study_end']}:t:2"
+            f"{sched['study_start']}:{sched['study_end']}:true:2"
         )
         sql_checks = self.psql_superuser(
             TARGET_DB_NS,
