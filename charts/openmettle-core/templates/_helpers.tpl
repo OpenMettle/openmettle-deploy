@@ -219,9 +219,15 @@ od -An -tx1 -v < "$stage/$cfg_key" | tr 'A-F \t' 'a-f\n' | {
   }
   valid_key_id() {
     [ "$2" -eq 0 ] && [ -n "$1" ] && [ "${#1}" -le 64 ] || return 1
+    {{- if eq .label "vault" }}
+    case "$1" in
+      *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    {{- else }}
     case "$1" in
       *[!A-Za-z0-9._-]*) return 1 ;;
     esac
+    {{- end }}
     return 0
   }
   validate_key_file_ref() {
@@ -908,30 +914,59 @@ regardless of Helm's template rendering order). Argument: the root context.
 {{- end -}}
 {{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
 {{- $dbEntry := index $.Values.database $dbRole -}}
+{{- $dbRequired := or (eq $dbRole "api") (eq $dbRole "worker") (and (eq $dbRole "migrate") $.Values.migration.enabled) -}}
+{{- if or $dbRequired (not (kindIs "invalid" $dbEntry)) -}}
 {{- if not (kindIs "map" $dbEntry) -}}
 {{- fail (printf "database.%s must be a mapping" $dbRole) -}}
 {{- end -}}
-{{- if not (kindIs "string" (get $dbEntry "existingSecret")) -}}
+{{- $rawDbSec := index $dbEntry "existingSecret" -}}
+{{- if or $dbRequired (not (kindIs "invalid" $rawDbSec)) -}}
+{{- if not (kindIs "string" $rawDbSec) -}}
 {{- fail (printf "database.%s.existingSecret must be a string" $dbRole) -}}
 {{- end -}}
-{{- if not (kindIs "string" (get $dbEntry "key")) -}}
+{{- end -}}
+{{- $rawDbKey := index $dbEntry "key" -}}
+{{- if or $dbRequired (not (kindIs "invalid" $rawDbKey)) -}}
+{{- if not (kindIs "string" $rawDbKey) -}}
 {{- fail (printf "database.%s.key must be a string" $dbRole) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.auth.loginKeysSecretName) -}}
 {{- if not (kindIs "string" .Values.auth.loginKeysSecretName) -}}
 {{- fail "auth.loginKeysSecretName must be a string" -}}
 {{- end -}}
-{{- if not (kindIs "string" (get (default dict .Values.vault) "existingSecret")) -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.vault) -}}
+{{- if not (kindIs "map" .Values.vault) -}}
+{{- fail "vault must be a mapping" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.vault "existingSecret")) -}}
+{{- if not (kindIs "string" (index .Values.vault "existingSecret")) -}}
 {{- fail "vault.existingSecret must be a string" -}}
 {{- end -}}
-{{- if not (kindIs "string" (get (default dict .Values.vault) "configKey")) -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.vault "configKey")) -}}
+{{- if not (kindIs "string" (index .Values.vault "configKey")) -}}
 {{- fail "vault.configKey must be a string" -}}
 {{- end -}}
-{{- if not (kindIs "string" (get (default dict .Values.backup) "existingKeysSecret")) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.backup) -}}
+{{- if not (kindIs "map" .Values.backup) -}}
+{{- fail "backup must be a mapping" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.backup "existingKeysSecret")) -}}
+{{- if not (kindIs "string" (index .Values.backup "existingKeysSecret")) -}}
 {{- fail "backup.existingKeysSecret must be a string" -}}
 {{- end -}}
-{{- if not (kindIs "string" (get (default dict .Values.backup) "keysConfigKey")) -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.backup "keysConfigKey")) -}}
+{{- if not (kindIs "string" (index .Values.backup "keysConfigKey")) -}}
 {{- fail "backup.keysConfigKey must be a string" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if not (kindIs "invalid" .Values.worker.sweepMs) -}}
 {{- include "openmettle-core.validate.intRange" (dict "field" "worker.sweepMs" "value" .Values.worker.sweepMs "min" 1000 "max" 3600000) -}}
@@ -1373,10 +1408,14 @@ provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030
 {{- fail "auth.catalogKey must differ from auth.configKey; the model catalog is a separate file named by catalog_file in auth.json" -}}
 {{- end -}}
 {{- end -}}
-{{- if eq $auth.loginKeysSecretName "" -}}
+{{- $authLoginKeysSecret := "" -}}
+{{- if kindIs "string" $auth.loginKeysSecretName -}}
+{{- $authLoginKeysSecret = $auth.loginKeysSecretName -}}
+{{- end -}}
+{{- if eq $authLoginKeysSecret "" -}}
 {{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
 {{- end -}}
-{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "auth.loginKeysSecretName" "secret" $auth.loginKeysSecretName "reason" "never mount a database URL Secret wholesale into the API login-keys directory") -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "auth.loginKeysSecretName" "secret" $authLoginKeysSecret "reason" "never mount a database URL Secret wholesale into the API login-keys directory") -}}
 {{- include "openmettle-core.validate.caBundle" (dict "path" "auth.providerCaBundle" "bundle" $auth.providerCaBundle) -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
 {{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
@@ -1499,8 +1538,14 @@ stage-vault-keys (never gateway, migrate or backup).
 */ -}}
 {{- $vault := default dict .Values.vault -}}
 {{- $vaultEnabled := default false (get $vault "enabled") -}}
-{{- $vaultSecret := get $vault "existingSecret" -}}
-{{- $vaultConfigKey := get $vault "configKey" -}}
+{{- $vaultSecret := "" -}}
+{{- if kindIs "string" (get $vault "existingSecret") -}}
+{{- $vaultSecret = get $vault "existingSecret" -}}
+{{- end -}}
+{{- $vaultConfigKey := "keyring.json" -}}
+{{- if kindIs "string" (get $vault "configKey") -}}
+{{- $vaultConfigKey = get $vault "configKey" -}}
+{{- end -}}
 {{- if $vaultEnabled -}}
 {{- if eq $vaultSecret "" -}}
 {{- fail "vault.existingSecret is required when vault.enabled is true (an existing Secret holding the vault keyring and 32-byte key files)" -}}
@@ -1523,8 +1568,14 @@ Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
 {{- $adminImage := default dict .Values.images.admin -}}
 {{- $pgClientImage := default dict .Values.images.postgresClient -}}
 {{- $backupDb := default dict .Values.database.backup -}}
-{{- $backupSecret := get $backup "existingKeysSecret" -}}
-{{- $backupKeysKey := get $backup "keysConfigKey" -}}
+{{- $backupSecret := "" -}}
+{{- if kindIs "string" (get $backup "existingKeysSecret") -}}
+{{- $backupSecret = get $backup "existingKeysSecret" -}}
+{{- end -}}
+{{- $backupKeysKey := "keyring.json" -}}
+{{- if kindIs "string" (get $backup "keysConfigKey") -}}
+{{- $backupKeysKey = get $backup "keysConfigKey" -}}
+{{- end -}}
 {{- $backupDest := default dict (get $backup "destination") -}}
 {{- $backupGraphiti := default dict (get $backup "graphiti") -}}
 {{- $backupChroma := default dict (get $backup "chroma") -}}
@@ -1744,9 +1795,12 @@ Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
 {{- $secret := .secret -}}
 {{- $reason := .reason -}}
 {{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
-{{- $dbSec := index $.root.Values.database $dbRole "existingSecret" -}}
-{{- if and (ne $dbSec "") (eq $secret $dbSec) -}}
+{{- $dbEntry := index $.root.Values.database $dbRole -}}
+{{- if kindIs "map" $dbEntry -}}
+{{- $dbSec := index $dbEntry "existingSecret" -}}
+{{- if and (kindIs "string" $dbSec) (ne $dbSec "") (eq $secret $dbSec) -}}
 {{- fail (printf "%s (%q) must differ from database.%s.existingSecret; %s" $field $secret $dbRole $reason) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

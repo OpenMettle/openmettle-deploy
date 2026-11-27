@@ -3142,6 +3142,25 @@ class BackupCronJobTest(Rendered):
             names.add(cron_name)
         self.assertEqual(len(names), 4)
 
+    def test_reuse_values_from_pre_vault_backup_release_renders_cleanly(self):
+        """Fails if helm upgrade --reuse-values from a pre-vault/backup release (lacking database.backup, vault, backup, worker.mcp, images.admin/postgresClient) fails schema or template guards."""
+        unset_new_defaults = [
+            "images.admin=null",
+            "images.postgresClient=null",
+            "database.backup=null",
+            "worker.mcp=null",
+            "networkPolicy.worker.mcp=null",
+            "vault=null",
+            "backup=null",
+        ]
+        for overlays in ((), ("auth-enabled.yaml",)):
+            for extra in ((), (SKIP,)):
+                with self.subTest(overlays=overlays, extra=extra):
+                    res = helm_template(overlays, unset_new_defaults, extra=extra)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    docs = [d for d in yaml.safe_load_all(res.stdout) if d]
+                    self.assertEqual(docs, render(overlays))
+
     def test_rendered_keyring_staging_scripts_enforce_referenced_and_non_dot_keys(self):
         """Executes rendered stage-vault-keys and prepare-backup-runtime scripts against valid, missing and dot-prefixed keys."""
         docs = self.renders["vault-and-backup-enabled"]
@@ -3210,7 +3229,18 @@ class BackupCronJobTest(Rendered):
                         (src / "keyring.json").write_text(bad_doc, encoding="utf-8")
                         bad = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
                         self.assertEqual(bad.returncode, 78, bad.stderr)
-                    # 4. Dot-prefixed Secret entry exits 78.
+                    # 4. Dotted key IDs ("v.1"): core forbids dots in VaultKeyRing IDs (exit 78) and permits them in BackupKeyRing IDs (exit 0).
+                    (src / "k2.key").write_bytes(b"\x24" * 32)
+                    (src / "keyring.json").write_text(json.dumps({
+                        "version": 1, "active_key_id": "v.1",
+                        "keys": [{"id": "v.1", "file": f"{mount_dir}/k1.key"}],
+                    }), encoding="utf-8")
+                    dotted_id = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                    if label == "vault":
+                        self.assertEqual(dotted_id.returncode, 78, dotted_id.stderr)
+                    else:
+                        self.assertEqual(dotted_id.returncode, 0, dotted_id.stderr)
+                    # 5. Dot-prefixed Secret entry exits 78.
                     (src / ".k1.key").write_bytes(b"\x42" * 32)
                     (src / "keyring.json").write_text(json.dumps({
                         "version": 1, "active_key_id": "k1",
