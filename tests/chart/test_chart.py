@@ -2479,6 +2479,31 @@ class NegativeCaseTest(unittest.TestCase):
           "backup.destination.domain=nas.example.test/openmettle",
           "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
          ['backup.existingKeysSecret ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
+        ("non-string boolean database.migrate.existingSecret refused without schema",
+         ["vault.enabled=true"],
+         ["--set-json", "database.migrate.existingSecret=false",
+          "--set-string", "vault.existingSecret=false", SKIP],
+         ["database.migrate.existingSecret must be a string"]),
+        ("non-string numeric database.migrate.existingSecret refused without schema",
+         ["vault.enabled=true"],
+         ["--set-json", "database.migrate.existingSecret=0",
+          "--set-string", "vault.existingSecret=0", SKIP],
+         ["database.migrate.existingSecret must be a string"]),
+        ("non-string boolean database.backup.existingSecret refused without schema",
+         ["vault.enabled=true"],
+         ["--set-json", "database.backup.existingSecret=false",
+          "--set-string", "vault.existingSecret=false", SKIP],
+         ["database.backup.existingSecret must be a string"]),
+        ("string 'false' database.migrate.existingSecret aliasing vault refused without schema",
+         ["vault.enabled=true"],
+         ["--set-string", "database.migrate.existingSecret=false",
+          "--set-string", "vault.existingSecret=false", SKIP],
+         ['vault.existingSecret ("false") must differ from database.migrate.existingSecret']),
+        ("string '0' database.migrate.existingSecret aliasing auth loginKeysSecretName refused without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", ISSUANCE],
+         [*OIDC_PEER, "--set-string", "database.migrate.existingSecret=0",
+          "--set-string", "auth.loginKeysSecretName=0", SKIP],
+         ['auth.loginKeysSecretName ("0") must differ from database.migrate.existingSecret']),
         # Worker external MCP/OAuth egress (V1-14, ADR 0045).
         ("worker mcp enabled without worker inference", ["worker.mcp.enabled=true"],
          ["--set-json", 'networkPolicy.worker.mcp.to=[{"ipBlock":{"cidr":"192.0.2.50/32"}}]'],
@@ -3138,22 +3163,54 @@ class BackupCronJobTest(Rendered):
                     src.mkdir()
                     stage_parent.mkdir()
                     script = raw_script.replace(src_const, str(src)).replace(stage_const, str(stage_parent))
-                    # 1. Valid keyring + 32-byte key succeeds and produces 0700 dir + 0400 files.
+                    # 1. Valid multi-key manifests (both plain and JSON-escaped property names & slashes) succeed.
                     (src / "k1.key").write_bytes(b"\x42" * 32)
-                    (src / "keyring.json").write_text(json.dumps({
-                        "version": 1, "active_key_id": "k1",
-                        "keys": [{"id": "k1", "file": f"{mount_dir}/k1.key"}],
-                    }), encoding="utf-8")
-                    ok = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
-                    self.assertEqual(ok.returncode, 0, ok.stderr)
-                    self.assertEqual((stage_parent / "keys").stat().st_mode & 0o777, 0o700)
-                    self.assertEqual((stage_parent / "keys" / "k1.key").stat().st_mode & 0o777, 0o400)
-                    # 2. Manifest-only Secret (missing referenced key file) exits 78.
-                    (src / "k1.key").unlink()
-                    missing = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
-                    self.assertEqual(missing.returncode, 78, missing.stderr)
-                    self.assertIn(f"missing referenced {label} key file: k1.key", missing.stderr)
-                    # 3. Dot-prefixed Secret entry exits 78.
+                    (src / "k2.key").write_bytes(b"\x24" * 32)
+                    plain_two = json.dumps({
+                        "version": 1, "active_key_id": "k2",
+                        "keys": [
+                            {"id": "k1", "file": f"{mount_dir}/k1.key"},
+                            {"id": "k2", "file": f"{mount_dir}/k2.key"},
+                        ],
+                    })
+                    escaped_mount = mount_dir.replace("/", r"\/")
+                    unicode_mount = mount_dir.replace("/", r"\u002f")
+                    escaped_two = (
+                        "{\n"
+                        '  "active_key_id": "k\\u0032",\n'
+                        '  "\\u006beys": [\n'
+                        f'    {{"f\\u0069le": "{escaped_mount}\\/k1.key", "id": "k1"}},\n'
+                        f'    {{"id": "k2", "f\\u0069le": "{unicode_mount}\\u002fk2.key"}}\n'
+                        "  ],\n"
+                        '  "version": 1\n'
+                        "}\n"
+                    )
+                    for doc_text in (plain_two, escaped_two):
+                        (src / "keyring.json").write_text(doc_text, encoding="utf-8")
+                        ok = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                        self.assertEqual(ok.returncode, 0, ok.stderr)
+                        self.assertEqual((stage_parent / "keys").stat().st_mode & 0o777, 0o700)
+                        self.assertEqual((stage_parent / "keys" / "k1.key").stat().st_mode & 0o777, 0o400)
+                        self.assertEqual((stage_parent / "keys" / "k2.key").stat().st_mode & 0o777, 0o400)
+                        self.assertFalse((stage_parent / ".refs").exists())
+                    # 2. Missing second referenced key file exits 78 under both plain and JSON-escaped encodings.
+                    (src / "k2.key").unlink()
+                    for doc_text in (plain_two, escaped_two):
+                        (src / "keyring.json").write_text(doc_text, encoding="utf-8")
+                        missing = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                        self.assertEqual(missing.returncode, 78, missing.stderr)
+                        self.assertIn(f"missing referenced {label} key file: k2.key", missing.stderr)
+                        self.assertFalse((stage_parent / ".refs").exists())
+                    # 3. Escaped path traversal and malformed/duplicate-member JSON exit 78.
+                    for bad_doc in (
+                        f'{{"version":1,"active_key_id":"k1","keys":[{{"id":"k1","file":"{escaped_mount}\\/..\\/k1.key"}}]}}',
+                        f'{{"version":1,"version":1,"active_key_id":"k1","keys":[{{"id":"k1","file":"{mount_dir}/k1.key"}}]}}',
+                        f'{{"version":1,"extra":true,"active_key_id":"k1","keys":[{{"id":"k1","file":"{mount_dir}/k1.key"}}]}}',
+                    ):
+                        (src / "keyring.json").write_text(bad_doc, encoding="utf-8")
+                        bad = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                        self.assertEqual(bad.returncode, 78, bad.stderr)
+                    # 4. Dot-prefixed Secret entry exits 78.
                     (src / ".k1.key").write_bytes(b"\x42" * 32)
                     (src / "keyring.json").write_text(json.dumps({
                         "version": 1, "active_key_id": "k1",

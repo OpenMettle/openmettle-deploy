@@ -30,8 +30,10 @@ timestamp ("-<ts>") within Kubernetes' 63-character Job name limit.
 
 {{/*
 POSIX /bin/sh snippet staging a Secret volume into 0400 regular files inside a 0700 subdirectory of
-a RAM-backed emptyDir, rejecting dot-prefixed Secret entries and verifying that the keyring JSON
-manifest and every 32-byte key file it references under mountDir exist.
+a RAM-backed emptyDir, rejecting dot-prefixed Secret entries and decoding the RFC 8259 version-1
+keyring JSON manifest (matching core VaultKeyRing/BackupKeyRing: <= 64 KiB, unique fields,
+version == 1, 1..=16 keys, active_key_id in keys, and full JSON string escape decoding) to verify
+every referenced 32-byte key file under mountDir without writing temporary files.
 Arguments: dict "label" "vault|backup" "srcDir" <path> "stageDir" <path> "mountDir" <path> "configKey" <key>
 */}}
 {{- define "openmettle-core.stageKeyringScript" -}}
@@ -39,6 +41,10 @@ stage={{ .stageDir | quote }}
 src_dir={{ .srcDir | quote }}
 mount_dir={{ .mountDir | quote }}
 cfg_key={{ .configKey | quote }}
+die78() {
+  echo "$1" >&2
+  exit 78
+}
 if [ -d "$stage" ]; then
   chmod -R u+w "$stage"
   rm -rf -- "$stage"
@@ -51,8 +57,7 @@ for hidden in "$src_dir"/.*; do
     .|..|..data|..[0-9]*) continue ;;
   esac
   if [ -e "$hidden" ] || [ -L "$hidden" ]; then
-    echo "dot-prefixed {{ .label }} Secret entry is not allowed: $base" >&2
-    exit 78
+    die78 "dot-prefixed {{ .label }} Secret entry is not allowed: $base"
   fi
 done
 for src in "$src_dir"/*; do
@@ -61,23 +66,309 @@ for src in "$src_dir"/*; do
   cp -L -- "$src" "$dst"
   chmod 0400 "$dst"
 done
-[ -f "$stage/$cfg_key" ] || { echo "missing {{ .label }} keyring config: $cfg_key" >&2; exit 78; }
-refs_list="${stage%/*}/.refs"
-tr '\n\r\t{}' '   \n\n' < "$stage/$cfg_key" | sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' > "$refs_list"
-[ -s "$refs_list" ] || { rm -f -- "$refs_list"; echo "invalid {{ .label }} keyring config: missing referenced key files" >&2; exit 78; }
-while IFS= read -r rel_path; do
-  case "$rel_path" in
-    "$mount_dir/"*) rel="${rel_path#"$mount_dir/"}" ;;
-    *) rm -f -- "$refs_list"; echo "{{ .label }} key file outside $mount_dir: $rel_path" >&2; exit 78 ;;
+[ -f "$stage/$cfg_key" ] || die78 "missing {{ .label }} keyring config: $cfg_key"
+cfg_bytes=$(wc -c < "$stage/$cfg_key")
+if [ "$cfg_bytes" -le 0 ] || [ "$cfg_bytes" -gt 65536 ]; then
+  die78 "invalid {{ .label }} keyring config: document size out of bounds"
+fi
+od -An -tx1 -v < "$stage/$cfg_key" | tr 'A-F \t' 'a-f\n' | {
+  CUR=""
+  pop_byte() {
+    while IFS= read -r CUR; do
+      [ -n "$CUR" ] && return 0
+    done
+    CUR=""
+    return 1
+  }
+  pop_non_ws() {
+    while pop_byte; do
+      case "$CUR" in
+        20|09|0a|0d) ;;
+        *) return 0 ;;
+      esac
+    done
+    return 1
+  }
+  hex_digit_val() {
+    case "$1" in
+      30) HVAL=0 ;; 31) HVAL=1 ;; 32) HVAL=2 ;; 33) HVAL=3 ;; 34) HVAL=4 ;;
+      35) HVAL=5 ;; 36) HVAL=6 ;; 37) HVAL=7 ;; 38) HVAL=8 ;; 39) HVAL=9 ;;
+      41|61) HVAL=10 ;; 42|62) HVAL=11 ;; 43|63) HVAL=12 ;;
+      44|64) HVAL=13 ;; 45|65) HVAL=14 ;; 46|66) HVAL=15 ;;
+      *) return 1 ;;
+    esac
+  }
+  read_u16_escape() {
+    U16=0
+    u_idx=0
+    while [ "$u_idx" -lt 4 ]; do
+      pop_byte || die78 "invalid {{ .label }} keyring config: truncated unicode escape"
+      hex_digit_val "$CUR" || die78 "invalid {{ .label }} keyring config: bad unicode escape"
+      U16=$((U16 * 16 + HVAL))
+      u_idx=$((u_idx + 1))
+    done
+  }
+  append_ascii_code() {
+    case "$1" in
+      32) JSTR="${JSTR} " ;; 33) JSTR="${JSTR}!" ;; 34) JSTR="${JSTR}\"" ;;
+      35) JSTR="${JSTR}#" ;; 36) JSTR="${JSTR}\$" ;; 37) JSTR="${JSTR}%" ;;
+      38) JSTR="${JSTR}&" ;; 39) JSTR="${JSTR}'" ;; 40) JSTR="${JSTR}(" ;;
+      41) JSTR="${JSTR})" ;; 42) JSTR="${JSTR}*" ;; 43) JSTR="${JSTR}+" ;;
+      44) JSTR="${JSTR}," ;; 45) JSTR="${JSTR}-" ;; 46) JSTR="${JSTR}." ;;
+      47) JSTR="${JSTR}/" ;; 48) JSTR="${JSTR}0" ;; 49) JSTR="${JSTR}1" ;;
+      50) JSTR="${JSTR}2" ;; 51) JSTR="${JSTR}3" ;; 52) JSTR="${JSTR}4" ;;
+      53) JSTR="${JSTR}5" ;; 54) JSTR="${JSTR}6" ;; 55) JSTR="${JSTR}7" ;;
+      56) JSTR="${JSTR}8" ;; 57) JSTR="${JSTR}9" ;; 58) JSTR="${JSTR}:" ;;
+      59) JSTR="${JSTR};" ;; 60) JSTR="${JSTR}<" ;; 61) JSTR="${JSTR}=" ;;
+      62) JSTR="${JSTR}>" ;; 63) JSTR="${JSTR}?" ;; 64) JSTR="${JSTR}@" ;;
+      65) JSTR="${JSTR}A" ;; 66) JSTR="${JSTR}B" ;; 67) JSTR="${JSTR}C" ;;
+      68) JSTR="${JSTR}D" ;; 69) JSTR="${JSTR}E" ;; 70) JSTR="${JSTR}F" ;;
+      71) JSTR="${JSTR}G" ;; 72) JSTR="${JSTR}H" ;; 73) JSTR="${JSTR}I" ;;
+      74) JSTR="${JSTR}J" ;; 75) JSTR="${JSTR}K" ;; 76) JSTR="${JSTR}L" ;;
+      77) JSTR="${JSTR}M" ;; 78) JSTR="${JSTR}N" ;; 79) JSTR="${JSTR}O" ;;
+      80) JSTR="${JSTR}P" ;; 81) JSTR="${JSTR}Q" ;; 82) JSTR="${JSTR}R" ;;
+      83) JSTR="${JSTR}S" ;; 84) JSTR="${JSTR}T" ;; 85) JSTR="${JSTR}U" ;;
+      86) JSTR="${JSTR}V" ;; 87) JSTR="${JSTR}W" ;; 88) JSTR="${JSTR}X" ;;
+      89) JSTR="${JSTR}Y" ;; 90) JSTR="${JSTR}Z" ;; 91) JSTR="${JSTR}[" ;;
+      92) JSTR="${JSTR}\\" ;; 93) JSTR="${JSTR}]" ;; 94) JSTR="${JSTR}^" ;;
+      95) JSTR="${JSTR}_" ;; 96) JSTR="${JSTR}\`" ;; 97) JSTR="${JSTR}a" ;;
+      98) JSTR="${JSTR}b" ;; 99) JSTR="${JSTR}c" ;; 100) JSTR="${JSTR}d" ;;
+      101) JSTR="${JSTR}e" ;; 102) JSTR="${JSTR}f" ;; 103) JSTR="${JSTR}g" ;;
+      104) JSTR="${JSTR}h" ;; 105) JSTR="${JSTR}i" ;; 106) JSTR="${JSTR}j" ;;
+      107) JSTR="${JSTR}k" ;; 108) JSTR="${JSTR}l" ;; 109) JSTR="${JSTR}m" ;;
+      110) JSTR="${JSTR}n" ;; 111) JSTR="${JSTR}o" ;; 112) JSTR="${JSTR}p" ;;
+      113) JSTR="${JSTR}q" ;; 114) JSTR="${JSTR}r" ;; 115) JSTR="${JSTR}s" ;;
+      116) JSTR="${JSTR}t" ;; 117) JSTR="${JSTR}u" ;; 118) JSTR="${JSTR}v" ;;
+      119) JSTR="${JSTR}w" ;; 120) JSTR="${JSTR}x" ;; 121) JSTR="${JSTR}y" ;;
+      122) JSTR="${JSTR}z" ;; 123) JSTR="${JSTR}{" ;; 124) JSTR="${JSTR}|" ;;
+      125) JSTR="${JSTR}}" ;; 126) JSTR="${JSTR}~" ;;
+      *) JSTR="${JSTR}?"; JSTR_NON_PRINT=1 ;;
+    esac
+  }
+  parse_json_string() {
+    [ "$CUR" = "22" ] || die78 "invalid {{ .label }} keyring config: expected JSON string"
+    JSTR=""
+    JSTR_NON_PRINT=0
+    while pop_byte; do
+      if [ "$CUR" = "22" ]; then
+        return 0
+      fi
+      if [ "$CUR" = "5c" ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: unterminated string escape"
+        case "$CUR" in
+          22) JSTR="${JSTR}\"" ;;
+          5c) JSTR="${JSTR}\\" ;;
+          2f) JSTR="${JSTR}/" ;;
+          62|66|6e|72|74) JSTR="${JSTR}?"; JSTR_NON_PRINT=1 ;;
+          75)
+            read_u16_escape
+            if [ "$U16" -ge 55296 ] && [ "$U16" -le 56319 ]; then
+              pop_byte && [ "$CUR" = "5c" ] || die78 "invalid {{ .label }} keyring config: lone high surrogate"
+              pop_byte && [ "$CUR" = "75" ] || die78 "invalid {{ .label }} keyring config: lone high surrogate"
+              read_u16_escape
+              [ "$U16" -ge 56320 ] && [ "$U16" -le 57343 ] || die78 "invalid {{ .label }} keyring config: invalid surrogate pair"
+              JSTR="${JSTR}?"
+              JSTR_NON_PRINT=1
+            elif [ "$U16" -ge 56320 ] && [ "$U16" -le 57343 ]; then
+              die78 "invalid {{ .label }} keyring config: lone low surrogate"
+            else
+              append_ascii_code "$U16"
+            fi
+            ;;
+          *) die78 "invalid {{ .label }} keyring config: invalid escape sequence" ;;
+        esac
+        continue
+      fi
+      bval=$((0x$CUR))
+      if [ "$bval" -lt 32 ]; then
+        die78 "invalid {{ .label }} keyring config: unescaped control character in string"
+      elif [ "$bval" -lt 128 ]; then
+        append_ascii_code "$bval"
+      elif [ "$bval" -ge 194 ] && [ "$bval" -le 223 ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c1=$((0x$CUR))
+        [ $((c1 & 192)) -eq 128 ] || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        JSTR="${JSTR}?"; JSTR_NON_PRINT=1
+      elif [ "$bval" -ge 224 ] && [ "$bval" -le 239 ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c1=$((0x$CUR))
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c2=$((0x$CUR))
+        [ $((c1 & 192)) -eq 128 ] && [ $((c2 & 192)) -eq 128 ] || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        if { [ "$bval" -eq 224 ] && [ "$c1" -lt 160 ]; } || { [ "$bval" -eq 237 ] && [ "$c1" -ge 160 ]; }; then
+          die78 "invalid {{ .label }} keyring config: overlong or surrogate UTF-8"
+        fi
+        JSTR="${JSTR}?"; JSTR_NON_PRINT=1
+      elif [ "$bval" -ge 240 ] && [ "$bval" -le 244 ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c1=$((0x$CUR))
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c2=$((0x$CUR))
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c3=$((0x$CUR))
+        [ $((c1 & 192)) -eq 128 ] && [ $((c2 & 192)) -eq 128 ] && [ $((c3 & 192)) -eq 128 ] || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        if { [ "$bval" -eq 240 ] && [ "$c1" -lt 144 ]; } || { [ "$bval" -eq 244 ] && [ "$c1" -ge 144 ]; }; then
+          die78 "invalid {{ .label }} keyring config: out-of-range UTF-8"
+        fi
+        JSTR="${JSTR}?"; JSTR_NON_PRINT=1
+      else
+        die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+      fi
+    done
+    die78 "invalid {{ .label }} keyring config: unterminated string"
+  }
+  valid_key_id() {
+    [ "$2" -eq 0 ] && [ -n "$1" ] && [ "${#1}" -le 64 ] || return 1
+    case "$1" in
+      *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+  }
+  validate_key_file_ref() {
+    ref_path="$1"
+    ref_np="$2"
+    [ "$ref_np" -eq 0 ] || die78 "{{ .label }} key file outside $mount_dir: $ref_path"
+    case "$ref_path" in
+      "$mount_dir/"*) rel="${ref_path#"$mount_dir/"}" ;;
+      *) die78 "{{ .label }} key file outside $mount_dir: $ref_path" ;;
+    esac
+    case "$rel" in
+      ""|*/*|.*) die78 "invalid {{ .label }} key file name: $rel" ;;
+    esac
+    [ "$rel" != "$cfg_key" ] || die78 "{{ .label }} key file must differ from keyring config: $rel"
+    [ -f "$stage/$rel" ] || die78 "missing referenced {{ .label }} key file: $rel"
+    [ "$(wc -c < "$stage/$rel")" -eq 32 ] || die78 "{{ .label }} key file must be 32 bytes: $rel"
+  }
+  parse_version_one() {
+    pop_non_ws || die78 "invalid {{ .label }} keyring config: missing version"
+    [ "$CUR" = "31" ] || die78 "invalid {{ .label }} keyring config: version must be 1"
+    pop_byte || die78 "invalid {{ .label }} keyring config: truncated after version"
+    case "$CUR" in
+      20|09|0a|0d) pop_non_ws || die78 "invalid {{ .label }} keyring config: truncated object" ;;
+      2c|7d) ;;
+      *) die78 "invalid {{ .label }} keyring config: version must be integer 1" ;;
+    esac
+  }
+  pop_non_ws || die78 "invalid {{ .label }} keyring config: empty document"
+  [ "$CUR" = "7b" ] || die78 "invalid {{ .label }} keyring config: root must be a JSON object"
+  seen_version=0
+  seen_active=0
+  seen_keys=0
+  active_id=""
+  seen_ids=" "
+  pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated root object"
+  [ "$CUR" != "7d" ] || die78 "invalid {{ .label }} keyring config: missing required fields"
+  while :; do
+    parse_json_string
+    [ "$JSTR_NON_PRINT" -eq 0 ] || die78 "invalid {{ .label }} keyring config: unknown field"
+    top_key="$JSTR"
+    pop_non_ws && [ "$CUR" = "3a" ] || die78 "invalid {{ .label }} keyring config: expected ':'"
+    case "$top_key" in
+      version)
+        [ "$seen_version" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate version field"
+        seen_version=1
+        parse_version_one
+        delim="$CUR"
+        ;;
+      active_key_id)
+        [ "$seen_active" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate active_key_id field"
+        seen_active=1
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: missing active_key_id"
+        parse_json_string
+        valid_key_id "$JSTR" "$JSTR_NON_PRINT" || die78 "invalid {{ .label }} keyring config: invalid active_key_id"
+        active_id="$JSTR"
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: truncated root object"
+        delim="$CUR"
+        ;;
+      keys)
+        [ "$seen_keys" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate keys field"
+        seen_keys=1
+        pop_non_ws && [ "$CUR" = "5b" ] || die78 "invalid {{ .label }} keyring config: keys must be an array"
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated keys array"
+        [ "$CUR" != "5d" ] || die78 "invalid {{ .label }} keyring config: missing referenced key files"
+        key_count=0
+        while :; do
+          [ "$CUR" = "7b" ] || die78 "invalid {{ .label }} keyring config: key entry must be an object"
+          key_count=$((key_count + 1))
+          [ "$key_count" -le 16 ] || die78 "invalid {{ .label }} keyring config: more than 16 keys"
+          entry_seen_id=0
+          entry_seen_file=0
+          entry_id=""
+          entry_file=""
+          entry_file_np=0
+          pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated key entry"
+          [ "$CUR" != "7d" ] || die78 "invalid {{ .label }} keyring config: empty key entry"
+          while :; do
+            parse_json_string
+            [ "$JSTR_NON_PRINT" -eq 0 ] || die78 "invalid {{ .label }} keyring config: unknown key entry field"
+            ekey="$JSTR"
+            pop_non_ws && [ "$CUR" = "3a" ] || die78 "invalid {{ .label }} keyring config: expected ':' in key entry"
+            pop_non_ws || die78 "invalid {{ .label }} keyring config: missing value in key entry"
+            parse_json_string
+            case "$ekey" in
+              id)
+                [ "$entry_seen_id" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate id in key entry"
+                entry_seen_id=1
+                valid_key_id "$JSTR" "$JSTR_NON_PRINT" || die78 "invalid {{ .label }} keyring config: invalid key id"
+                entry_id="$JSTR"
+                ;;
+              file)
+                [ "$entry_seen_file" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate file in key entry"
+                entry_seen_file=1
+                entry_file="$JSTR"
+                entry_file_np="$JSTR_NON_PRINT"
+                ;;
+              *) die78 "invalid {{ .label }} keyring config: unknown key entry field" ;;
+            esac
+            pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated key entry"
+            if [ "$CUR" = "2c" ]; then
+              pop_non_ws || die78 "invalid {{ .label }} keyring config: trailing comma in key entry"
+              continue
+            elif [ "$CUR" = "7d" ]; then
+              break
+            else
+              die78 "invalid {{ .label }} keyring config: malformed key entry"
+            fi
+          done
+          [ "$entry_seen_id" -eq 1 ] && [ "$entry_seen_file" -eq 1 ] || die78 "invalid {{ .label }} keyring config: incomplete key entry"
+          case "$seen_ids" in
+            *" $entry_id "*) die78 "invalid {{ .label }} keyring config: duplicate key id $entry_id" ;;
+          esac
+          seen_ids="${seen_ids}${entry_id} "
+          validate_key_file_ref "$entry_file" "$entry_file_np"
+          pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated keys array"
+          if [ "$CUR" = "2c" ]; then
+            pop_non_ws || die78 "invalid {{ .label }} keyring config: trailing comma in keys array"
+            continue
+          elif [ "$CUR" = "5d" ]; then
+            break
+          else
+            die78 "invalid {{ .label }} keyring config: malformed keys array"
+          fi
+        done
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: truncated root object"
+        delim="$CUR"
+        ;;
+      *) die78 "invalid {{ .label }} keyring config: unknown field" ;;
+    esac
+    if [ "$delim" = "2c" ]; then
+      pop_non_ws || die78 "invalid {{ .label }} keyring config: trailing comma"
+      continue
+    elif [ "$delim" = "7d" ]; then
+      break
+    else
+      die78 "invalid {{ .label }} keyring config: malformed root object"
+    fi
+  done
+  if pop_non_ws; then
+    die78 "invalid {{ .label }} keyring config: trailing data"
+  fi
+  [ "$seen_version" -eq 1 ] && [ "$seen_active" -eq 1 ] && [ "$seen_keys" -eq 1 ] || die78 "invalid {{ .label }} keyring config: missing required fields"
+  case "$seen_ids" in
+    *" $active_id "*) ;;
+    *) die78 "invalid {{ .label }} keyring config: active_key_id missing from keys" ;;
   esac
-  case "$rel" in
-    ""|*/*|.*) rm -f -- "$refs_list"; echo "invalid {{ .label }} key file name: $rel" >&2; exit 78 ;;
-  esac
-  [ "$rel" != "$cfg_key" ] || { rm -f -- "$refs_list"; echo "{{ .label }} key file must differ from keyring config: $rel" >&2; exit 78; }
-  [ -f "$stage/$rel" ] || { rm -f -- "$refs_list"; echo "missing referenced {{ .label }} key file: $rel" >&2; exit 78; }
-  [ "$(wc -c < "$stage/$rel")" -eq 32 ] || { rm -f -- "$refs_list"; echo "{{ .label }} key file must be 32 bytes: $rel" >&2; exit 78; }
-done < "$refs_list"
-rm -f -- "$refs_list"
+} || exit $?
 {{- end -}}
 
 {{/* Labels on every pod of this release, whatever its component. Argument: the root context. */}}
@@ -131,12 +422,27 @@ The schema enforces the same pattern; this guard also holds under --skip-schema-
 {{- end -}}
 {{- end -}}
 
-{{/* Arguments: dict "name" "api|worker|migrate" "ref" <database values> */}}
+{{/* Arguments: dict "name" "api|worker|migrate|issuance|gateway|backup" "ref" <database values> */}}
 {{- define "openmettle-core.databaseUrlEnv" -}}
+{{- if not (kindIs "map" .ref) -}}
+{{- fail (printf "database.%s must be a mapping" .name) -}}
+{{- end -}}
+{{- if not (kindIs "string" .ref.existingSecret) -}}
+{{- fail (printf "database.%s.existingSecret must be a string" .name) -}}
+{{- end -}}
+{{- if eq .ref.existingSecret "" -}}
+{{- fail (printf "database.%s.existingSecret is required (an existing Secret holding the PostgreSQL URL)" .name) -}}
+{{- end -}}
+{{- if not (kindIs "string" .ref.key) -}}
+{{- fail (printf "database.%s.key must be a string" .name) -}}
+{{- end -}}
+{{- if eq .ref.key "" -}}
+{{- fail (printf "database.%s.key is required" .name) -}}
+{{- end -}}
 valueFrom:
   secretKeyRef:
-    name: {{ required (printf "database.%s.existingSecret is required (an existing Secret holding the PostgreSQL URL)" .name) .ref.existingSecret | quote }}
-    key: {{ required (printf "database.%s.key is required" .name) .ref.key | quote }}
+    name: {{ .ref.existingSecret | quote }}
+    key: {{ .ref.key | quote }}
 {{- end -}}
 
 {{/*
@@ -597,6 +903,36 @@ regardless of Helm's template rendering order). Argument: the root context.
 {{/* Render-time guards that do not depend on schema validation. */}}
 {{- define "openmettle-core.validate" -}}
 {{- include "openmettle-core.validate.booleans" . -}}
+{{- if not (kindIs "map" .Values.database) -}}
+{{- fail "database must be a mapping" -}}
+{{- end -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbEntry := index $.Values.database $dbRole -}}
+{{- if not (kindIs "map" $dbEntry) -}}
+{{- fail (printf "database.%s must be a mapping" $dbRole) -}}
+{{- end -}}
+{{- if not (kindIs "string" (get $dbEntry "existingSecret")) -}}
+{{- fail (printf "database.%s.existingSecret must be a string" $dbRole) -}}
+{{- end -}}
+{{- if not (kindIs "string" (get $dbEntry "key")) -}}
+{{- fail (printf "database.%s.key must be a string" $dbRole) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "string" .Values.auth.loginKeysSecretName) -}}
+{{- fail "auth.loginKeysSecretName must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" (get (default dict .Values.vault) "existingSecret")) -}}
+{{- fail "vault.existingSecret must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" (get (default dict .Values.vault) "configKey")) -}}
+{{- fail "vault.configKey must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" (get (default dict .Values.backup) "existingKeysSecret")) -}}
+{{- fail "backup.existingKeysSecret must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" (get (default dict .Values.backup) "keysConfigKey")) -}}
+{{- fail "backup.keysConfigKey must be a string" -}}
+{{- end -}}
 {{- if not (kindIs "invalid" .Values.worker.sweepMs) -}}
 {{- include "openmettle-core.validate.intRange" (dict "field" "worker.sweepMs" "value" .Values.worker.sweepMs "min" 1000 "max" 3600000) -}}
 {{- end -}}
@@ -1037,15 +1373,10 @@ provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030
 {{- fail "auth.catalogKey must differ from auth.configKey; the model catalog is a separate file named by catalog_file in auth.json" -}}
 {{- end -}}
 {{- end -}}
-{{- if not $auth.loginKeysSecretName -}}
+{{- if eq $auth.loginKeysSecretName "" -}}
 {{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
 {{- end -}}
-{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
-{{- $dbSec := toString (default "" (get (default dict (index $.Values.database $dbRole)) "existingSecret")) -}}
-{{- if and $dbSec (eq (toString $auth.loginKeysSecretName) $dbSec) -}}
-{{- fail (printf "auth.loginKeysSecretName (%q) must differ from database.%s.existingSecret; never mount a database URL Secret wholesale into the API login-keys directory" (toString $auth.loginKeysSecretName) $dbRole) -}}
-{{- end -}}
-{{- end -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "auth.loginKeysSecretName" "secret" $auth.loginKeysSecretName "reason" "never mount a database URL Secret wholesale into the API login-keys directory") -}}
 {{- include "openmettle-core.validate.caBundle" (dict "path" "auth.providerCaBundle" "bundle" $auth.providerCaBundle) -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
 {{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
@@ -1168,24 +1499,19 @@ stage-vault-keys (never gateway, migrate or backup).
 */ -}}
 {{- $vault := default dict .Values.vault -}}
 {{- $vaultEnabled := default false (get $vault "enabled") -}}
-{{- $vaultSecret := toString (default "" (get $vault "existingSecret")) -}}
-{{- $vaultConfigKey := toString (default "keyring.json" (get $vault "configKey")) -}}
+{{- $vaultSecret := get $vault "existingSecret" -}}
+{{- $vaultConfigKey := get $vault "configKey" -}}
 {{- if $vaultEnabled -}}
-{{- if not $vaultSecret -}}
+{{- if eq $vaultSecret "" -}}
 {{- fail "vault.existingSecret is required when vault.enabled is true (an existing Secret holding the vault keyring and 32-byte key files)" -}}
 {{- end -}}
 {{- include "openmettle-core.validate.nonDotKey" (dict "field" "vault.configKey" "key" $vaultConfigKey) -}}
-{{- if and .Values.auth.enabled (eq $vaultSecret (toString .Values.auth.loginKeysSecretName)) -}}
+{{- if and .Values.auth.enabled (eq $vaultSecret .Values.auth.loginKeysSecretName) -}}
 {{- fail (printf "vault.existingSecret (%q) must differ from auth.loginKeysSecretName; keep vault master keys in a dedicated Secret (core ADR 0045)" $vaultSecret) -}}
 {{- end -}}
-{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
-{{- $dbSec := toString (default "" (get (default dict (index $.Values.database $dbRole)) "existingSecret")) -}}
-{{- if and $dbSec (eq $vaultSecret $dbSec) -}}
-{{- fail (printf "vault.existingSecret (%q) must differ from database.%s.existingSecret; never stage a database URL Secret into api/worker pods" $vaultSecret $dbRole) -}}
-{{- end -}}
-{{- end -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "vault.existingSecret" "secret" $vaultSecret "reason" "never stage a database URL Secret into api/worker pods") -}}
 {{- else -}}
-{{- if $vaultSecret -}}
+{{- if ne $vaultSecret "" -}}
 {{- fail "vault.existingSecret must be empty when vault.enabled is false" -}}
 {{- end -}}
 {{- end -}}
@@ -1197,8 +1523,8 @@ Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
 {{- $adminImage := default dict .Values.images.admin -}}
 {{- $pgClientImage := default dict .Values.images.postgresClient -}}
 {{- $backupDb := default dict .Values.database.backup -}}
-{{- $backupSecret := toString (default "" (get $backup "existingKeysSecret")) -}}
-{{- $backupKeysKey := toString (default "keyring.json" (get $backup "keysConfigKey")) -}}
+{{- $backupSecret := get $backup "existingKeysSecret" -}}
+{{- $backupKeysKey := get $backup "keysConfigKey" -}}
 {{- $backupDest := default dict (get $backup "destination") -}}
 {{- $backupGraphiti := default dict (get $backup "graphiti") -}}
 {{- $backupChroma := default dict (get $backup "chroma") -}}
@@ -1255,22 +1581,17 @@ Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
 {{- if le (int64 $backup.activeDeadlineSeconds) (int64 $backup.drainTimeoutSecs) -}}
 {{- fail (printf "backup.activeDeadlineSeconds (%d s) must exceed backup.drainTimeoutSecs (%d s)" (int64 $backup.activeDeadlineSeconds) (int64 $backup.drainTimeoutSecs)) -}}
 {{- end -}}
-{{- if not $backupSecret -}}
+{{- if eq $backupSecret "" -}}
 {{- fail "backup.existingKeysSecret is required when backup.enabled is true (an existing Secret holding the backup keyring and 32-byte key files)" -}}
 {{- end -}}
 {{- include "openmettle-core.validate.nonDotKey" (dict "field" "backup.keysConfigKey" "key" $backupKeysKey) -}}
 {{- if and $vaultEnabled (eq $backupSecret $vaultSecret) -}}
 {{- fail (printf "backup.existingKeysSecret (%q) must differ from vault.existingSecret; backup and vault master keys require separate custody (core ADR 0046)" $backupSecret) -}}
 {{- end -}}
-{{- if and .Values.auth.enabled (eq $backupSecret (toString .Values.auth.loginKeysSecretName)) -}}
+{{- if and .Values.auth.enabled (eq $backupSecret .Values.auth.loginKeysSecretName) -}}
 {{- fail (printf "backup.existingKeysSecret (%q) must differ from auth.loginKeysSecretName; keep backup master keys in a dedicated Secret (core ADR 0046)" $backupSecret) -}}
 {{- end -}}
-{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
-{{- $dbSec := toString (default "" (get (default dict (index $.Values.database $dbRole)) "existingSecret")) -}}
-{{- if and $dbSec (eq $backupSecret $dbSec) -}}
-{{- fail (printf "backup.existingKeysSecret (%q) must differ from database.%s.existingSecret; keep backup master keys in a dedicated Secret (core ADR 0046)" $backupSecret $dbRole) -}}
-{{- end -}}
-{{- end -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "backup.existingKeysSecret" "secret" $backupSecret "reason" "keep backup master keys in a dedicated Secret (core ADR 0046)") -}}
 {{- $destClaim := toString (default "" (get $backupDest "existingClaim")) -}}
 {{- $destSubPath := toString (default "" (get $backupDest "subPath")) -}}
 {{- $destDomain := toString (default "" (get $backupDest "domain")) -}}
@@ -1413,6 +1734,19 @@ Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
 {{- end -}}
 {{- if or (default false (get $backupCb "enabled")) (get $backupCb "configMapName") (get $backupCb "files") -}}
 {{- fail "backup.configBundle must stay disabled and empty when backup.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "root" $ "field" <path> "secret" <string> "reason" <string> */}}
+{{- define "openmettle-core.validate.notDatabaseSecret" -}}
+{{- $field := .field -}}
+{{- $secret := .secret -}}
+{{- $reason := .reason -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbSec := index $.root.Values.database $dbRole "existingSecret" -}}
+{{- if and (ne $dbSec "") (eq $secret $dbSec) -}}
+{{- fail (printf "%s (%q) must differ from database.%s.existingSecret; %s" $field $secret $dbRole $reason) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
