@@ -219,52 +219,247 @@ def parse_journal_export_watermarks(text: str) -> dict:
     }
 
 
+def decode_base64_export_bytes(b64_text: str) -> bytes:
+    """Decode base64-wrapped file content from pod logs back into exact raw file bytes so
+    `subprocess.run(..., text=True)` newline normalization cannot mask CRLF/corruption."""
+    if not isinstance(b64_text, str):
+        raise DrillFailure(f"expected base64 text string, got {type(b64_text).__name__}")
+    cleaned = re.sub(r"[ \t\r\n]+", "", b64_text)
+    if not cleaned:
+        raise DrillFailure("empty base64 post-restore journal export")
+    try:
+        return base64.b64decode(cleaned.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise DrillFailure(f"invalid base64 post-restore journal export: {exc}") from exc
+
+
+def _parse_i64(raw: str, label: str) -> int:
+    if not re.fullmatch(r"-?[0-9]+", raw):
+        raise DrillFailure(f"malformed {label} integer in journal export: {raw!r}")
+    val = int(raw)
+    if val < -(2**63) or val > (2**63 - 1):
+        raise DrillFailure(f"out-of-range {label} integer in journal export: {raw!r}")
+    return val
+
+
+def _parse_opt_i64(raw: str, label: str) -> int | None:
+    return None if raw == "-" else _parse_i64(raw, label)
+
+
+def _is_hex64(raw: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", raw))
+
+
+def _baseline_step(prev_hex: str, fields: tuple[str, ...]) -> str:
+    entity, scope, state, r_us, a_us, purging, content, policy = fields
+    payload = f"{prev_hex}:{entity}:{scope}:{state}:{r_us}:{a_us}:{purging}:{content}:{policy}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def verify_persisted_post_restore_journal(
-    text: str,
+    raw_bytes: bytes,
     *,
     expected_origin_us: int,
     min_seq: int,
     lost_revision_ids: list[str] | tuple[str, ...],
 ) -> dict:
-    """Verify a post-restore `deletion_journal` export read back from persistent storage against
-    `openmettle-core`'s `Export::parse` SHA-256 contract, expected installation `origin`,
-    advanced watermark `seq`, and declared `artifact_revision.lost` revision records."""
-    if "\r" in text:
-        raise DrillFailure("persisted post-restore journal export contains carriage returns")
-    idx = text.rfind("\nsha256 ")
+    """Verify a post-restore `deletion_journal` export read back as raw `bytes` against
+    `openmettle-core`'s complete `Export::parse` (`src/restore.rs`) SHA-256, header, lifecycle,
+    sequence, per-event-kind, and watermark invariants plus expected `artifact_revision.lost` IDs."""
+    if not isinstance(raw_bytes, (bytes, bytearray)):
+        raise DrillFailure(f"persisted post-restore journal must be raw bytes, got {type(raw_bytes).__name__}")
+    raw = bytes(raw_bytes)
+    idx = raw.rfind(b"\nsha256 ")
     if idx == -1:
         raise DrillFailure("persisted post-restore journal export missing trailing sha256 checksum")
-    body = text[: idx + 1]
-    trailer = text[idx + 1 :]
-    expected_hex = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    if trailer != f"sha256 {expected_hex}\n":
+    body_bytes = raw[: idx + 1]
+    trailer_bytes = raw[idx + 1 :]
+    expected_hex = hashlib.sha256(body_bytes).hexdigest()
+    if trailer_bytes != f"sha256 {expected_hex}\n".encode("ascii"):
         raise DrillFailure("persisted post-restore journal export sha256 checksum mismatch")
+    if b"\r" in body_bytes:
+        raise DrillFailure("persisted post-restore journal export contains carriage returns")
+    try:
+        body = body_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DrillFailure(f"persisted post-restore journal export is not valid UTF-8: {exc}") from exc
 
-    wm = parse_journal_export_watermarks(text)
-    if wm["origin_us"] != expected_origin_us:
-        raise DrillFailure(
-            f"persisted post-restore journal origin mismatch: got {wm['origin_us']}, expected {expected_origin_us}"
-        )
-    if lost_revision_ids and wm["required_seq"] <= min_seq:
-        raise DrillFailure(
-            f"persisted post-restore journal seq {wm['required_seq']} did not advance past {min_seq}"
-        )
-    if not lost_revision_ids and wm["required_seq"] < min_seq:
-        raise DrillFailure(
-            f"persisted post-restore journal seq {wm['required_seq']} regressed behind {min_seq}"
-        )
+    lines = body[:-1].split("\n")
+    pos = 0
 
-    lost_revs: set[str] = set()
-    for raw in body.splitlines():
-        parts = raw.split()
-        if len(parts) == 11 and parts[0].isdigit() and parts[2] == "artifact_revision.lost":
-            if not (
-                smoke.UUID.fullmatch(parts[3])
-                and re.fullmatch(r"[0-9a-f]{64}", parts[7])
-                and re.fullmatch(r"[0-9a-f]{64}", parts[9])
+    def next_line() -> str | None:
+        nonlocal pos
+        if pos >= len(lines):
+            return None
+        val = lines[pos]
+        pos += 1
+        return val
+
+    def peek_line() -> str | None:
+        return lines[pos] if pos < len(lines) else None
+
+    if next_line() != "openmettle.deletion_journal.export/1":
+        raise DrillFailure("invalid deletion journal export header")
+    origin_line = next_line()
+    if origin_line is None:
+        raise DrillFailure("journal export missing origin header")
+    origin_parts = origin_line.split(" ")
+    if len(origin_parts) != 2 or origin_parts[0] != "origin":
+        raise DrillFailure(f"malformed journal export origin line: {origin_line!r}")
+    origin_us = _parse_i64(origin_parts[1], "origin")
+
+    genesis = "0" * 64
+    lifecycle_origin_us: int | None = None
+    lifecycle_baseline_digest: str | None = None
+    if (peek := peek_line()) is not None and peek.startswith("lifecycle_origin"):
+        lc_parts = (next_line() or "").split(" ")
+        if len(lc_parts) != 2 or lc_parts[0] != "lifecycle_origin":
+            raise DrillFailure("malformed lifecycle_origin in journal export")
+        lifecycle_origin_us = _parse_i64(lc_parts[1], "lifecycle_origin")
+        lb_line = next_line()
+        if lb_line is None:
+            raise DrillFailure("missing lifecycle_baseline in journal export")
+        lb_parts = lb_line.split(" ")
+        if len(lb_parts) != 2 or lb_parts[0] != "lifecycle_baseline" or not _is_hex64(lb_parts[1]):
+            raise DrillFailure("malformed lifecycle_baseline in journal export")
+        lifecycle_baseline_digest = lb_parts[1]
+        folded = genesis
+        prev_entity: str | None = None
+        while (b_peek := peek_line()) is not None and b_peek.startswith("baseline "):
+            b_fields = (next_line() or "").split(" ")
+            if len(b_fields) != 9 or b_fields[0] != "baseline":
+                raise DrillFailure("malformed baseline line in journal export")
+            _, entity, scope, state, retained_s, after_s, purging_s, content, policy_s = b_fields
+            if not (smoke.UUID.fullmatch(entity) and smoke.UUID.fullmatch(scope)):
+                raise DrillFailure("malformed UUID in journal export baseline")
+            if prev_entity is not None and entity <= prev_entity:
+                raise DrillFailure("baseline entries out of order in journal export")
+            if state not in ("retained", "purging"):
+                raise DrillFailure("malformed baseline state in journal export")
+            if not _is_hex64(content):
+                raise DrillFailure("malformed digest in journal export baseline")
+            r_us = _parse_i64(retained_s, "baseline retained")
+            a_us = _parse_i64(after_s, "baseline after")
+            if a_us < r_us:
+                raise DrillFailure("baseline after < retained in journal export")
+            p_us = _parse_opt_i64(purging_s, "baseline purging")
+            if not ((state == "retained" and p_us is None) or (state == "purging" and p_us is not None and p_us >= a_us)):
+                raise DrillFailure("malformed baseline state/purging pair in journal export")
+            if policy_s != "-" and _parse_i64(policy_s, "baseline policy") <= 0:
+                raise DrillFailure("non-positive baseline policy revision in journal export")
+            folded = _baseline_step(folded, (entity, scope, state, str(r_us), str(a_us), purging_s, content, policy_s))
+            prev_entity = entity
+        if folded != lifecycle_baseline_digest:
+            raise DrillFailure("lifecycle baseline digest mismatch in journal export")
+
+    connection_origin_us: int | None = None
+    if (c_peek := peek_line()) is not None and c_peek.startswith("connection_origin"):
+        co_parts = (next_line() or "").split(" ")
+        if len(co_parts) != 2 or co_parts[0] != "connection_origin":
+            raise DrillFailure("malformed connection_origin in journal export")
+        connection_origin_us = _parse_i64(co_parts[1], "connection_origin")
+
+    records: list[tuple[int, str, str, str]] = []
+    watermark: tuple[int, str] | None = None
+    while (line := next_line()) is not None:
+        fields = line.split(" ")
+        if len(fields) == 5 and fields[0] == "watermark" and watermark is None:
+            wm_origin = _parse_i64(fields[1], "watermark origin")
+            if wm_origin != origin_us:
+                raise DrillFailure("watermark origin does not match export origin")
+            wm_seq = _parse_i64(fields[2], "watermark seq")
+            if wm_seq < 0:
+                raise DrillFailure("negative watermark seq in journal export")
+            if not _is_hex64(fields[3]):
+                raise DrillFailure("malformed watermark chain digest in journal export")
+            _parse_i64(fields[4], "watermark exported_at")
+            watermark = (wm_seq, fields[3])
+        elif len(fields) == 10 and watermark is None:
+            seq_s, at_s, kind, entity, scope, after_s, purged_s, content, policy_s, chain = fields
+            seq = _parse_i64(seq_s, "record seq")
+            if seq != len(records) + 1:
+                raise DrillFailure(f"journal records out of sequence: expected {len(records) + 1}, got {seq}")
+            if kind != "artifact_revision.purged":
+                raise DrillFailure(f"unexpected 10-field event kind in journal export: {kind!r}")
+            if not (smoke.UUID.fullmatch(entity) and smoke.UUID.fullmatch(scope)):
+                raise DrillFailure("malformed UUID in purged journal record")
+            if not (_is_hex64(content) and _is_hex64(chain)):
+                raise DrillFailure("malformed digest in purged journal record")
+            if policy_s != "-" and _parse_i64(policy_s, "policy") <= 0:
+                raise DrillFailure("non-positive policy revision in purged journal record")
+            _parse_i64(at_s, "recorded_at")
+            _parse_i64(after_s, "original_purge_after")
+            _parse_i64(purged_s, "purged_at")
+            records.append((seq, kind, entity, chain))
+        elif len(fields) == 11 and watermark is None:
+            seq_s, at_s, kind, entity, scope, after_s, purged_s, content, policy_s, chain, retained_s = fields
+            is_conn = kind in (
+                "external_connection.disconnected",
+                "external_connection.credential_superseded",
+                "external_connection.share_revoked",
+            )
+            if is_conn:
+                if connection_origin_us is None:
+                    raise DrillFailure(f"missing connection_origin for {kind}")
+            elif lifecycle_origin_us is None:
+                raise DrillFailure(f"missing lifecycle_origin for {kind}")
+            seq = _parse_i64(seq_s, "record seq")
+            if seq != len(records) + 1:
+                raise DrillFailure(f"journal records out of sequence: expected {len(records) + 1}, got {seq}")
+            if not is_conn and kind not in (
+                "artifact_revision.retained",
+                "artifact_revision.deadline_adjusted",
+                "artifact_revision.restored",
+                "artifact_revision.lost",
             ):
-                raise DrillFailure(f"malformed artifact_revision.lost record in post-restore export: {raw!r}")
-            lost_revs.add(parts[3])
+                raise DrillFailure(f"unknown 11-field event kind in journal export: {kind!r}")
+            if not (smoke.UUID.fullmatch(entity) and smoke.UUID.fullmatch(scope)):
+                raise DrillFailure("malformed UUID in 11-field journal record")
+            if not (_is_hex64(content) and _is_hex64(chain)):
+                raise DrillFailure("malformed digest in 11-field journal record")
+            pol = None if policy_s == "-" else _parse_i64(policy_s, "policy")
+            if pol is not None and pol <= 0:
+                raise DrillFailure("non-positive policy revision in 11-field journal record")
+            _parse_i64(at_s, "recorded_at")
+            a_us = _parse_opt_i64(after_s, "original_purge_after")
+            p_us = _parse_opt_i64(purged_s, "purged_at")
+            r_us = _parse_opt_i64(retained_s, "retained_at")
+            if kind in ("artifact_revision.retained", "artifact_revision.deadline_adjusted"):
+                if a_us is None or p_us is not None or r_us is None or a_us < r_us:
+                    raise DrillFailure(f"malformed {kind} timestamps in journal export")
+            elif kind == "artifact_revision.restored":
+                if a_us is not None or p_us is not None or r_us is not None:
+                    raise DrillFailure("malformed artifact_revision.restored timestamps in journal export")
+            elif kind == "artifact_revision.lost":
+                if p_us is None or ((r_us is None) != (a_us is None)) or (a_us is not None and r_us is not None and a_us < r_us):
+                    raise DrillFailure(f"malformed artifact_revision.lost line in journal export: {line!r}")
+            elif is_conn:
+                if a_us is not None or p_us is not None or r_us is not None or pol is None:
+                    raise DrillFailure(f"malformed {kind} fields in journal export")
+            records.append((seq, kind, entity, chain))
+        else:
+            raise DrillFailure(f"malformed line in journal export: {line!r}")
+
+    if watermark is None:
+        raise DrillFailure("missing watermark in journal export")
+    expected_tail = (records[-1][0], records[-1][3]) if records else (0, genesis)
+    if watermark != expected_tail:
+        raise DrillFailure(f"watermark {watermark!r} does not match last record {expected_tail!r}")
+
+    if origin_us != expected_origin_us:
+        raise DrillFailure(
+            f"persisted post-restore journal origin mismatch: got {origin_us}, expected {expected_origin_us}"
+        )
+    if lost_revision_ids and watermark[0] <= min_seq:
+        raise DrillFailure(
+            f"persisted post-restore journal seq {watermark[0]} did not advance past {min_seq}"
+        )
+    if not lost_revision_ids and watermark[0] < min_seq:
+        raise DrillFailure(
+            f"persisted post-restore journal seq {watermark[0]} regressed behind {min_seq}"
+        )
+
+    lost_revs = {entity for _, kind, entity, _ in records if kind == "artifact_revision.lost"}
     for rev_id in lost_revision_ids:
         if not smoke.UUID.fullmatch(rev_id):
             raise DrillFailure(f"invalid expected lost revision UUID: {rev_id!r}")
@@ -272,7 +467,14 @@ def verify_persisted_post_restore_journal(
             raise DrillFailure(
                 f"persisted post-restore journal export missing artifact_revision.lost for {rev_id}"
             )
-    return wm
+    return {
+        "origin_us": origin_us,
+        "lifecycle_origin_us": lifecycle_origin_us,
+        "lifecycle_baseline_digest": lifecycle_baseline_digest,
+        "connection_origin_us": connection_origin_us,
+        "required_seq": watermark[0],
+        "required_digest": watermark[1],
+    }
 
 
 def should_pass_export_complete(
@@ -3864,7 +4066,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                         "securityContext": POD_SEC_CONTEXT,
                         "containers": [{
                             "name": "read-export", "image": admin_ref, "imagePullPolicy": "Never",
-                            "command": ["cat", post_export_path],
+                            "command": ["base64", post_export_path],
                             "securityContext": CONTAINER_SEC_CONTEXT,
                             "volumeMounts": [
                                 {"name": "post-exports", "mountPath": POST_RESTORE_EXPORT_DIR, "readOnly": True},
@@ -3877,10 +4079,11 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 },
             },
         }
-        persisted_export_text, _ = self.run_job(TARGET_APP_NS, read_post_export_job)
+        persisted_export_b64, _ = self.run_job(TARGET_APP_NS, read_post_export_job)
+        persisted_export_bytes = decode_base64_export_bytes(persisted_export_b64)
         pre_wm = recovery_meta["pre_restore_journal_watermarks"]
         verify_persisted_post_restore_journal(
-            persisted_export_text,
+            persisted_export_bytes,
             expected_origin_us=pre_wm["origin_us"],
             min_seq=pre_wm["required_seq"],
             lost_revision_ids=[primary_state["art_to_lose"]["revision_id"]],

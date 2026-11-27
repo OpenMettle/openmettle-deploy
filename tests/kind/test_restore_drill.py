@@ -183,31 +183,98 @@ class JournalAndRebindParserTest(unittest.TestCase):
     def test_verify_persisted_post_restore_journal_checks_sha256_watermark_and_lost_records(self):
         rev_lost = "99999999-9999-4999-8999-999999999995"
         scope_id = "22222222-2222-4222-8222-222222222222"
-        body = (
-            "openmettle.deletion_journal.export/1\n"
-            "origin 1795450000000000\n"
-            f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - - {DIGEST_A} - {DIGEST_B} -\n"
-            f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
-        )
-        valid = body + f"sha256 {hashlib.sha256(body.encode('utf-8')).hexdigest()}\n"
+
+        def make_export_bytes(records: list[str], *, seq: int = 6, with_lifecycle: bool = True, eol: str = "\n", sum_eol: str = "\n") -> bytes:
+            lines = ["openmettle.deletion_journal.export/1", "origin 1795450000000000"]
+            if with_lifecycle:
+                lines.extend(["lifecycle_origin 1795450000000100", f"lifecycle_baseline {GENESIS}"])
+            lines.extend(["connection_origin 1795450000000200", *records, f"watermark 1795450000000000 {seq} {DIGEST_B} 1795450025000000"])
+            body = eol.join(lines) + eol
+            body_b = body.encode("utf-8")
+            trailer = f"sha256 {hashlib.sha256(body_b).hexdigest()}{sum_eol}".encode("ascii")
+            return body_b + trailer
+
+        base_records = [
+            f"1 1795450010000000 artifact_revision.purged 11111111-1111-4111-8111-111111111111 {scope_id} 1795450009000000 1795450010000000 {DIGEST_A} 1 {DIGEST_A}",
+            f"2 1795450011000000 artifact_revision.retained 11111111-1111-4111-8111-111111111112 {scope_id} 1795450020000000 - {DIGEST_A} 1 {DIGEST_A} 1795450011000000",
+            f"3 1795450012000000 artifact_revision.deadline_adjusted 11111111-1111-4111-8111-111111111113 {scope_id} 1795450025000000 - {DIGEST_A} 1 {DIGEST_A} 1795450012000000",
+            f"4 1795450013000000 artifact_revision.restored 11111111-1111-4111-8111-111111111114 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -",
+            f"5 1795450014000000 external_connection.disconnected 11111111-1111-4111-8111-111111111115 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -",
+            f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - 1795450015000000 {DIGEST_A} - {DIGEST_B} -",
+        ]
+        valid = make_export_bytes(base_records)
+        # Round-trip via base64 even with `\r\n` log line-ending normalization.
+        b64_log = base64.encodebytes(valid).decode("ascii").replace("\n", "\r\n").replace("\r\n", "\n")
+        decoded_valid = restore_drill.decode_base64_export_bytes(b64_log)
         wm = restore_drill.verify_persisted_post_restore_journal(
-            valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            decoded_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
         )
         self.assertEqual(wm["required_seq"], 6)
 
-        tampered = valid.replace(rev_lost, "99999999-9999-4999-8999-999999999999")
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "raw bytes"):
+            restore_drill.verify_persisted_post_restore_journal(
+                valid.decode("utf-8"), expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]  # type: ignore[arg-type]
+            )
+
+        # CRLF regression: stored CRLF export transferred safely over base64 + text logs still fails SHA-256!
+        crlf_stored = valid.replace(b"\n", b"\r\n")
+        crlf_b64_through_text_runner = base64.encodebytes(crlf_stored).decode("ascii").replace("\r\n", "\n")
+        decoded_crlf = restore_drill.decode_base64_export_bytes(crlf_b64_through_text_runner)
+        self.assertEqual(decoded_crlf, crlf_stored)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
+            restore_drill.verify_persisted_post_restore_journal(
+                decoded_crlf, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        # Even if CRLF bytes carry a matching SHA-256 over the CRLF body, CR bytes in body MUST fail closed.
+        crlf_rehashed = make_export_bytes(base_records, eol="\r\n", sum_eol="\n")
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "carriage returns"):
+            restore_drill.verify_persisted_post_restore_journal(
+                crlf_rehashed, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        tampered = valid.replace(rev_lost.encode("ascii"), b"99999999-9999-4999-8999-999999999999")
         with self.assertRaisesRegex(restore_drill.DrillFailure, "sha256 checksum mismatch"):
             restore_drill.verify_persisted_post_restore_journal(
                 tampered, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
             )
 
-        other_body = (
-            "openmettle.deletion_journal.export/1\n"
-            "origin 1795450000000000\n"
-            f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999999 {scope_id} - - {DIGEST_A} - {DIGEST_B} -\n"
-            f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
+        # Retained Review #15 malformed fixture (starts at seq 6, omits lifecycle_origin, '-' for purged_us):
+        malformed_combined = make_export_bytes(
+            [f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - - {DIGEST_A} - {DIGEST_B} -"],
+            with_lifecycle=False,
         )
-        other_valid = other_body + f"sha256 {hashlib.sha256(other_body.encode('utf-8')).hexdigest()}\n"
+        with self.assertRaises(restore_drill.DrillFailure):
+            restore_drill.verify_persisted_post_restore_journal(
+                malformed_combined, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        # Individual Export::parse rejection cases:
+        no_lifecycle = make_export_bytes([base_records[-1]], seq=1, with_lifecycle=False)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "missing lifecycle_origin"):
+            restore_drill.verify_persisted_post_restore_journal(
+                no_lifecycle, expected_origin_us=1795450000000000, min_seq=0, lost_revision_ids=[rev_lost]
+            )
+
+        seq_gap = make_export_bytes([base_records[-1]], seq=6, with_lifecycle=True)
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "out of sequence"):
+            restore_drill.verify_persisted_post_restore_journal(
+                seq_gap, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        missing_purged_us = make_export_bytes(
+            [*base_records[:-1], f"6 1795450015000000 artifact_revision.lost {rev_lost} {scope_id} - - {DIGEST_A} - {DIGEST_B} -"],
+            seq=6,
+            with_lifecycle=True,
+        )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "malformed artifact_revision.lost"):
+            restore_drill.verify_persisted_post_restore_journal(
+                missing_purged_us, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
+            )
+
+        other_valid = make_export_bytes(
+            [*base_records[:-1], f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999999 {scope_id} - 1795450015000000 {DIGEST_A} - {DIGEST_B} -"]
+        )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "missing artifact_revision.lost"):
             restore_drill.verify_persisted_post_restore_journal(
                 other_valid, expected_origin_us=1795450000000000, min_seq=5, lost_revision_ids=[rev_lost]
@@ -950,6 +1017,9 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertNotIn("/tmp/post-restore.export", runbook)
         self.assertIn("details->>'restore_run_id' = '<RESTORE_RUN_UUID>'", step6)
         self.assertIn("openmettle.login_admission.outstanding_limit", step6)
+        self.assertIn("outstanding_unissued < outstanding_limit", step6)
+        self.assertIn("outstanding_limit IS NULL", step6)
+        self.assertIn("Unconfigured", step6)
         self.assertIn("post-restore-$RESTORE_RUN_UUID.export", step6)
         self.assertIn("artifact_revision.lost", step6)
 
@@ -1556,13 +1626,23 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         if name == "openmettle-drill-post-verify":
             return self._res(0, qv)
         if name == "openmettle-drill-read-post-export":
+            scope_id = "22222222-2222-4222-8222-222222222222"
             export_body = (
                 "openmettle.deletion_journal.export/1\n"
                 "origin 1795450000000000\n"
-                f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999995 22222222-2222-4222-8222-222222222222 - - {DIGEST_A} - {DIGEST_B} -\n"
+                "lifecycle_origin 1795450000000100\n"
+                f"lifecycle_baseline {GENESIS}\n"
+                "connection_origin 1795450000000200\n"
+                f"1 1795450010000000 artifact_revision.purged 11111111-1111-4111-8111-111111111111 {scope_id} 1795450009000000 1795450010000000 {DIGEST_A} 1 {DIGEST_A}\n"
+                f"2 1795450011000000 artifact_revision.retained 11111111-1111-4111-8111-111111111112 {scope_id} 1795450020000000 - {DIGEST_A} 1 {DIGEST_A} 1795450011000000\n"
+                f"3 1795450012000000 artifact_revision.deadline_adjusted 11111111-1111-4111-8111-111111111113 {scope_id} 1795450025000000 - {DIGEST_A} 1 {DIGEST_A} 1795450012000000\n"
+                f"4 1795450013000000 artifact_revision.restored 11111111-1111-4111-8111-111111111114 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -\n"
+                f"5 1795450014000000 external_connection.disconnected 11111111-1111-4111-8111-111111111115 {scope_id} - - {DIGEST_A} 1 {DIGEST_A} -\n"
+                f"6 1795450015000000 artifact_revision.lost 99999999-9999-4999-8999-999999999995 {scope_id} - 1795450015000000 {DIGEST_A} - {DIGEST_B} -\n"
                 f"watermark 1795450000000000 6 {DIGEST_B} 1795450025000000\n"
             )
-            return self._res(0, export_body + f"sha256 {hashlib.sha256(export_body.encode('utf-8')).hexdigest()}\n")
+            raw_export = (export_body + f"sha256 {hashlib.sha256(export_body.encode('utf-8')).hexdigest()}\n").encode("utf-8")
+            return self._res(0, base64.encodebytes(raw_export).decode("ascii"))
         return self._res(0, "")
 
     def _exec_handler(self, argv: list[str], stdin_text: str | None):
@@ -1974,6 +2054,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-read-post-export"
         )
         read_export_pod = read_export_job["spec"]["template"]["spec"]
+        self.assertEqual(read_export_pod["containers"][0]["command"][0], "base64")
         self.assertNotIn("env", read_export_pod["containers"][0])
         self.assertTrue(read_export_pod["containers"][0]["volumeMounts"][0]["readOnly"])
         self.assertTrue(read_export_pod["volumes"][0]["persistentVolumeClaim"]["readOnly"])
