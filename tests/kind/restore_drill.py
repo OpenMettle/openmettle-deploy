@@ -2449,14 +2449,8 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     **manifest_summary)
 
         # Model loss of access to the encrypted recovery archive after unpack completes, while
-        # keeping the independently retained selected journal on target scratch. Deleting the two
-        # completed preflight/unpack Jobs releases `kubernetes.io/pvc-protection` on media PVC.
-        self.verify_identity()
-        self.kube(
-            "--namespace", TARGET_APP_NS, "delete", "job",
-            "openmettle-drill-preflight-neg", "openmettle-drill-verify-unpack",
-            "--wait=true", timeout=120,
-        )
+        # keeping the independently retained selected journal on target scratch (`run_job` already
+        # deleted both preflight/unpack Jobs above with `--wait=true`, releasing `pvc-protection`).
         self.verify_identity()
         self.kube(
             "--namespace", TARGET_APP_NS, "delete", "pvc",

@@ -652,6 +652,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         cat_path.write_text(json.dumps(test_smoke.CATALOG_FIXTURE), encoding="utf-8")
         self.commands: list[list[str]] = []
         self.applied_manifests: list[dict] = []
+        self.live_objects: set[tuple[str, str, str]] = set()
         self.media_lifecycle: list[str] = []
         self.fail_on_target_migrate = False
         self.job_failed_on_pre_worker_sql = False
@@ -774,9 +775,30 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                         self.media_lifecycle.append("applied-reconcile-admin")
                     if self.fail_on_target_migrate and self._last_job == "openmettle-drill-migrate":
                         return self._res(1, "", f"fatal migrate error password={self._leak_secret}")
+                self._record_applied(doc)
                 return self._res(0, "")
-            if "delete" in argv and "pvc" in argv and restore_drill.TARGET_RECOVERY_MEDIA_CLAIM in argv:
-                self.media_lifecycle.append("deleted-media-pvc")
+            if "create" in argv and "job" in argv:
+                ns = argv[argv.index("--namespace") + 1] if "--namespace" in argv else ""
+                job_name = argv[argv.index("job") + 1]
+                self.live_objects.add((ns, "job", job_name))
+                return self._res(0, "")
+            if "delete" in argv:
+                ns = argv[argv.index("--namespace") + 1] if "--namespace" in argv else ""
+                del_idx = argv.index("delete")
+                res_kind = argv[del_idx + 1]
+                names = [a for a in argv[del_idx + 2:] if not a.startswith("-")]
+                ignore_missing = "--ignore-not-found=true" in argv
+                for obj_name in names:
+                    key = (ns, res_kind, obj_name)
+                    if key not in self.live_objects:
+                        if not ignore_missing:
+                            return self._res(
+                                1, "", f'Error from server (NotFound): {res_kind} "{obj_name}" not found'
+                            )
+                    else:
+                        self.live_objects.remove(key)
+                        if res_kind == "pvc" and obj_name == restore_drill.TARGET_RECOVERY_MEDIA_CLAIM:
+                            self.media_lifecycle.append("deleted-media-pvc")
                 return self._res(0, "")
             if "get" in argv and "job" in argv and argv[-1] == "--output=json":
                 job_name = argv[argv.index("job") + 1]
@@ -800,6 +822,28 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return self._exec_handler(argv, input)
             return self._res(0, "")
         return self._res(0, "")
+
+    def _record_applied(self, doc: dict) -> None:
+        kind = doc.get("kind")
+        if kind == "List":
+            for item in doc.get("items", ()):
+                self._record_applied(item)
+            return
+        kind_map = {
+            "Job": "job",
+            "Pod": "pod",
+            "PersistentVolumeClaim": "pvc",
+            "Secret": "secret",
+            "ConfigMap": "configmap",
+            "Deployment": "deployment",
+            "Service": "service",
+            "NetworkPolicy": "networkpolicy",
+            "Namespace": "namespace",
+        }
+        mapped = kind_map.get(kind)
+        if mapped:
+            meta = doc.get("metadata", {})
+            self.live_objects.add((meta.get("namespace", ""), mapped, meta["name"]))
 
     @property
     def _run_id(self) -> str:
@@ -1094,6 +1138,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
     def _run_drill(self) -> tuple[int, dict]:
         self._scaled_zero = False
         self._leak_secret = "not-yet-set"
+        self.live_objects.clear()
+        self.media_lifecycle.clear()
         outer = self
 
         class FakePF:
@@ -1247,6 +1293,27 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(summary["result"], "failed")
         self.assertIn("epoch guard diagnostic", summary["error"])
+
+    def test_stateful_kubectl_fake_rejects_duplicate_checked_deletion(self):
+        rc, summary = self._run_drill()
+        self.assertEqual(rc, 0, summary.get("error"))
+        dup_pvc = self._dispatch([
+            "kubectl", "--namespace", restore_drill.TARGET_APP_NS,
+            "delete", "pvc", restore_drill.TARGET_RECOVERY_MEDIA_CLAIM, "--wait=true",
+        ])
+        self.assertEqual(dup_pvc.returncode, 1)
+        self.assertIn("NotFound", dup_pvc.stderr)
+        dup_job = self._dispatch([
+            "kubectl", "--namespace", restore_drill.TARGET_APP_NS,
+            "delete", "job", "openmettle-drill-verify-unpack", "--wait=true",
+        ])
+        self.assertEqual(dup_job.returncode, 1)
+        self.assertIn("NotFound", dup_job.stderr)
+        ignored = self._dispatch([
+            "kubectl", "--namespace", restore_drill.TARGET_APP_NS,
+            "delete", "job", "openmettle-drill-verify-unpack", "--ignore-not-found=true",
+        ])
+        self.assertEqual(ignored.returncode, 0)
 
     def test_failed_job_reports_redacted_pod_logs_without_waiting_for_complete_timeout(self):
         self.job_failed_on_pre_worker_sql = True
