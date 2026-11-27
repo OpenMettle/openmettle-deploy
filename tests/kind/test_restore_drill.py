@@ -436,7 +436,90 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         run_id = "77777777-7777-4777-8777-777777777777"
         uid = restore_drill.USER_D_IDS["user"]
 
-        # Model-only post-backup change on an already-restored policy emits ONLY set-model so
+        def run_simulated_family_cli(script_text: str, *, initial_policy: dict | None = None, initial_models: dict | None = None):
+            """Simulate `openmettle-core`'s `openmettle-admin family` state machine (`UNCHANGED`,
+            missing policy `NotFound`, `KEY_REUSED`, and idempotent `Replayed` no-op)."""
+            policies: dict[str, dict] = {}
+            if initial_policy is not None:
+                policies[uid] = dict(initial_policy)
+            models: dict[tuple[str, str, str], bool] = dict(initial_models or {})
+            audit: dict[tuple[str, str], tuple] = {}
+            emitted_keys: list[str] = []
+
+            def replay(lines_to_run: list[str]) -> None:
+                for line in lines_to_run:
+                    tokens = shlex.split(line)
+                    self.assertEqual(tokens[:2], ["openmettle-admin", "family"])
+                    sub = tokens[2]
+                    op_id = tokens[tokens.index("--operator-id") + 1]
+                    req_key = tokens[tokens.index("--request-key") + 1]
+                    target_uid = tokens[tokens.index("--user") + 1]
+                    self.assertLessEqual(len(req_key.encode("utf-8")), 128)
+                    emitted_keys.append(req_key)
+
+                    if sub == "set-policy":
+                        zone = tokens[tokens.index("--zone") + 1]
+                        quiet = tokens[tokens.index("--quiet") + 1] if "--quiet" in tokens else None
+                        study = tokens[tokens.index("--study") + 1] if "--study" in tokens else None
+                        override = "--override-group-schedules" in tokens
+                        details = ("set", target_uid, zone, quiet, study, override)
+                        if (op_id, req_key) in audit:
+                            self.assertEqual(audit[(op_id, req_key)], details)
+                            continue
+                        audit[(op_id, req_key)] = details
+                        cur = policies.get(target_uid)
+                        if (
+                            cur is not None
+                            and cur["active"]
+                            and (cur["zone"], cur["quiet"], cur["study"], cur["override"])
+                            == (zone, quiet, study, override)
+                        ):
+                            raise AssertionError(f"UNCHANGED set-policy on {target_uid}: {details!r}")
+                        policies[target_uid] = {
+                            "active": True,
+                            "zone": zone,
+                            "quiet": quiet,
+                            "study": study,
+                            "override": override,
+                        }
+                    elif sub == "clear-policy":
+                        details = ("clear", target_uid)
+                        if (op_id, req_key) in audit:
+                            self.assertEqual(audit[(op_id, req_key)], details)
+                            continue
+                        audit[(op_id, req_key)] = details
+                        cur = policies.get(target_uid)
+                        if cur is None or not cur["active"]:
+                            raise AssertionError(f"UNCHANGED clear-policy on {target_uid}")
+                        cur["active"] = False
+                    elif sub == "set-model":
+                        kind = tokens[tokens.index("--kind") + 1]
+                        model = tokens[tokens.index("--model") + 1]
+                        has_enable = "--enable" in tokens
+                        has_disable = "--disable" in tokens
+                        self.assertNotEqual(has_enable, has_disable)
+                        active = has_enable
+                        details = ("model", target_uid, kind, model, active)
+                        if (op_id, req_key) in audit:
+                            self.assertEqual(audit[(op_id, req_key)], details)
+                            continue
+                        audit[(op_id, req_key)] = details
+                        if target_uid not in policies:
+                            raise AssertionError(f"family policy target not found for {target_uid}")
+                        if models.get((target_uid, kind, model), False) == active:
+                            raise AssertionError(f"UNCHANGED set-model on {(target_uid, kind, model, active)!r}")
+                        models[(target_uid, kind, model)] = active
+                    else:
+                        raise AssertionError(f"unexpected subcommand: {sub!r}")
+
+            raw_lines = [ln for ln in script_text.splitlines() if ln.strip()]
+            replay(raw_lines)
+            # Second pass verifies script retry is a pure idempotent replay across all steps.
+            key_count_first = len(emitted_keys)
+            replay(raw_lines)
+            return policies, models, emitted_keys[:key_count_first]
+
+        # 1) Model-only post-backup change on an already-restored policy emits ONLY set-model so
         # existing quiet/study/override schedule fields are preserved untouched.
         model_only = restore_drill.build_family_policy_reconcile_lines(
             restore_drill.DRILL_OPERATOR_ID,
@@ -446,64 +529,116 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertNotIn("family set-policy", model_only)
         self.assertIn("openmettle-admin family set-model --user", model_only)
         self.assertIn("--kind disabled --model 'a' --enable", model_only)
-
-        # Repeated toggles (`disable -> enable -> disable`) or repeated `set-policy` updates fold
-        # cleanly to one final authoritative command so `openmettle-admin` idempotent request-key
-        # replay cannot leave stale state active.
-        toggled_enable = restore_drill.build_family_policy_reconcile_lines(
-            restore_drill.DRILL_OPERATOR_ID,
-            run_id,
-            [{"user_id": uid, "policy": None, "models": [("disabled", "a", True), ("disabled", "a", False), ("disabled", "a", True)]}],
+        pol1, mod1, keys1 = run_simulated_family_cli(
+            model_only,
+            initial_policy={"active": True, "zone": "Europe/London", "quiet": "22:00-07:00", "study": "16:00-18:00", "override": True},
         )
-        toggled_lines = [ln for ln in toggled_enable.splitlines() if ln.strip()]
-        self.assertEqual(len(toggled_lines), 1)
-        self.assertIn("--kind disabled --model 'a' --enable", toggled_lines[0])
+        self.assertEqual(pol1[uid]["quiet"], "22:00-07:00")
+        self.assertTrue(mod1[(uid, "disabled", "a")])
+        self.assertEqual(len(keys1), 1)
 
-        toggled_disable = restore_drill.build_family_policy_reconcile_lines(
+        # 2) Model toggle returning to backup state (`allowed` -> `disable a` -> `enable a`):
+        # must replay both steps with distinct keys so `set-model --disable` does not fail with UNCHANGED.
+        toggle_back = restore_drill.build_family_policy_reconcile_lines(
             restore_drill.DRILL_OPERATOR_ID,
             run_id,
             [{"user_id": uid, "policy": None, "models": [("disabled", "a", True), ("disabled", "a", False)]}],
         )
-        self.assertEqual(len([ln for ln in toggled_disable.splitlines() if ln.strip()]), 1)
-        self.assertIn("--kind disabled --model 'a' --disable", toggled_disable)
+        tb_lines = [ln for ln in toggle_back.splitlines() if ln.strip()]
+        self.assertEqual(len(tb_lines), 2)
+        self.assertIn("--kind disabled --model 'a' --enable", tb_lines[0])
+        self.assertIn("--kind disabled --model 'a' --disable", tb_lines[1])
+        _, mod2, keys2 = run_simulated_family_cli(
+            toggle_back,
+            initial_policy={"active": True, "zone": "UTC", "quiet": None, "study": None, "override": False},
+        )
+        self.assertEqual(len(set(keys2)), 2)
+        self.assertFalse(mod2[(uid, "disabled", "a")])
 
-        repeated_policy = restore_drill.build_family_policy_reconcile_lines(
+        # 3) Triple model toggle (`disable -> enable -> disable`): 3 commands with 3 distinct keys.
+        triple_toggle = restore_drill.build_family_policy_reconcile_lines(
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            [{"user_id": uid, "policy": None, "models": [("disabled", "a", True), ("disabled", "a", False), ("disabled", "a", True)]}],
+        )
+        tt_lines = [ln for ln in triple_toggle.splitlines() if ln.strip()]
+        self.assertEqual(len(tt_lines), 3)
+        _, mod3, keys3 = run_simulated_family_cli(
+            triple_toggle,
+            initial_policy={"active": True, "zone": "UTC", "quiet": None, "study": None, "override": False},
+        )
+        self.assertEqual(len(set(keys3)), 3)
+        self.assertTrue(mod3[(uid, "disabled", "a")])
+
+        # 4) Schedule toggle returning to backup value (`UTC` -> `Europe/London` + `22:00-07:00` -> `UTC`):
+        # emits both transitions in order with distinct keys so neither hits UNCHANGED.
+        schedule_revert = restore_drill.build_family_policy_reconcile_lines(
             restore_drill.DRILL_OPERATOR_ID,
             run_id,
             [
-                {"user_id": uid, "policy": {"zone": "UTC"}, "models": []},
                 {"user_id": uid, "policy": {"zone": "Europe/London", "quiet": "22:00-07:00"}, "models": []},
+                {"user_id": uid, "policy": {"zone": "UTC"}, "models": []},
             ],
         )
-        rp_lines = [ln for ln in repeated_policy.splitlines() if ln.strip()]
-        self.assertEqual(len(rp_lines), 1)
-        self.assertIn('--zone "Europe/London" --quiet "22:00-07:00"', rp_lines[0])
+        sr_lines = [ln for ln in schedule_revert.splitlines() if ln.strip()]
+        self.assertEqual(len(sr_lines), 2)
+        self.assertIn('--zone "Europe/London" --quiet "22:00-07:00"', sr_lines[0])
+        self.assertIn('--zone "UTC"', sr_lines[1])
+        pol4, _, keys4 = run_simulated_family_cli(
+            schedule_revert,
+            initial_policy={"active": True, "zone": "UTC", "quiet": None, "study": None, "override": False},
+        )
+        self.assertEqual(len(set(keys4)), 2)
+        self.assertEqual(pol4[uid], {"active": True, "zone": "UTC", "quiet": None, "study": None, "override": False})
 
-        # Policy + model change passes the complete recorded schedule (--zone, --quiet, --study,
-        # --override-group-schedules) before set-model.
-        full_policy = restore_drill.build_family_policy_reconcile_lines(
-            restore_drill.DRILL_OPERATOR_ID,
-            run_id,
-            [{
-                "user_id": uid,
-                "policy": {
-                    "zone": "Europe/London",
-                    "quiet": "22:00-07:00",
-                    "study": "16:00-18:00",
-                    "override_group_schedules": True,
+        # 5) Post-backup policy creation -> model rule -> policy clearance:
+        # must preserve set-policy before set-model and clear-policy at the end (never NotFound).
+        for entries in (
+            [
+                {
+                    "user_id": uid,
+                    "policy": {
+                        "zone": "Europe/London",
+                        "quiet": "22:00-07:00",
+                        "study": "16:00-18:00",
+                        "override_group_schedules": True,
+                    },
+                    "models": [("disabled", "a", True)],
                 },
-                "models": [("disabled", "a", True)],
-            }],
-        )
-        self.assertIn(
-            f'openmettle-admin family set-policy --user "{uid}" --zone "Europe/London" '
-            '--quiet "22:00-07:00" --study "16:00-18:00" --override-group-schedules',
-            full_policy,
-        )
-        self.assertLess(full_policy.index("family set-policy"), full_policy.index("family set-model"))
+                {"user_id": uid, "policy": "clear", "models": []},
+            ],
+            [
+                {
+                    "user_id": uid,
+                    "policy": {
+                        "zone": "Europe/London",
+                        "quiet": "22:00-07:00",
+                        "study": "16:00-18:00",
+                        "override_group_schedules": True,
+                    },
+                    "models": [],
+                },
+                {"user_id": uid, "policy": None, "models": [("disabled", "a", True)]},
+                {"user_id": uid, "policy": "clear", "models": []},
+            ],
+        ):
+            create_model_clear = restore_drill.build_family_policy_reconcile_lines(
+                restore_drill.DRILL_OPERATOR_ID, run_id, entries
+            )
+            cmc_lines = [ln for ln in create_model_clear.splitlines() if ln.strip()]
+            self.assertEqual(len(cmc_lines), 3)
+            self.assertIn("family set-policy", cmc_lines[0])
+            self.assertIn('--zone "Europe/London" --quiet "22:00-07:00" --study "16:00-18:00" --override-group-schedules', cmc_lines[0])
+            self.assertIn("family set-model", cmc_lines[1])
+            self.assertIn("family clear-policy", cmc_lines[2])
+            pol5, mod5, keys5 = run_simulated_family_cli(create_model_clear, initial_policy=None)
+            self.assertEqual(len(set(keys5)), 3)
+            self.assertFalse(pol5[uid]["active"])
+            self.assertEqual(pol5[uid]["zone"], "Europe/London")
+            self.assertTrue(mod5[(uid, "disabled", "a")])
 
         # Boundary tests: valid model names of 31, 32, and 256 UTF-8 bytes (and spaces/quotes) MUST
-        # stay <= 128 bytes for --request-key, remain deterministic per (run, user, kind, model, bit),
+        # stay <= 128 bytes for --request-key, remain deterministic per (run, seq, user, kind, model, bit),
         # and safely round-trip through shlex.split.
         for model_name in ("m" * 31, "m" * 32, "m" * 256, " padded'model "):
             cmd_line = restore_drill.build_family_policy_reconcile_lines(
@@ -532,6 +667,12 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
                     run_id,
                     [{"user_id": uid, "policy": None, "models": [("disabled", bad_model, True)]}],
                 )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy models sequence"):
+            restore_drill.build_family_policy_reconcile_lines(
+                restore_drill.DRILL_OPERATOR_ID,
+                run_id,
+                [{"user_id": uid, "policy": None, "models": "disabled"}],
+            )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy timezone"):
             restore_drill.build_family_policy_reconcile_lines(
                 restore_drill.DRILL_OPERATOR_ID,
@@ -1253,6 +1394,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return self._res(0, self.forced_run_diag_row + "\n")
             if "openmettle.operations" in stdin_text:
                 import re as _re
+                self.assertIn("fp.override_group_schedules::text", stdin_text)
                 pre_job = next(
                     d for d in self.applied_manifests
                     if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-primary-family-pre"

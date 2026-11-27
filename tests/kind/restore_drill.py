@@ -732,59 +732,69 @@ def build_family_policy_reconcile_lines(
       - `models`: sequence of `(kind, model, enable)` tuples (`kind` in `{"disabled",
         "study_allow"}`, `enable` bool).
 
-    Validates all inputs in order and folds repeated updates per `(user_id, rule_kind, model)`
-    and grantee policy to the final audited state so toggle sequences such as
-    `disable -> enable -> disable` (or repeated `set-policy` schedule changes) never collide on
-    idempotent `--request-key` replay and leave the wrong state active. Uses SHA-256-bounded
-    request keys (`<= 128` bytes for every valid 1..=256-byte model identifier).
+    Validates all inputs in order and emits audited transitions in chronological order with a
+    0-based ordinal bound into each SHA-256 `--request-key` (`<= 128` bytes for every valid
+    1..=256-byte model identifier). Replaying transitions in order avoids `openmettle-admin`
+    `UNCHANGED` errors when a toggle returns to its backup value and `NotFound` errors when a
+    post-backup `set-policy -> set-model -> clear-policy` sequence precedes clearance, while
+    keeping script retries for the same `restore_run_id` idempotent.
     """
     for label, val in (("operator_id", operator_id), ("restore_run_id", restore_run_id)):
         if not smoke.UUID.fullmatch(val):
             raise DrillFailure(f"invalid {label} UUID: {val!r}")
-    per_user: dict[str, dict] = {}
+    if not isinstance(entries, (list, tuple)):
+        raise DrillFailure(f"expected family policy entries sequence, got {entries!r}")
+
+    normalized: list[tuple[str, str | dict | None, list[tuple[str, str, bool]]]] = []
     for entry in entries:
         if not isinstance(entry, dict):
             raise DrillFailure(f"expected family policy reconcile entry dict, got {entry!r}")
         user_id = entry.get("user_id", "")
         if not smoke.UUID.fullmatch(user_id):
             raise DrillFailure(f"invalid restricted user UUID: {user_id!r}")
-        state = per_user.setdefault(user_id, {"policy": None, "models": {}})
         policy = entry.get("policy")
-        if policy == "clear":
-            state["policy"] = "clear"
+        norm_policy: str | dict | None
+        if policy is None or policy == "clear":
+            norm_policy = policy
         elif isinstance(policy, dict):
             zone = policy.get("zone", "")
             if not isinstance(zone, str) or not re.fullmatch(r"[A-Za-z0-9/+_.-]{1,128}", zone):
                 raise DrillFailure(f"invalid family policy timezone: {zone!r}")
             quiet = policy.get("quiet")
             study = policy.get("study")
-            state["policy"] = {
+            norm_policy = {
                 "zone": zone,
                 "quiet": _validate_hhmm_window("quiet", quiet) if quiet is not None else None,
                 "study": _validate_hhmm_window("study", study) if study is not None else None,
                 "override_group_schedules": bool(policy.get("override_group_schedules", False)),
             }
-        elif policy is not None:
+        else:
             raise DrillFailure(f"invalid family policy directive: {policy!r}")
 
-        for kind, model, enable in entry.get("models", ()):
+        models_raw = entry.get("models", ())
+        if not isinstance(models_raw, (list, tuple)):
+            raise DrillFailure(f"invalid family policy models sequence: {models_raw!r}")
+        norm_models: list[tuple[str, str, bool]] = []
+        for item in models_raw:
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                raise DrillFailure(f"invalid family policy model entry: {item!r}")
+            kind, model, enable = item
             if kind not in ("disabled", "study_allow"):
                 raise DrillFailure(f"invalid family policy rule kind: {kind!r}")
             if not isinstance(enable, bool):
                 raise DrillFailure(f"invalid family policy enable flag: {enable!r}")
             _validate_model_name(model)
-            key = (kind, model)
-            state["models"].pop(key, None)
-            state["models"][key] = enable
+            norm_models.append((kind, model, enable))
+        normalized.append((user_id, norm_policy, norm_models))
 
     lines: list[str] = []
-    for user_id, state in per_user.items():
-        final_policy = state["policy"]
-        if isinstance(final_policy, dict):
-            zone = final_policy["zone"]
-            quiet = final_policy["quiet"]
-            study = final_policy["study"]
-            override = final_policy["override_group_schedules"]
+    seq = 0
+    for user_id, policy, models in normalized:
+        if isinstance(policy, dict):
+            zone = policy["zone"]
+            quiet = policy["quiet"]
+            study = policy["study"]
+            override = policy["override_group_schedules"]
             parts = [f'openmettle-admin family set-policy --user "{user_id}" --zone "{zone}"']
             if quiet is not None:
                 parts.append(f'--quiet "{quiet}"')
@@ -795,6 +805,7 @@ def build_family_policy_reconcile_lines(
             policy_key = _family_request_key(
                 "restore-fp",
                 restore_run_id,
+                str(seq),
                 user_id,
                 "set",
                 zone,
@@ -802,15 +813,19 @@ def build_family_policy_reconcile_lines(
                 study or "",
                 "1" if override else "0",
             )
+            seq += 1
             parts.append(
                 f'--operator-id "{operator_id}" --request-key "{policy_key}" '
                 '--reason "reconcile post-backup family policy before reopening inference"'
             )
             lines.append(" ".join(parts))
 
-        for (kind, model), enable in state["models"].items():
+        for kind, model, enable in models:
             state_bit = "1" if enable else "0"
-            model_key = _family_request_key("restore-fm", restore_run_id, user_id, kind, model, state_bit)
+            model_key = _family_request_key(
+                "restore-fm", restore_run_id, str(seq), user_id, kind, model, state_bit
+            )
+            seq += 1
             flag = "--enable" if enable else "--disable"
             lines.append(
                 f'openmettle-admin family set-model --user "{user_id}" --kind {kind} '
@@ -819,8 +834,9 @@ def build_family_policy_reconcile_lines(
                 '--reason "reconcile post-backup family model rule before reopening inference"'
             )
 
-        if final_policy == "clear":
-            policy_key = _family_request_key("restore-fp", restore_run_id, user_id, "clear")
+        if policy == "clear":
+            policy_key = _family_request_key("restore-fp", restore_run_id, str(seq), user_id, "clear")
+            seq += 1
             lines.append(
                 f'openmettle-admin family clear-policy --user "{user_id}" '
                 f'--operator-id "{operator_id}" --request-key "{policy_key}" '

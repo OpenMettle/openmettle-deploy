@@ -381,14 +381,14 @@ Deploy the target release with freshly generated 32-byte `active.key` and `curso
 Bumping provider generation fences pre-restore cookies/bearers and pending logins, **not** fresh sign-ins by accounts whose authority was reduced after the backup. Before reopening authentication (`auth.enabled: true` / ingress):
 
 - Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), family-policy schedules and model rules (`openmettle.family_policies`, `openmettle.family_policy_models` `rule_kind IN ('disabled', 'study_allow')`, audited under `family_policy.*` in `openmettle.authorization_audit`, `ADR 0044`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records.
-  - Because `openmettle-admin family set-policy` replaces `zone`, `quiet`, `study`, and `override_group_schedules` (`ADR 0044`), run **`openmettle-admin family set-model` directly** when an active `openmettle.family_policies` row already exists in the restored snapshot and only model rules (`family_policy.model_*`) changed post-backup (preserving existing schedules). Run `openmettle-admin family set-policy` **with the complete audited schedule** (`--zone`, plus `--quiet`, `--study`, and `--override-group-schedules` whenever set in `authorization_audit.details`) only when `family_policy.set` occurred post-backup (or `family clear-policy` for `family_policy.clear`).
-  - Reconcile the **final** post-backup state once per grantee policy and once per `(rule_kind, model)` rule (folding intermediate toggles such as `disable -> enable -> disable` or earlier schedule edits rather than replaying superseded events whose request keys would collide and be skipped as idempotent replays), or include the unique `$AUDIT_ROW_ID` in the SHA-256 request-key input if replaying ordered audit rows individually.
+  - Capture `RESTORED_MAX_AUDIT_ID` on the restored target database (`SELECT COALESCE(MAX(id), 0) FROM openmettle.authorization_audit;`) before reconciliation, then replay post-backup `family_policy.*` rows from the primary `openmettle.authorization_audit` export (`WHERE id > $RESTORED_MAX_AUDIT_ID AND target_kind = 'family_policy' ORDER BY id ASC`) **in ascending `id` (`$AUDIT_ROW_ID`) order**, binding `"$AUDIT_ROW_ID"` into each SHA-256 `--request-key` input and selecting `--user`, `--local-group`, or `--oidc-group` per `details->>'grantee_kind'`.
+  - Why chronological audit replay with `$AUDIT_ROW_ID`: `openmettle-admin family` rejects no-op writes (`UNCHANGED`), requires a `family_policies` row to exist before `set-model`, and treats identical `(operator_id, request_key)` pairs as idempotent replays. Replaying each audited transition in `id` order applies toggles that return to the backup state (`disable -> enable` or schedule revert), multi-step toggles (`disable -> enable -> disable`), and post-backup `set-policy -> set-model -> clear-policy` sequences without `UNCHANGED` or missing-policy errors, preserves restored schedules untouched when only model rules changed post-backup, and remains idempotent if the recovery script is re-run. When emitting `family set-policy`, supply `--zone` plus `--quiet`, `--study`, and `--override-group-schedules` whenever set in `authorization_audit.details`.
   - Always derive `--request-key` from a fixed-width SHA-256 hash (`restore-fp-$RESTORE_RUN_UUID-<hash>` / `restore-fm-$RESTORE_RUN_UUID-<hash>`, 112 bytes <= the CLI's 128-byte limit) so valid model identifiers up to 256 UTF-8 bytes remain recoverable:
 
   ```sh
-  # Case 1: policy already exists in the restored snapshot; only a model rule changed post-backup
-  # (runs set-model directly so existing quiet, study, and override_group_schedules stay intact):
-  fm_hash="$(printf '%s\0%s\0disabled\0%s\01' "$RESTORE_RUN_UUID" "$RESTRICTED_USER_UUID" "$DISABLED_MODEL" | sha256sum)"
+  # Example 1: family_policy.model_disable / model_enable row ($AUDIT_ROW_ID from authorization_audit):
+  # Runs set-model directly so an already-restored policy's quiet/study/override schedule stays intact:
+  fm_hash="$(printf '%s\0%s\0%s\0disabled\0%s\01' "$RESTORE_RUN_UUID" "$AUDIT_ROW_ID" "$RESTRICTED_USER_UUID" "$DISABLED_MODEL" | sha256sum)"
   fm_key="restore-fm-$RESTORE_RUN_UUID-${fm_hash%% *}"
   openmettle-admin family set-model \
     --user "$RESTRICTED_USER_UUID" \
@@ -399,10 +399,9 @@ Bumping provider generation fences pre-restore cookies/bearers and pending login
     --request-key "$fm_key" \
     --reason "reconcile post-backup disabled model rule before reopening inference"
 
-  # Case 2: family_policy.set also occurred post-backup (supply the complete final schedule
-  # before re-applying final post-backup model rules; omit --quiet/--study/--override-group-schedules
-  # only when those fields were unset in authorization_audit.details):
-  fp_hash="$(printf '%s\0%s\0set\0%s\0%s\0%s\0%s' "$RESTORE_RUN_UUID" "$RESTRICTED_USER_UUID" "$POLICY_TZ" "${QUIET_WINDOW:-}" "${STUDY_WINDOW:-}" "${OVERRIDE_FLAG:-0}" | sha256sum)"
+  # Example 2: family_policy.set row ($AUDIT_ROW_ID; omit --quiet/--study/--override-group-schedules
+  # whenever those fields were unset in authorization_audit.details):
+  fp_hash="$(printf '%s\0%s\0%s\0set\0%s\0%s\0%s\0%s' "$RESTORE_RUN_UUID" "$AUDIT_ROW_ID" "$RESTRICTED_USER_UUID" "$POLICY_TZ" "${QUIET_WINDOW:-}" "${STUDY_WINDOW:-}" "${OVERRIDE_FLAG:-0}" | sha256sum)"
   fp_key="restore-fp-$RESTORE_RUN_UUID-${fp_hash%% *}"
   openmettle-admin family set-policy \
     --user "$RESTRICTED_USER_UUID" \
@@ -413,6 +412,15 @@ Bumping provider generation fences pre-restore cookies/bearers and pending login
     --operator-id "$OPERATOR_UUID" \
     --request-key "$fp_key" \
     --reason "reconcile post-backup family policy before reopening inference"
+
+  # Example 3: family_policy.clear row ($AUDIT_ROW_ID; runs after any prior set-policy/set-model rows):
+  fp_clear_hash="$(printf '%s\0%s\0%s\0clear' "$RESTORE_RUN_UUID" "$AUDIT_ROW_ID" "$RESTRICTED_USER_UUID" | sha256sum)"
+  fp_clear_key="restore-fp-$RESTORE_RUN_UUID-${fp_clear_hash%% *}"
+  openmettle-admin family clear-policy \
+    --user "$RESTRICTED_USER_UUID" \
+    --operator-id "$OPERATOR_UUID" \
+    --request-key "$fp_clear_key" \
+    --reason "reconcile post-backup family policy clearance before reopening inference"
   ```
 
 - **Fail-closed rule:** if post-backup identity, capability, or family-policy model restriction evidence is unavailable, **keep authentication and inference closed** (`auth.enabled: false` / ingress blocked) until an operator audits and re-approves principals, grants, and model policies, so a disabled user or model cannot regain access after restore.
