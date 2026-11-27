@@ -13,6 +13,370 @@ Names are truncated to 52 characters so that "<fullname>-migrate" stays within 6
 {{- end -}}
 {{- end -}}
 
+{{/*
+CronJob names are limited to 52 DNS characters so the CronJob controller can append a 10-digit
+timestamp ("-<ts>") within Kubernetes' 63-character Job name limit.
+*/}}
+{{- define "openmettle-core.backupCronJobName" -}}
+{{- $fullname := include "openmettle-core.fullname" . -}}
+{{- $candidate := printf "%s-backup" $fullname -}}
+{{- if le (len $candidate) 52 -}}
+{{- $candidate -}}
+{{- else -}}
+{{- $hash := substr 0 8 (sha256sum (printf "%s/%s" .Release.Name .Chart.Name)) -}}
+{{- printf "%s-%s-backup" ($fullname | trunc 36 | trimSuffix "-") $hash -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+POSIX /bin/sh snippet staging a Secret volume into 0400 regular files inside a 0700 subdirectory of
+a RAM-backed emptyDir, rejecting dot-prefixed Secret entries and decoding the RFC 8259 version-1
+keyring JSON manifest (matching core VaultKeyRing/BackupKeyRing: <= 64 KiB, unique fields,
+version == 1, 1..=16 keys, active_key_id in keys, and full JSON string escape decoding) to verify
+every referenced 32-byte key file under mountDir without writing temporary files.
+Arguments: dict "label" "vault|backup" "srcDir" <path> "stageDir" <path> "mountDir" <path> "configKey" <key>
+*/}}
+{{- define "openmettle-core.stageKeyringScript" -}}
+stage={{ .stageDir | quote }}
+src_dir={{ .srcDir | quote }}
+mount_dir={{ .mountDir | quote }}
+cfg_key={{ .configKey | quote }}
+die78() {
+  echo "$1" >&2
+  exit 78
+}
+if [ -d "$stage" ]; then
+  chmod -R u+w "$stage"
+  rm -rf -- "$stage"
+fi
+mkdir -p -- "$stage"
+chmod 0700 "$stage"
+for hidden in "$src_dir"/.*; do
+  base="${hidden##*/}"
+  case "$base" in
+    .|..|..data|..[0-9]*) continue ;;
+  esac
+  if [ -e "$hidden" ] || [ -L "$hidden" ]; then
+    die78 "dot-prefixed {{ .label }} Secret entry is not allowed: $base"
+  fi
+done
+for src in "$src_dir"/*; do
+  [ -f "$src" ] || continue
+  dst="$stage/${src##*/}"
+  cp -L -- "$src" "$dst"
+  chmod 0400 "$dst"
+done
+[ -f "$stage/$cfg_key" ] || die78 "missing {{ .label }} keyring config: $cfg_key"
+cfg_bytes=$(wc -c < "$stage/$cfg_key")
+if [ "$cfg_bytes" -le 0 ] || [ "$cfg_bytes" -gt 65536 ]; then
+  die78 "invalid {{ .label }} keyring config: document size out of bounds"
+fi
+od -An -tx1 -v < "$stage/$cfg_key" | tr 'A-F \t' 'a-f\n' | {
+  CUR=""
+  pop_byte() {
+    while IFS= read -r CUR; do
+      [ -n "$CUR" ] && return 0
+    done
+    CUR=""
+    return 1
+  }
+  pop_non_ws() {
+    while pop_byte; do
+      case "$CUR" in
+        20|09|0a|0d) ;;
+        *) return 0 ;;
+      esac
+    done
+    return 1
+  }
+  hex_digit_val() {
+    case "$1" in
+      30) HVAL=0 ;; 31) HVAL=1 ;; 32) HVAL=2 ;; 33) HVAL=3 ;; 34) HVAL=4 ;;
+      35) HVAL=5 ;; 36) HVAL=6 ;; 37) HVAL=7 ;; 38) HVAL=8 ;; 39) HVAL=9 ;;
+      41|61) HVAL=10 ;; 42|62) HVAL=11 ;; 43|63) HVAL=12 ;;
+      44|64) HVAL=13 ;; 45|65) HVAL=14 ;; 46|66) HVAL=15 ;;
+      *) return 1 ;;
+    esac
+  }
+  read_u16_escape() {
+    U16=0
+    u_idx=0
+    while [ "$u_idx" -lt 4 ]; do
+      pop_byte || die78 "invalid {{ .label }} keyring config: truncated unicode escape"
+      hex_digit_val "$CUR" || die78 "invalid {{ .label }} keyring config: bad unicode escape"
+      U16=$((U16 * 16 + HVAL))
+      u_idx=$((u_idx + 1))
+    done
+  }
+  append_ascii_code() {
+    case "$1" in
+      32) JSTR="${JSTR} " ;; 33) JSTR="${JSTR}!" ;; 34) JSTR="${JSTR}\"" ;;
+      35) JSTR="${JSTR}#" ;; 36) JSTR="${JSTR}\$" ;; 37) JSTR="${JSTR}%" ;;
+      38) JSTR="${JSTR}&" ;; 39) JSTR="${JSTR}'" ;; 40) JSTR="${JSTR}(" ;;
+      41) JSTR="${JSTR})" ;; 42) JSTR="${JSTR}*" ;; 43) JSTR="${JSTR}+" ;;
+      44) JSTR="${JSTR}," ;; 45) JSTR="${JSTR}-" ;; 46) JSTR="${JSTR}." ;;
+      47) JSTR="${JSTR}/" ;; 48) JSTR="${JSTR}0" ;; 49) JSTR="${JSTR}1" ;;
+      50) JSTR="${JSTR}2" ;; 51) JSTR="${JSTR}3" ;; 52) JSTR="${JSTR}4" ;;
+      53) JSTR="${JSTR}5" ;; 54) JSTR="${JSTR}6" ;; 55) JSTR="${JSTR}7" ;;
+      56) JSTR="${JSTR}8" ;; 57) JSTR="${JSTR}9" ;; 58) JSTR="${JSTR}:" ;;
+      59) JSTR="${JSTR};" ;; 60) JSTR="${JSTR}<" ;; 61) JSTR="${JSTR}=" ;;
+      62) JSTR="${JSTR}>" ;; 63) JSTR="${JSTR}?" ;; 64) JSTR="${JSTR}@" ;;
+      65) JSTR="${JSTR}A" ;; 66) JSTR="${JSTR}B" ;; 67) JSTR="${JSTR}C" ;;
+      68) JSTR="${JSTR}D" ;; 69) JSTR="${JSTR}E" ;; 70) JSTR="${JSTR}F" ;;
+      71) JSTR="${JSTR}G" ;; 72) JSTR="${JSTR}H" ;; 73) JSTR="${JSTR}I" ;;
+      74) JSTR="${JSTR}J" ;; 75) JSTR="${JSTR}K" ;; 76) JSTR="${JSTR}L" ;;
+      77) JSTR="${JSTR}M" ;; 78) JSTR="${JSTR}N" ;; 79) JSTR="${JSTR}O" ;;
+      80) JSTR="${JSTR}P" ;; 81) JSTR="${JSTR}Q" ;; 82) JSTR="${JSTR}R" ;;
+      83) JSTR="${JSTR}S" ;; 84) JSTR="${JSTR}T" ;; 85) JSTR="${JSTR}U" ;;
+      86) JSTR="${JSTR}V" ;; 87) JSTR="${JSTR}W" ;; 88) JSTR="${JSTR}X" ;;
+      89) JSTR="${JSTR}Y" ;; 90) JSTR="${JSTR}Z" ;; 91) JSTR="${JSTR}[" ;;
+      92) JSTR="${JSTR}\\" ;; 93) JSTR="${JSTR}]" ;; 94) JSTR="${JSTR}^" ;;
+      95) JSTR="${JSTR}_" ;; 96) JSTR="${JSTR}\`" ;; 97) JSTR="${JSTR}a" ;;
+      98) JSTR="${JSTR}b" ;; 99) JSTR="${JSTR}c" ;; 100) JSTR="${JSTR}d" ;;
+      101) JSTR="${JSTR}e" ;; 102) JSTR="${JSTR}f" ;; 103) JSTR="${JSTR}g" ;;
+      104) JSTR="${JSTR}h" ;; 105) JSTR="${JSTR}i" ;; 106) JSTR="${JSTR}j" ;;
+      107) JSTR="${JSTR}k" ;; 108) JSTR="${JSTR}l" ;; 109) JSTR="${JSTR}m" ;;
+      110) JSTR="${JSTR}n" ;; 111) JSTR="${JSTR}o" ;; 112) JSTR="${JSTR}p" ;;
+      113) JSTR="${JSTR}q" ;; 114) JSTR="${JSTR}r" ;; 115) JSTR="${JSTR}s" ;;
+      116) JSTR="${JSTR}t" ;; 117) JSTR="${JSTR}u" ;; 118) JSTR="${JSTR}v" ;;
+      119) JSTR="${JSTR}w" ;; 120) JSTR="${JSTR}x" ;; 121) JSTR="${JSTR}y" ;;
+      122) JSTR="${JSTR}z" ;; 123) JSTR="${JSTR}{" ;; 124) JSTR="${JSTR}|" ;;
+      125) JSTR="${JSTR}}" ;; 126) JSTR="${JSTR}~" ;;
+      *) JSTR="${JSTR}?"; JSTR_NON_PRINT=1 ;;
+    esac
+  }
+  parse_json_string() {
+    [ "$CUR" = "22" ] || die78 "invalid {{ .label }} keyring config: expected JSON string"
+    JSTR=""
+    JSTR_NON_PRINT=0
+    while pop_byte; do
+      if [ "$CUR" = "22" ]; then
+        return 0
+      fi
+      if [ "$CUR" = "5c" ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: unterminated string escape"
+        case "$CUR" in
+          22) JSTR="${JSTR}\"" ;;
+          5c) JSTR="${JSTR}\\" ;;
+          2f) JSTR="${JSTR}/" ;;
+          62|66|6e|72|74) JSTR="${JSTR}?"; JSTR_NON_PRINT=1 ;;
+          75)
+            read_u16_escape
+            if [ "$U16" -ge 55296 ] && [ "$U16" -le 56319 ]; then
+              pop_byte && [ "$CUR" = "5c" ] || die78 "invalid {{ .label }} keyring config: lone high surrogate"
+              pop_byte && [ "$CUR" = "75" ] || die78 "invalid {{ .label }} keyring config: lone high surrogate"
+              read_u16_escape
+              [ "$U16" -ge 56320 ] && [ "$U16" -le 57343 ] || die78 "invalid {{ .label }} keyring config: invalid surrogate pair"
+              JSTR="${JSTR}?"
+              JSTR_NON_PRINT=1
+            elif [ "$U16" -ge 56320 ] && [ "$U16" -le 57343 ]; then
+              die78 "invalid {{ .label }} keyring config: lone low surrogate"
+            else
+              append_ascii_code "$U16"
+            fi
+            ;;
+          *) die78 "invalid {{ .label }} keyring config: invalid escape sequence" ;;
+        esac
+        continue
+      fi
+      bval=$((0x$CUR))
+      if [ "$bval" -lt 32 ]; then
+        die78 "invalid {{ .label }} keyring config: unescaped control character in string"
+      elif [ "$bval" -lt 128 ]; then
+        append_ascii_code "$bval"
+      elif [ "$bval" -ge 194 ] && [ "$bval" -le 223 ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c1=$((0x$CUR))
+        [ $((c1 & 192)) -eq 128 ] || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        JSTR="${JSTR}?"; JSTR_NON_PRINT=1
+      elif [ "$bval" -ge 224 ] && [ "$bval" -le 239 ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c1=$((0x$CUR))
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c2=$((0x$CUR))
+        [ $((c1 & 192)) -eq 128 ] && [ $((c2 & 192)) -eq 128 ] || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        if { [ "$bval" -eq 224 ] && [ "$c1" -lt 160 ]; } || { [ "$bval" -eq 237 ] && [ "$c1" -ge 160 ]; }; then
+          die78 "invalid {{ .label }} keyring config: overlong or surrogate UTF-8"
+        fi
+        JSTR="${JSTR}?"; JSTR_NON_PRINT=1
+      elif [ "$bval" -ge 240 ] && [ "$bval" -le 244 ]; then
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c1=$((0x$CUR))
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c2=$((0x$CUR))
+        pop_byte || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        c3=$((0x$CUR))
+        [ $((c1 & 192)) -eq 128 ] && [ $((c2 & 192)) -eq 128 ] && [ $((c3 & 192)) -eq 128 ] || die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+        if { [ "$bval" -eq 240 ] && [ "$c1" -lt 144 ]; } || { [ "$bval" -eq 244 ] && [ "$c1" -ge 144 ]; }; then
+          die78 "invalid {{ .label }} keyring config: out-of-range UTF-8"
+        fi
+        JSTR="${JSTR}?"; JSTR_NON_PRINT=1
+      else
+        die78 "invalid {{ .label }} keyring config: invalid UTF-8"
+      fi
+    done
+    die78 "invalid {{ .label }} keyring config: unterminated string"
+  }
+  valid_key_id() {
+    [ "$2" -eq 0 ] && [ -n "$1" ] && [ "${#1}" -le 64 ] || return 1
+    {{- if eq .label "vault" }}
+    case "$1" in
+      *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    {{- else }}
+    case "$1" in
+      *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    {{- end }}
+    return 0
+  }
+  validate_key_file_ref() {
+    ref_path="$1"
+    ref_np="$2"
+    [ "$ref_np" -eq 0 ] || die78 "{{ .label }} key file outside $mount_dir: $ref_path"
+    case "$ref_path" in
+      "$mount_dir/"*) rel="${ref_path#"$mount_dir/"}" ;;
+      *) die78 "{{ .label }} key file outside $mount_dir: $ref_path" ;;
+    esac
+    case "$rel" in
+      ""|*/*|.*) die78 "invalid {{ .label }} key file name: $rel" ;;
+    esac
+    [ "$rel" != "$cfg_key" ] || die78 "{{ .label }} key file must differ from keyring config: $rel"
+    [ -f "$stage/$rel" ] || die78 "missing referenced {{ .label }} key file: $rel"
+    [ "$(wc -c < "$stage/$rel")" -eq 32 ] || die78 "{{ .label }} key file must be 32 bytes: $rel"
+  }
+  parse_version_one() {
+    pop_non_ws || die78 "invalid {{ .label }} keyring config: missing version"
+    [ "$CUR" = "31" ] || die78 "invalid {{ .label }} keyring config: version must be 1"
+    pop_byte || die78 "invalid {{ .label }} keyring config: truncated after version"
+    case "$CUR" in
+      20|09|0a|0d) pop_non_ws || die78 "invalid {{ .label }} keyring config: truncated object" ;;
+      2c|7d) ;;
+      *) die78 "invalid {{ .label }} keyring config: version must be integer 1" ;;
+    esac
+  }
+  pop_non_ws || die78 "invalid {{ .label }} keyring config: empty document"
+  [ "$CUR" = "7b" ] || die78 "invalid {{ .label }} keyring config: root must be a JSON object"
+  seen_version=0
+  seen_active=0
+  seen_keys=0
+  active_id=""
+  seen_ids=" "
+  pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated root object"
+  [ "$CUR" != "7d" ] || die78 "invalid {{ .label }} keyring config: missing required fields"
+  while :; do
+    parse_json_string
+    [ "$JSTR_NON_PRINT" -eq 0 ] || die78 "invalid {{ .label }} keyring config: unknown field"
+    top_key="$JSTR"
+    pop_non_ws && [ "$CUR" = "3a" ] || die78 "invalid {{ .label }} keyring config: expected ':'"
+    case "$top_key" in
+      version)
+        [ "$seen_version" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate version field"
+        seen_version=1
+        parse_version_one
+        delim="$CUR"
+        ;;
+      active_key_id)
+        [ "$seen_active" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate active_key_id field"
+        seen_active=1
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: missing active_key_id"
+        parse_json_string
+        valid_key_id "$JSTR" "$JSTR_NON_PRINT" || die78 "invalid {{ .label }} keyring config: invalid active_key_id"
+        active_id="$JSTR"
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: truncated root object"
+        delim="$CUR"
+        ;;
+      keys)
+        [ "$seen_keys" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate keys field"
+        seen_keys=1
+        pop_non_ws && [ "$CUR" = "5b" ] || die78 "invalid {{ .label }} keyring config: keys must be an array"
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated keys array"
+        [ "$CUR" != "5d" ] || die78 "invalid {{ .label }} keyring config: missing referenced key files"
+        key_count=0
+        while :; do
+          [ "$CUR" = "7b" ] || die78 "invalid {{ .label }} keyring config: key entry must be an object"
+          key_count=$((key_count + 1))
+          [ "$key_count" -le 16 ] || die78 "invalid {{ .label }} keyring config: more than 16 keys"
+          entry_seen_id=0
+          entry_seen_file=0
+          entry_id=""
+          entry_file=""
+          entry_file_np=0
+          pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated key entry"
+          [ "$CUR" != "7d" ] || die78 "invalid {{ .label }} keyring config: empty key entry"
+          while :; do
+            parse_json_string
+            [ "$JSTR_NON_PRINT" -eq 0 ] || die78 "invalid {{ .label }} keyring config: unknown key entry field"
+            ekey="$JSTR"
+            pop_non_ws && [ "$CUR" = "3a" ] || die78 "invalid {{ .label }} keyring config: expected ':' in key entry"
+            pop_non_ws || die78 "invalid {{ .label }} keyring config: missing value in key entry"
+            parse_json_string
+            case "$ekey" in
+              id)
+                [ "$entry_seen_id" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate id in key entry"
+                entry_seen_id=1
+                valid_key_id "$JSTR" "$JSTR_NON_PRINT" || die78 "invalid {{ .label }} keyring config: invalid key id"
+                entry_id="$JSTR"
+                ;;
+              file)
+                [ "$entry_seen_file" -eq 0 ] || die78 "invalid {{ .label }} keyring config: duplicate file in key entry"
+                entry_seen_file=1
+                entry_file="$JSTR"
+                entry_file_np="$JSTR_NON_PRINT"
+                ;;
+              *) die78 "invalid {{ .label }} keyring config: unknown key entry field" ;;
+            esac
+            pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated key entry"
+            if [ "$CUR" = "2c" ]; then
+              pop_non_ws || die78 "invalid {{ .label }} keyring config: trailing comma in key entry"
+              continue
+            elif [ "$CUR" = "7d" ]; then
+              break
+            else
+              die78 "invalid {{ .label }} keyring config: malformed key entry"
+            fi
+          done
+          [ "$entry_seen_id" -eq 1 ] && [ "$entry_seen_file" -eq 1 ] || die78 "invalid {{ .label }} keyring config: incomplete key entry"
+          case "$seen_ids" in
+            *" $entry_id "*) die78 "invalid {{ .label }} keyring config: duplicate key id $entry_id" ;;
+          esac
+          seen_ids="${seen_ids}${entry_id} "
+          validate_key_file_ref "$entry_file" "$entry_file_np"
+          pop_non_ws || die78 "invalid {{ .label }} keyring config: unterminated keys array"
+          if [ "$CUR" = "2c" ]; then
+            pop_non_ws || die78 "invalid {{ .label }} keyring config: trailing comma in keys array"
+            continue
+          elif [ "$CUR" = "5d" ]; then
+            break
+          else
+            die78 "invalid {{ .label }} keyring config: malformed keys array"
+          fi
+        done
+        pop_non_ws || die78 "invalid {{ .label }} keyring config: truncated root object"
+        delim="$CUR"
+        ;;
+      *) die78 "invalid {{ .label }} keyring config: unknown field" ;;
+    esac
+    if [ "$delim" = "2c" ]; then
+      pop_non_ws || die78 "invalid {{ .label }} keyring config: trailing comma"
+      continue
+    elif [ "$delim" = "7d" ]; then
+      break
+    else
+      die78 "invalid {{ .label }} keyring config: malformed root object"
+    fi
+  done
+  if pop_non_ws; then
+    die78 "invalid {{ .label }} keyring config: trailing data"
+  fi
+  [ "$seen_version" -eq 1 ] && [ "$seen_active" -eq 1 ] && [ "$seen_keys" -eq 1 ] || die78 "invalid {{ .label }} keyring config: missing required fields"
+  case "$seen_ids" in
+    *" $active_id "*) ;;
+    *) die78 "invalid {{ .label }} keyring config: active_key_id missing from keys" ;;
+  esac
+} || exit $?
+{{- end -}}
+
 {{/* Labels on every pod of this release, whatever its component. Argument: the root context. */}}
 {{- define "openmettle-core.releaseSelectorLabels" -}}
 app.kubernetes.io/name: {{ include "openmettle-core.name" . }}
@@ -64,12 +428,27 @@ The schema enforces the same pattern; this guard also holds under --skip-schema-
 {{- end -}}
 {{- end -}}
 
-{{/* Arguments: dict "name" "api|worker|migrate" "ref" <database values> */}}
+{{/* Arguments: dict "name" "api|worker|migrate|issuance|gateway|backup" "ref" <database values> */}}
 {{- define "openmettle-core.databaseUrlEnv" -}}
+{{- if not (kindIs "map" .ref) -}}
+{{- fail (printf "database.%s must be a mapping" .name) -}}
+{{- end -}}
+{{- if not (kindIs "string" .ref.existingSecret) -}}
+{{- fail (printf "database.%s.existingSecret must be a string" .name) -}}
+{{- end -}}
+{{- if eq .ref.existingSecret "" -}}
+{{- fail (printf "database.%s.existingSecret is required (an existing Secret holding the PostgreSQL URL)" .name) -}}
+{{- end -}}
+{{- if not (kindIs "string" .ref.key) -}}
+{{- fail (printf "database.%s.key must be a string" .name) -}}
+{{- end -}}
+{{- if eq .ref.key "" -}}
+{{- fail (printf "database.%s.key is required" .name) -}}
+{{- end -}}
 valueFrom:
   secretKeyRef:
-    name: {{ required (printf "database.%s.existingSecret is required (an existing Secret holding the PostgreSQL URL)" .name) .ref.existingSecret | quote }}
-    key: {{ required (printf "database.%s.key is required" .name) .ref.key | quote }}
+    name: {{ .ref.existingSecret | quote }}
+    key: {{ .ref.key | quote }}
 {{- end -}}
 
 {{/*
@@ -84,7 +463,7 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
-  {{- if or .storage .auth }}
+  {{- if or .storage .auth (default false .vault) }}
   fsGroup: 65532
   {{- end }}
   {{- if .storage }}
@@ -110,6 +489,13 @@ never block nested mountpoints under containerd/runc.
 {{- define "openmettle-core.inferenceConfigDirectory" -}}/etc/openmettle/inference{{- end -}}
 {{- define "openmettle-core.inferenceConfigPath" -}}/etc/openmettle/inference/inference.json{{- end -}}
 {{- define "openmettle-core.inferenceCaDirectory" -}}/etc/openmettle/inference-ca{{- end -}}
+{{- define "openmettle-core.mcpCaDirectory" -}}/etc/openmettle/mcp-ca{{- end -}}
+{{- define "openmettle-core.vaultKeysDirectory" -}}/etc/openmettle/vault-keys{{- end -}}
+{{- define "openmettle-core.backupKeysDirectory" -}}/etc/openmettle/backup-keys{{- end -}}
+{{- define "openmettle-core.backupDestinationDirectory" -}}/var/backups/openmettle{{- end -}}
+{{- define "openmettle-core.backupNeo4jDirectory" -}}/var/backups/openmettle-neo4j{{- end -}}
+{{- define "openmettle-core.backupChromaDirectory" -}}/var/backups/openmettle-chroma{{- end -}}
+{{- define "openmettle-core.backupConfigDirectory" -}}/etc/openmettle/backup-config{{- end -}}
 
 {{/*
 Resolve one gateways.<name> entry against per-gateway defaults without Sprig mergeOverwrite quirks
@@ -248,12 +634,17 @@ helper renders nothing when no volume applies.
 {{- $auth := .root.Values.auth -}}
 {{- $otlp := .root.Values.telemetry.otlp -}}
 {{- $inference := default dict .root.Values.worker.inference -}}
+{{- $mcp := default dict .root.Values.worker.mcp -}}
+{{- $vault := default dict .root.Values.vault -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
 {{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
 {{- $mountInference := and (default false .inference) (default false (get $inference "enabled")) -}}
 {{- $mountInferenceCa := and $mountInference (default false (get (default dict (get $inference "caBundle")) "enabled")) -}}
-{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference }}
+{{- $mountMcp := and (default false .mcp) (default false (get $mcp "enabled")) -}}
+{{- $mountMcpCa := and $mountMcp (default false (get (default dict (get $mcp "caBundle")) "enabled")) -}}
+{{- $mountVault := and (default false .vault) (default false (get $vault "enabled")) -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference $mountMcpCa $mountVault }}
 volumes:
   {{- if .artifacts }}
   - name: artifacts
@@ -300,6 +691,20 @@ volumes:
   {{- if $mountInferenceCa }}
   {{- include "openmettle-core.caBundleVolume" (dict "name" "inference-ca" "path" "worker.inference.caBundle" "bundle" $inference.caBundle) | nindent 2 }}
   {{- end }}
+  {{- if $mountMcpCa }}
+  {{- include "openmettle-core.caBundleVolume" (dict "name" "mcp-ca" "path" "worker.mcp.caBundle" "bundle" $mcp.caBundle) | nindent 2 }}
+  {{- end }}
+  {{- if $mountVault }}
+  - name: vault-keys-secret
+    secret:
+      secretName: {{ required "vault.existingSecret is required when vault.enabled is true" $vault.existingSecret | quote }}
+      # 0440 octal: readable by root and pod fsGroup 65532 only; staged to 0400 by stage-vault-keys.
+      defaultMode: 288
+  - name: vault-keys
+    emptyDir:
+      medium: Memory
+      sizeLimit: 1Mi
+  {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -317,12 +722,17 @@ volumes:
 {{- $auth := .root.Values.auth -}}
 {{- $otlp := .root.Values.telemetry.otlp -}}
 {{- $inference := default dict .root.Values.worker.inference -}}
+{{- $mcp := default dict .root.Values.worker.mcp -}}
+{{- $vault := default dict .root.Values.vault -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
 {{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
 {{- $mountInference := and (default false .inference) (default false (get $inference "enabled")) -}}
 {{- $mountInferenceCa := and $mountInference (default false (get (default dict (get $inference "caBundle")) "enabled")) -}}
-{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference }}
+{{- $mountMcp := and (default false .mcp) (default false (get $mcp "enabled")) -}}
+{{- $mountMcpCa := and $mountMcp (default false (get (default dict (get $mcp "caBundle")) "enabled")) -}}
+{{- $mountVault := and (default false .vault) (default false (get $vault "enabled")) -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference $mountMcpCa $mountVault }}
 volumeMounts:
   {{- if .artifacts }}
   - name: artifacts
@@ -359,6 +769,17 @@ volumeMounts:
   {{- if $mountInferenceCa }}
   - name: inference-ca
     mountPath: {{ include "openmettle-core.inferenceCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountMcpCa }}
+  - name: mcp-ca
+    mountPath: {{ include "openmettle-core.mcpCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountVault }}
+  - name: vault-keys
+    mountPath: {{ include "openmettle-core.vaultKeysDirectory" . | quote }}
+    subPath: keys
     readOnly: true
   {{- end }}
 {{- end }}
@@ -421,11 +842,132 @@ regardless of Helm's template rendering order). Argument: the root context.
 {{- if hasKey $infCa "enabled" -}}
 {{- include "openmettle-core.validate.bool" (dict "field" "worker.inference.caBundle.enabled" "value" (index $infCa "enabled")) -}}
 {{- end -}}
+{{- $mcp := default dict .Values.worker.mcp -}}
+{{- if not (kindIs "map" $mcp) -}}
+{{- fail "worker.mcp must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $mcp "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.mcp.enabled" "value" (index $mcp "enabled")) -}}
+{{- end -}}
+{{- $mcpCa := default dict (get $mcp "caBundle") -}}
+{{- if not (kindIs "map" $mcpCa) -}}
+{{- fail "worker.mcp.caBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $mcpCa "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.mcp.caBundle.enabled" "value" (index $mcpCa "enabled")) -}}
+{{- end -}}
+{{- $vault := default dict .Values.vault -}}
+{{- if not (kindIs "map" $vault) -}}
+{{- fail "vault must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $vault "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "vault.enabled" "value" (index $vault "enabled")) -}}
+{{- end -}}
+{{- $backup := default dict .Values.backup -}}
+{{- if not (kindIs "map" $backup) -}}
+{{- fail "backup must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backup "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.enabled" "value" (index $backup "enabled")) -}}
+{{- end -}}
+{{- if hasKey $backup "suspend" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.suspend" "value" (index $backup "suspend")) -}}
+{{- end -}}
+{{- if hasKey $backup "releaseOnSuccess" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.releaseOnSuccess" "value" (index $backup "releaseOnSuccess")) -}}
+{{- end -}}
+{{- $backupDest := default dict (get $backup "destination") -}}
+{{- if not (kindIs "map" $backupDest) -}}
+{{- fail "backup.destination must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupDest "requireSeparateDevice" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.destination.requireSeparateDevice" "value" (index $backupDest "requireSeparateDevice")) -}}
+{{- end -}}
+{{- $backupRet := default dict (get $backup "retention") -}}
+{{- if not (kindIs "map" $backupRet) -}}
+{{- fail "backup.retention must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupRet "prune" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.retention.prune" "value" (index $backupRet "prune")) -}}
+{{- end -}}
+{{- $backupCb := default dict (get $backup "configBundle") -}}
+{{- if not (kindIs "map" $backupCb) -}}
+{{- fail "backup.configBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupCb "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.configBundle.enabled" "value" (index $backupCb "enabled")) -}}
+{{- end -}}
+{{- $backupSa := default dict (get $backup "serviceAccount") -}}
+{{- if not (kindIs "map" $backupSa) -}}
+{{- fail "backup.serviceAccount must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupSa "create" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.serviceAccount.create" "value" (index $backupSa "create")) -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Render-time guards that do not depend on schema validation. */}}
 {{- define "openmettle-core.validate" -}}
 {{- include "openmettle-core.validate.booleans" . -}}
+{{- if not (kindIs "map" .Values.database) -}}
+{{- fail "database must be a mapping" -}}
+{{- end -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbEntry := index $.Values.database $dbRole -}}
+{{- $dbRequired := or (eq $dbRole "api") (eq $dbRole "worker") (and (eq $dbRole "migrate") $.Values.migration.enabled) -}}
+{{- if or $dbRequired (not (kindIs "invalid" $dbEntry)) -}}
+{{- if not (kindIs "map" $dbEntry) -}}
+{{- fail (printf "database.%s must be a mapping" $dbRole) -}}
+{{- end -}}
+{{- $rawDbSec := index $dbEntry "existingSecret" -}}
+{{- if or $dbRequired (not (kindIs "invalid" $rawDbSec)) -}}
+{{- if not (kindIs "string" $rawDbSec) -}}
+{{- fail (printf "database.%s.existingSecret must be a string" $dbRole) -}}
+{{- end -}}
+{{- end -}}
+{{- $rawDbKey := index $dbEntry "key" -}}
+{{- if or $dbRequired (not (kindIs "invalid" $rawDbKey)) -}}
+{{- if not (kindIs "string" $rawDbKey) -}}
+{{- fail (printf "database.%s.key must be a string" $dbRole) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.auth.loginKeysSecretName) -}}
+{{- if not (kindIs "string" .Values.auth.loginKeysSecretName) -}}
+{{- fail "auth.loginKeysSecretName must be a string" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.vault) -}}
+{{- if not (kindIs "map" .Values.vault) -}}
+{{- fail "vault must be a mapping" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.vault "existingSecret")) -}}
+{{- if not (kindIs "string" (index .Values.vault "existingSecret")) -}}
+{{- fail "vault.existingSecret must be a string" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.vault "configKey")) -}}
+{{- if not (kindIs "string" (index .Values.vault "configKey")) -}}
+{{- fail "vault.configKey must be a string" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.backup) -}}
+{{- if not (kindIs "map" .Values.backup) -}}
+{{- fail "backup must be a mapping" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.backup "existingKeysSecret")) -}}
+{{- if not (kindIs "string" (index .Values.backup "existingKeysSecret")) -}}
+{{- fail "backup.existingKeysSecret must be a string" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" (index .Values.backup "keysConfigKey")) -}}
+{{- if not (kindIs "string" (index .Values.backup "keysConfigKey")) -}}
+{{- fail "backup.keysConfigKey must be a string" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if not (kindIs "invalid" .Values.worker.sweepMs) -}}
 {{- include "openmettle-core.validate.intRange" (dict "field" "worker.sweepMs" "value" .Values.worker.sweepMs "min" 1000 "max" 3600000) -}}
 {{- end -}}
@@ -481,6 +1023,9 @@ ServiceAccount uniqueness and connection-budget checks so gateways participate i
 {{- $dbRoles := list "api" "worker" "migrate" -}}
 {{- if .Values.auth.enabled -}}
 {{- $dbRoles = append $dbRoles "issuance" -}}
+{{- end -}}
+{{- if default false (get (default dict .Values.backup) "enabled") -}}
+{{- $dbRoles = append $dbRoles "backup" -}}
 {{- end -}}
 {{- range $role := $dbRoles -}}
 {{- $ref := index $.Values.database $role -}}
@@ -569,6 +1114,11 @@ delete policy remove another component's ServiceAccount on every install or upgr
 {{- $g := index $resolvedGateways $name -}}
 {{- $components = append $components (list (printf "gateway-%s" $name) (printf "gateways.%s" $name) $g.serviceAccount) -}}
 {{- end -}}
+{{- $backupCfg := default dict .Values.backup -}}
+{{- if default false (get $backupCfg "enabled") -}}
+{{- $backupSa := default (dict "create" true "name" "" "annotations" (dict)) (get $backupCfg "serviceAccount") -}}
+{{- $components = append $components (list "backup" "backup" $backupSa) -}}
+{{- end -}}
 {{- range $entry := $components -}}
 {{- $key := index $entry 1 -}}
 {{- $name := include "openmettle-core.serviceAccountName" (dict "root" $ "component" (index $entry 0) "field" $key "serviceAccount" (index $entry 2)) -}}
@@ -607,7 +1157,8 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- end -}}
 {{- $npWorker := default dict .Values.networkPolicy.worker -}}
 {{- $npInference := default (dict "to" (list) "port" 8082) (get $npWorker "inference") -}}
-{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.worker.inference.to" "peers" $npInference.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
+{{- $npMcp := default (dict "to" (list) "ports" (list 443)) (get $npWorker "mcp") -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.worker.inference.to" "peers" $npInference.to) (dict "path" "networkPolicy.worker.mcp.to" "peers" $npMcp.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
 {{- range $i, $peer := $entry.peers -}}
 {{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
 {{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
@@ -741,9 +1292,10 @@ and are not counted; see the chart README. With auth, each API pod also opens it
 {{- $g := index $resolvedGateways $name -}}
 {{- $gateways = add $gateways (mul (add $g.replicas $g.strategy.maxSurge) $g.settings.dbMaxConnections) -}}
 {{- end -}}
-{{- $total := add $api $worker $gateways 1 -}}
+{{- $backupConns := ternary 3 0 (default false (get (default dict $.Values.backup) "enabled")) -}}
+{{- $total := add $api $worker $gateways 1 $backupConns -}}
 {{- if gt (int64 $total) (int64 .) -}}
-{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d + gateways %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker) (int64 $gateways)) -}}
+{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d + gateways %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator + %d backup" (int64 .) (int64 $total) (int64 $api) (int64 $worker) (int64 $gateways) (int64 $backupConns)) -}}
 {{- end -}}
 {{- end -}}
 {{- /*
@@ -796,6 +1348,50 @@ worker pod only; never into api, gateway or migrate pods.
 {{- end -}}
 {{- end -}}
 {{- /*
+Worker external MCP and OAuth refresh egress/CA (core V1-14, ADR 0045). External MCP connections
+live inside inference.json, so worker.mcp.enabled requires worker.inference.enabled.
+*/ -}}
+{{- $npMcpAll := default (dict "to" (list) "ports" (list 443)) (get $npWorkerAll "mcp") -}}
+{{- if not (kindIs "map" $npMcpAll) -}}
+{{- fail "networkPolicy.worker.mcp must be a mapping" -}}
+{{- end -}}
+{{- $npMcpPorts := list 443 -}}
+{{- if hasKey $npMcpAll "ports" -}}
+{{- $npMcpPorts = index $npMcpAll "ports" -}}
+{{- end -}}
+{{- if or (not (kindIs "slice" $npMcpPorts)) (eq (len $npMcpPorts) 0) (gt (len $npMcpPorts) 16) -}}
+{{- fail "networkPolicy.worker.mcp.ports must list between 1 and 16 TCP ports (1-65535)" -}}
+{{- end -}}
+{{- $seenMcpPorts := dict -}}
+{{- range $i, $port := $npMcpPorts -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "networkPolicy.worker.mcp.ports[%d]" $i) "value" $port "min" 1 "max" 65535) -}}
+{{- $portKey := printf "%d" (int64 $port) -}}
+{{- if hasKey $seenMcpPorts $portKey -}}
+{{- fail (printf "networkPolicy.worker.mcp.ports contains duplicate port %d" (int64 $port)) -}}
+{{- end -}}
+{{- $_ := set $seenMcpPorts $portKey true -}}
+{{- end -}}
+{{- $mcp := default dict .Values.worker.mcp -}}
+{{- $mcpEnabled := default false (get $mcp "enabled") -}}
+{{- $mcpCa := default dict (get $mcp "caBundle") -}}
+{{- $mcpCaEnabled := default false (get $mcpCa "enabled") -}}
+{{- if $mcpEnabled -}}
+{{- if not $infEnabled -}}
+{{- fail "worker.mcp.enabled requires worker.inference.enabled (external_mcp connections and refresh_routes live in inference.json)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.caBundle" (dict "path" "worker.mcp.caBundle" "bundle" $mcpCa) -}}
+{{- if and .Values.networkPolicy.enabled (not (get $npMcpAll "to")) -}}
+{{- fail "networkPolicy.worker.mcp.to must list at least one external MCP or OAuth refresh peer when worker.mcp.enabled and networkPolicy.enabled are true (an empty list would block egress or allow egress to every destination)" -}}
+{{- end -}}
+{{- else -}}
+{{- if $mcpCaEnabled -}}
+{{- fail "worker.mcp.caBundle.enabled cannot be true when worker.mcp.enabled is false" -}}
+{{- end -}}
+{{- if get $npMcpAll "to" -}}
+{{- fail "networkPolicy.worker.mcp.to must be empty when worker.mcp.enabled is false; remove MCP egress peers or enable worker.mcp" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
 Sign-in / OIDC and /v1/* application routes (core ADRs 0025, 0027 and 0029). Mounted into the API pod only; never into worker or
 migrate pods. The checks repeat the schema for --skip-schema-validation and enforce cross-field
 provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030) guards.
@@ -812,9 +1408,14 @@ provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030
 {{- fail "auth.catalogKey must differ from auth.configKey; the model catalog is a separate file named by catalog_file in auth.json" -}}
 {{- end -}}
 {{- end -}}
-{{- if not $auth.loginKeysSecretName -}}
+{{- $authLoginKeysSecret := "" -}}
+{{- if kindIs "string" $auth.loginKeysSecretName -}}
+{{- $authLoginKeysSecret = $auth.loginKeysSecretName -}}
+{{- end -}}
+{{- if eq $authLoginKeysSecret "" -}}
 {{- fail "auth.loginKeysSecretName is required when auth.enabled is true (an existing Secret holding raw 32-byte login key files)" -}}
 {{- end -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "auth.loginKeysSecretName" "secret" $authLoginKeysSecret "reason" "never mount a database URL Secret wholesale into the API login-keys directory") -}}
 {{- include "openmettle-core.validate.caBundle" (dict "path" "auth.providerCaBundle" "bundle" $auth.providerCaBundle) -}}
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.api.oidc.to) -}}
 {{- fail "networkPolicy.api.oidc.to must list at least one OIDC provider peer when auth.enabled and networkPolicy.enabled are true (an empty list would block sign-in or allow egress to every destination)" -}}
@@ -824,22 +1425,27 @@ Session issuance (core ADR 0030): sign-in requires a second, API-only database c
 login role of openmettle_issuance. Reusing another component's Secret key would hand the API the
 same login role twice (core exits 78) or mount a role's credential where it does not belong.
 */ -}}
-{{- $issuance := .Values.database.issuance -}}
-{{- if not $issuance.existingSecret -}}
+{{- $issuance := default dict .Values.database.issuance -}}
+{{- if not (get $issuance "existingSecret") -}}
 {{- fail "database.issuance.existingSecret is required when auth.enabled is true (an existing Secret holding the openmettle_issuance PostgreSQL URL; core ADR 0030)" -}}
 {{- end -}}
-{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $issuance.key)) -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (toString (index $issuance "key"))) -}}
 {{- fail "database.issuance.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
 {{- end -}}
-{{- range $role := list "api" "worker" "migrate" -}}
+{{- $issuanceDbRoles := list "api" "worker" "migrate" -}}
+{{- if default false (get (default dict .Values.backup) "enabled") -}}
+{{- $issuanceDbRoles = append $issuanceDbRoles "backup" -}}
+{{- end -}}
+{{- range $role := $issuanceDbRoles -}}
 {{- $ref := index $.Values.database $role -}}
-{{- if and (eq (toString $issuance.existingSecret) (toString $ref.existingSecret)) (eq (toString $issuance.key) (toString $ref.key)) -}}
+{{- if and (eq (toString (get $issuance "existingSecret")) (toString $ref.existingSecret)) (eq (toString (index $issuance "key")) (toString $ref.key)) -}}
 {{- fail (printf "database.issuance must not reuse database.%s (Secret %q, key %q); session issuance needs its own openmettle_issuance login (core ADR 0030)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
 {{- end -}}
 {{- end -}}
 {{- include "openmettle-core.validate.intRange" (dict "field" "api.settings.issuanceDbMaxConnections" "value" .Values.api.settings.issuanceDbMaxConnections "min" 1 "max" 64 "includeValueOnTypeError" true) -}}
 {{- else -}}
-{{- if .Values.database.issuance.existingSecret -}}
+{{- $issuance := default dict .Values.database.issuance -}}
+{{- if get $issuance "existingSecret" -}}
 {{- fail "database.issuance.existingSecret must be empty when auth.enabled is false; the issuance URL is mounted only with sign-in (core ADR 0030)" -}}
 {{- end -}}
 {{- if $auth.catalogKey -}}
@@ -925,6 +1531,297 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- end -}}
 {{- if .Values.networkPolicy.telemetry.otlp.to -}}
 {{- fail "networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false; remove OTLP egress peers or enable telemetry.otlp" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Credential vault keyring (core ADR 0045, V1-28). Mounted into api and worker only via
+stage-vault-keys (never gateway, migrate or backup).
+*/ -}}
+{{- $vault := default dict .Values.vault -}}
+{{- $vaultEnabled := default false (get $vault "enabled") -}}
+{{- $vaultSecret := "" -}}
+{{- if kindIs "string" (get $vault "existingSecret") -}}
+{{- $vaultSecret = get $vault "existingSecret" -}}
+{{- end -}}
+{{- $vaultConfigKey := "keyring.json" -}}
+{{- if kindIs "string" (get $vault "configKey") -}}
+{{- $vaultConfigKey = get $vault "configKey" -}}
+{{- end -}}
+{{- if $vaultEnabled -}}
+{{- if eq $vaultSecret "" -}}
+{{- fail "vault.existingSecret is required when vault.enabled is true (an existing Secret holding the vault keyring and 32-byte key files)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.nonDotKey" (dict "field" "vault.configKey" "key" $vaultConfigKey) -}}
+{{- if and .Values.auth.enabled (eq $vaultSecret .Values.auth.loginKeysSecretName) -}}
+{{- fail (printf "vault.existingSecret (%q) must differ from auth.loginKeysSecretName; keep vault master keys in a dedicated Secret (core ADR 0045)" $vaultSecret) -}}
+{{- end -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "vault.existingSecret" "secret" $vaultSecret "reason" "never stage a database URL Secret into api/worker pods") -}}
+{{- else -}}
+{{- if ne $vaultSecret "" -}}
+{{- fail "vault.existingSecret must be empty when vault.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
+*/ -}}
+{{- $backup := default dict .Values.backup -}}
+{{- $backupEnabled := default false (get $backup "enabled") -}}
+{{- $adminImage := default dict .Values.images.admin -}}
+{{- $pgClientImage := default dict .Values.images.postgresClient -}}
+{{- $backupDb := default dict .Values.database.backup -}}
+{{- $backupSecret := "" -}}
+{{- if kindIs "string" (get $backup "existingKeysSecret") -}}
+{{- $backupSecret = get $backup "existingKeysSecret" -}}
+{{- end -}}
+{{- $backupKeysKey := "keyring.json" -}}
+{{- if kindIs "string" (get $backup "keysConfigKey") -}}
+{{- $backupKeysKey = get $backup "keysConfigKey" -}}
+{{- end -}}
+{{- $backupDest := default dict (get $backup "destination") -}}
+{{- $backupGraphiti := default dict (get $backup "graphiti") -}}
+{{- $backupChroma := default dict (get $backup "chroma") -}}
+{{- $backupCb := default dict (get $backup "configBundle") -}}
+{{- if $backupEnabled -}}
+{{- range $imgEntry := list (dict "name" "admin" "image" $adminImage) (dict "name" "postgresClient" "image" $pgClientImage) -}}
+{{- if not (get $imgEntry.image "repository") -}}
+{{- fail (printf "images.%s.repository is required when backup.enabled is true" $imgEntry.name) -}}
+{{- end -}}
+{{- if not (get $imgEntry.image "digest") -}}
+{{- fail (printf "images.%s.digest is required when backup.enabled is true (sha256:<64 lowercase hex>; tags are not accepted)" $imgEntry.name) -}}
+{{- end -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString (get $imgEntry.image "digest"))) -}}
+{{- fail (printf "images.%s.digest must be sha256:<64 lowercase hex>; tags are not accepted" $imgEntry.name) -}}
+{{- end -}}
+{{- if or (contains ":" (toString (get $imgEntry.image "repository"))) (contains "@" (toString (get $imgEntry.image "repository"))) -}}
+{{- fail (printf "images.%s.repository must not contain a tag or digest" $imgEntry.name) -}}
+{{- end -}}
+{{- end -}}
+{{- $backupDbSecret := toString (default "" (get $backupDb "existingSecret")) -}}
+{{- $backupDbKey := toString (default "" (get $backupDb "key")) -}}
+{{- if not $backupDbSecret -}}
+{{- fail "database.backup.existingSecret is required when backup.enabled is true (an existing Secret holding the openmettle_owner PostgreSQL URL; core ADR 0046)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $backupDbKey) -}}
+{{- fail "database.backup.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
+{{- end -}}
+{{- $nonOwnerRoles := list "api" "worker" -}}
+{{- if .Values.auth.enabled -}}
+{{- $nonOwnerRoles = append $nonOwnerRoles "issuance" -}}
+{{- end -}}
+{{- if gt (len $gwNames) 0 -}}
+{{- $nonOwnerRoles = append $nonOwnerRoles "gateway" -}}
+{{- end -}}
+{{- range $role := $nonOwnerRoles -}}
+{{- $ref := index $.Values.database $role -}}
+{{- if and (eq $backupDbSecret (toString $ref.existingSecret)) (eq $backupDbKey (toString $ref.key)) -}}
+{{- fail (printf "database.backup must not reuse database.%s (Secret %q, key %q); backup capture requires an openmettle_owner login (core ADR 0046)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not (kindIs "string" $backup.schedule)) (eq (len $backup.schedule) 0) (gt (len $backup.schedule) 128) (regexMatch "[\\x00-\\x1f\\x7f]" $backup.schedule) -}}
+{{- fail "backup.schedule must be a non-empty cron expression of at most 128 characters without control characters" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" $backup.timeZone) -}}
+{{- if or (not (kindIs "string" $backup.timeZone)) (not (regexMatch "^[A-Za-z0-9_./+-]{1,64}$" $backup.timeZone)) -}}
+{{- fail "backup.timeZone must be null or a valid IANA time zone name (1-64 characters)" -}}
+{{- end -}}
+{{- end -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.startingDeadlineSeconds" "value" $backup.startingDeadlineSeconds "min" 1 "max" 86400) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.activeDeadlineSeconds" "value" $backup.activeDeadlineSeconds "min" 60 "max" 86400) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.successfulJobsHistoryLimit" "value" $backup.successfulJobsHistoryLimit "min" 0 "max" 100) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.failedJobsHistoryLimit" "value" $backup.failedJobsHistoryLimit "min" 0 "max" 100) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.drainTimeoutSecs" "value" $backup.drainTimeoutSecs "min" 1 "max" 86400) -}}
+{{- if le (int64 $backup.activeDeadlineSeconds) (int64 $backup.drainTimeoutSecs) -}}
+{{- fail (printf "backup.activeDeadlineSeconds (%d s) must exceed backup.drainTimeoutSecs (%d s)" (int64 $backup.activeDeadlineSeconds) (int64 $backup.drainTimeoutSecs)) -}}
+{{- end -}}
+{{- if eq $backupSecret "" -}}
+{{- fail "backup.existingKeysSecret is required when backup.enabled is true (an existing Secret holding the backup keyring and 32-byte key files)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.nonDotKey" (dict "field" "backup.keysConfigKey" "key" $backupKeysKey) -}}
+{{- if and $vaultEnabled (eq $backupSecret $vaultSecret) -}}
+{{- fail (printf "backup.existingKeysSecret (%q) must differ from vault.existingSecret; backup and vault master keys require separate custody (core ADR 0046)" $backupSecret) -}}
+{{- end -}}
+{{- if and .Values.auth.enabled (eq $backupSecret .Values.auth.loginKeysSecretName) -}}
+{{- fail (printf "backup.existingKeysSecret (%q) must differ from auth.loginKeysSecretName; keep backup master keys in a dedicated Secret (core ADR 0046)" $backupSecret) -}}
+{{- end -}}
+{{- include "openmettle-core.validate.notDatabaseSecret" (dict "root" . "field" "backup.existingKeysSecret" "secret" $backupSecret "reason" "keep backup master keys in a dedicated Secret (core ADR 0046)") -}}
+{{- $destClaim := toString (default "" (get $backupDest "existingClaim")) -}}
+{{- $destSubPath := toString (default "" (get $backupDest "subPath")) -}}
+{{- $destDomain := toString (default "" (get $backupDest "domain")) -}}
+{{- if not $destClaim -}}
+{{- fail "backup.destination.existingClaim is required when backup.enabled is true (an existing off-host PVC)" -}}
+{{- end -}}
+{{- $artifactsClaim := include "openmettle-core.artifactsClaimName" . -}}
+{{- if and .Values.storage.artifacts.enabled (eq $destClaim $artifactsClaim) -}}
+{{- fail (printf "backup.destination.existingClaim (%q) must differ from the resolved storage.artifacts claim (%q); backups must write to an isolated destination PVC (core ADR 0046)" $destClaim $artifactsClaim) -}}
+{{- end -}}
+{{- if $destSubPath -}}
+{{- include "openmettle-core.validate.relativePath" (dict "field" "backup.destination.subPath" "path" $destSubPath) -}}
+{{- end -}}
+{{- if or (not (kindIs "string" (get $backupDest "domain"))) (not (regexMatch "^[A-Za-z0-9._:/-]{1,128}$" $destDomain)) -}}
+{{- fail "backup.destination.domain is required when backup.enabled is true (1-128 ASCII characters matching ^[A-Za-z0-9._:/-]+$)" -}}
+{{- end -}}
+{{- $opId := toString (default "" (get $backup "operatorId")) -}}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" $opId) -}}
+{{- fail "backup.operatorId is required when backup.enabled is true and must be a canonical lowercase UUID" -}}
+{{- end -}}
+{{- $reason := get $backup "reason" -}}
+{{- if or (not (kindIs "string" $reason)) (eq (len $reason) 0) (gt (len $reason) 512) (ne (trim $reason) $reason) (regexMatch "[\\x00-\\x1f\\x7f]" $reason) -}}
+{{- fail "backup.reason must be a trimmed non-empty string of at most 512 bytes without control characters" -}}
+{{- end -}}
+{{- $ret := default dict (get $backup "retention") -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.retention.daily" "value" $ret.daily "min" 1 "max" 3650) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.retention.weekly" "value" $ret.weekly "min" 1 "max" 520) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.retention.monthly" "value" $ret.monthly "min" 1 "max" 120) -}}
+{{- $gMode := toString (default "not-provisioned" (get $backupGraphiti "mode")) -}}
+{{- $gClaim := toString (default "" (get $backupGraphiti "existingClaim")) -}}
+{{- $gDump := toString (default "" (get $backupGraphiti "dumpPath")) -}}
+{{- if eq $gMode "not-provisioned" -}}
+{{- if or $gClaim $gDump -}}
+{{- fail "backup.graphiti.existingClaim and dumpPath must be empty when backup.graphiti.mode is \"not-provisioned\"" -}}
+{{- end -}}
+{{- else if eq $gMode "offline-dump" -}}
+{{- if not $gClaim -}}
+{{- fail "backup.graphiti.existingClaim is required when backup.graphiti.mode is \"offline-dump\"" -}}
+{{- end -}}
+{{- if eq $gClaim $destClaim -}}
+{{- fail "backup.graphiti.existingClaim must differ from backup.destination.existingClaim" -}}
+{{- end -}}
+{{- if and .Values.storage.artifacts.enabled (eq $gClaim $artifactsClaim) -}}
+{{- fail "backup.graphiti.existingClaim must differ from the storage.artifacts claim" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.relativePath" (dict "field" "backup.graphiti.dumpPath" "path" $gDump) -}}
+{{- else -}}
+{{- fail "backup.graphiti.mode must be \"not-provisioned\" or \"offline-dump\"" -}}
+{{- end -}}
+{{- $cMode := toString (default "not-provisioned" (get $backupChroma "mode")) -}}
+{{- $cClaim := toString (default "" (get $backupChroma "existingClaim")) -}}
+{{- $cArchive := toString (default "" (get $backupChroma "archivePath")) -}}
+{{- $cQual := toString (default "" (get $backupChroma "qualificationRef")) -}}
+{{- if eq $cMode "not-provisioned" -}}
+{{- if or $cClaim $cArchive $cQual -}}
+{{- fail "backup.chroma.existingClaim, archivePath and qualificationRef must be empty when backup.chroma.mode is \"not-provisioned\"" -}}
+{{- end -}}
+{{- else if eq $cMode "archive" -}}
+{{- if $cQual -}}
+{{- fail "backup.chroma.qualificationRef must be empty when backup.chroma.mode is \"archive\"" -}}
+{{- end -}}
+{{- if not $cClaim -}}
+{{- fail "backup.chroma.existingClaim is required when backup.chroma.mode is \"archive\"" -}}
+{{- end -}}
+{{- if eq $cClaim $destClaim -}}
+{{- fail "backup.chroma.existingClaim must differ from backup.destination.existingClaim" -}}
+{{- end -}}
+{{- if and .Values.storage.artifacts.enabled (eq $cClaim $artifactsClaim) -}}
+{{- fail "backup.chroma.existingClaim must differ from the storage.artifacts claim" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.relativePath" (dict "field" "backup.chroma.archivePath" "path" $cArchive) -}}
+{{- else if eq $cMode "qualified-rebuild" -}}
+{{- if or $cClaim $cArchive -}}
+{{- fail "backup.chroma.existingClaim and archivePath must be empty when backup.chroma.mode is \"qualified-rebuild\"" -}}
+{{- end -}}
+{{- if or (eq (len $cQual) 0) (gt (len $cQual) 256) (ne (trim $cQual) $cQual) (not (regexMatch "^[\\x20-\\x7e]+$" $cQual)) -}}
+{{- fail "backup.chroma.qualificationRef is required when backup.chroma.mode is \"qualified-rebuild\" (1-256 trimmed printable ASCII characters)" -}}
+{{- end -}}
+{{- else -}}
+{{- fail "backup.chroma.mode must be \"not-provisioned\", \"archive\" or \"qualified-rebuild\"" -}}
+{{- end -}}
+{{- $cbEnabled := default false (get $backupCb "enabled") -}}
+{{- $cbCm := toString (default "" (get $backupCb "configMapName")) -}}
+{{- $cbFiles := default (list) (get $backupCb "files") -}}
+{{- if $cbEnabled -}}
+{{- if not $cbCm -}}
+{{- fail "backup.configBundle.configMapName is required when backup.configBundle.enabled is true" -}}
+{{- end -}}
+{{- if or (not (kindIs "slice" $cbFiles)) (eq (len $cbFiles) 0) (gt (len $cbFiles) 32) -}}
+{{- fail "backup.configBundle.files must list between 1 and 32 entries when backup.configBundle.enabled is true" -}}
+{{- end -}}
+{{- $seenCbNames := dict -}}
+{{- range $i, $entry := $cbFiles -}}
+{{- if not (kindIs "map" $entry) -}}
+{{- fail (printf "backup.configBundle.files[%d] must be a mapping with name and key" $i) -}}
+{{- end -}}
+{{- $fname := toString (default "" (get $entry "name")) -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" $fname)) (eq (lower $fname) "vault-key-inventory.json") -}}
+{{- fail (printf "backup.configBundle.files[%d].name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ and must not be vault-key-inventory.json" $i) -}}
+{{- end -}}
+{{- $lowerName := lower $fname -}}
+{{- if hasKey $seenCbNames $lowerName -}}
+{{- fail (printf "backup.configBundle.files contains duplicate case-insensitive name %q" $fname) -}}
+{{- end -}}
+{{- $_ := set $seenCbNames $lowerName true -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" (printf "backup.configBundle.files[%d].key" $i) "key" (get $entry "key")) -}}
+{{- end -}}
+{{- else -}}
+{{- if $cbCm -}}
+{{- fail "backup.configBundle.configMapName must be empty when backup.configBundle.enabled is false" -}}
+{{- end -}}
+{{- if $cbFiles -}}
+{{- fail "backup.configBundle.files must be empty when backup.configBundle.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if or (get $adminImage "registry") (get $adminImage "repository") (get $adminImage "digest") -}}
+{{- fail "images.admin.{registry,repository,digest} must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (get $pgClientImage "registry") (get $pgClientImage "repository") (get $pgClientImage "digest") -}}
+{{- fail "images.postgresClient.{registry,repository,digest} must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if get $backupDb "existingSecret" -}}
+{{- fail "database.backup.existingSecret must be empty when backup.enabled is false; the backup owner URL is mounted only when backup.enabled is true (core ADR 0046)" -}}
+{{- end -}}
+{{- if $backupSecret -}}
+{{- fail "backup.existingKeysSecret must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (get $backupDest "existingClaim") (get $backupDest "subPath") (get $backupDest "domain") -}}
+{{- fail "backup.destination.{existingClaim,subPath,domain} must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if get $backup "operatorId" -}}
+{{- fail "backup.operatorId must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (ne (toString (default "not-provisioned" (get $backupGraphiti "mode"))) "not-provisioned") (get $backupGraphiti "existingClaim") (get $backupGraphiti "dumpPath") -}}
+{{- fail "backup.graphiti must stay not-provisioned with empty paths when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (ne (toString (default "not-provisioned" (get $backupChroma "mode"))) "not-provisioned") (get $backupChroma "existingClaim") (get $backupChroma "archivePath") (get $backupChroma "qualificationRef") -}}
+{{- fail "backup.chroma must stay not-provisioned with empty paths when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (default false (get $backupCb "enabled")) (get $backupCb "configMapName") (get $backupCb "files") -}}
+{{- fail "backup.configBundle must stay disabled and empty when backup.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "root" $ "field" <path> "secret" <string> "reason" <string> */}}
+{{- define "openmettle-core.validate.notDatabaseSecret" -}}
+{{- $field := .field -}}
+{{- $secret := .secret -}}
+{{- $reason := .reason -}}
+{{- range $dbRole := list "api" "worker" "migrate" "issuance" "gateway" "backup" -}}
+{{- $dbEntry := index $.root.Values.database $dbRole -}}
+{{- if kindIs "map" $dbEntry -}}
+{{- $dbSec := index $dbEntry "existingSecret" -}}
+{{- if and (kindIs "string" $dbSec) (ne $dbSec "") (eq $secret $dbSec) -}}
+{{- fail (printf "%s (%q) must differ from database.%s.existingSecret; %s" $field $secret $dbRole $reason) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "field" <path> "key" <value> */}}
+{{- define "openmettle-core.validate.nonDotKey" -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$" (toString .key)) -}}
+{{- fail (printf "%s must start with an ASCII letter or digit and use only letters, digits, '-', '_' or '.'" .field) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "field" <path> "path" <value> */}}
+{{- define "openmettle-core.validate.relativePath" -}}
+{{- $p := toString .path -}}
+{{- if or (eq (len $p) 0) (gt (len $p) 256) (not (regexMatch "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$" $p)) -}}
+{{- fail (printf "%s must be a non-empty relative path without leading slash, whitespace or traversal" .field) -}}
+{{- end -}}
+{{- range $seg := splitList "/" $p -}}
+{{- if or (eq $seg ".") (eq $seg "..") -}}
+{{- fail (printf "%s must not contain '.' or '..' path segments" $.field) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

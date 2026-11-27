@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,20 +40,36 @@ MATRIX = {
     "gateway-and-inference-enabled": ("gateway-and-inference-enabled.yaml",),
     "gateway-tls-terminator": ("gateway-tls-terminator.yaml",),
     "gateway-network-policy-disabled": ("gateway-network-policy-disabled.yaml",),
+    "vault-and-backup-enabled": ("vault-and-backup-enabled.yaml",),
+    "backup-network-policy-disabled": ("backup-network-policy-disabled.yaml",),
 }
 PREFIX = {"api": "OPENMETTLE_API_", "worker": "OPENMETTLE_WORKER_", "migrate": "OPENMETTLE_MIGRATE_",
-          "gateway": "OPENMETTLE_GATEWAY_"}
+          "gateway": "OPENMETTLE_GATEWAY_", "backup": "OPENMETTLE_ADMIN_"}
 PORT = {"api": 8080, "worker": 8081, "gateway": 8082}
 INFERENCE_CONFIG_DIR = "/etc/openmettle/inference"
 INFERENCE_CONFIG_PATH = "/etc/openmettle/inference/inference.json"
 INFERENCE_CA_DIR = "/etc/openmettle/inference-ca"
 INFERENCE_VOLUMES = {"inference-config", "inference-ca"}
+MCP_CA_DIR = "/etc/openmettle/mcp-ca"
+MCP_VOLUMES = {"mcp-ca"}
+VAULT_KEYS_DIR = "/etc/openmettle/vault-keys"
+VAULT_VOLUMES = {"vault-keys-secret", "vault-keys"}
+BACKUP_KEYS_DIR = "/etc/openmettle/backup-keys"
+BACKUP_DEST_DIR = "/var/backups/openmettle"
+BACKUP_NEO4J_DIR = "/var/backups/openmettle-neo4j"
+BACKUP_CHROMA_DIR = "/var/backups/openmettle-chroma"
+BACKUP_CONFIG_DIR = "/etc/openmettle/backup-config"
+BACKUP_VOLUMES = {
+    "admin-bin", "backup-keys-secret", "backup-keys", "backup-destination", "tmp",
+    "db-ca-src", "neo4j-dump", "chroma-archive", "backup-config-src", "backup-config",
+}
+RAW_STAGED_SOURCES = {"vault-keys-secret", "backup-keys-secret", "db-ca-src", "backup-config-src"}
 
 
 def role_kind(role):
     return "gateway" if role.startswith("gateway-") else role
-ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job", "NetworkPolicy", "PersistentVolumeClaim", "Ingress",
-                 "PodDisruptionBudget"}
+ALLOWED_KINDS = {"Deployment", "Service", "ServiceAccount", "Job", "CronJob", "NetworkPolicy",
+                 "PersistentVolumeClaim", "Ingress", "PodDisruptionBudget"}
 ALLOWED_RESOURCES = {"cpu", "memory", "ephemeral-storage"}
 IMAGE = re.compile(r"^(?:[a-z0-9.-]+(?::[0-9]+)?/)?[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
 HOOK = "helm.sh/hook"
@@ -97,7 +114,13 @@ def component(doc):
 
 def pods(docs):
     """(component, pod spec) for every workload that creates pods."""
-    return [(component(d), d["spec"]["template"]["spec"]) for d in docs if d["kind"] in ("Deployment", "Job")]
+    result = []
+    for d in docs:
+        if d["kind"] in ("Deployment", "Job"):
+            result.append((component(d), d["spec"]["template"]["spec"]))
+        elif d["kind"] == "CronJob":
+            result.append((component(d), d["spec"]["jobTemplate"]["spec"]["template"]["spec"]))
+    return result
 
 
 def containers(pod):
@@ -106,7 +129,13 @@ def containers(pod):
 
 def pod_labels(docs):
     """(component, pod template labels) for every workload that creates pods."""
-    return [(component(d), d["spec"]["template"]["metadata"]["labels"]) for d in docs if d["kind"] in ("Deployment", "Job")]
+    result = []
+    for d in docs:
+        if d["kind"] in ("Deployment", "Job"):
+            result.append((component(d), d["spec"]["template"]["metadata"]["labels"]))
+        elif d["kind"] == "CronJob":
+            result.append((component(d), d["spec"]["jobTemplate"]["spec"]["template"]["metadata"]["labels"]))
+    return result
 
 
 def selects(selector, labels):
@@ -170,11 +199,11 @@ class PodPolicyTest(Rendered):
             self.assertEqual(context.get("runAsGroup"), 65532)
             self.assertEqual(context.get("seccompProfile"), {"type": "RuntimeDefault"})
             vol_names = {v["name"] for v in pod.get("volumes", [])}
-            if "artifacts" in vol_names or "auth-login-keys" in vol_names:
+            if vol_names & {"artifacts", "auth-login-keys", "vault-keys-secret", "backup-destination"}:
                 self.assertEqual(context.get("fsGroup"), 65532)
             else:
-                self.assertNotIn("fsGroup", context, "fsGroup is only for pods mounting artifacts or auth login keys")
-            if "artifacts" in vol_names:
+                self.assertNotIn("fsGroup", context, "fsGroup is only for pods mounting artifacts, backup PVCs or 0440 key Secrets")
+            if vol_names & {"artifacts", "backup-destination"}:
                 self.assertEqual(context.get("fsGroupChangePolicy"), "OnRootMismatch")
             else:
                 self.assertNotIn("fsGroupChangePolicy", context)
@@ -201,28 +230,57 @@ class PodPolicyTest(Rendered):
                     self.assertNotIn("hostPort", port)
 
     def test_only_known_volumes(self):
-        """Fails if a pod gains an unknown volume, auth volumes appear outside api, inference volumes appear outside worker, otlp-ca appears on migrate, or a mount lacks a matching volume."""
+        """Fails if a pod gains an unknown volume, role-specific volumes leak, raw staged secrets reach a main container, or a mount lacks a matching volume."""
         for _, role, pod in self.each_pod():
             vols = {v["name"]: v for v in pod.get("volumes", [])}
-            self.assertLessEqual(set(vols), {"artifacts", "db-ca", "otlp-ca"} | AUTH_VOLUMES | INFERENCE_VOLUMES)
+            allowed = ({"artifacts", "db-ca", "otlp-ca"} | AUTH_VOLUMES | INFERENCE_VOLUMES
+                       | MCP_VOLUMES | VAULT_VOLUMES | BACKUP_VOLUMES)
+            self.assertLessEqual(set(vols), allowed)
             if role != "api":
                 self.assertFalse(AUTH_VOLUMES & set(vols), f"{role} must never mount auth volumes")
             if role != "worker":
-                self.assertFalse(INFERENCE_VOLUMES & set(vols), f"{role} must never mount inference volumes")
+                self.assertFalse((INFERENCE_VOLUMES | MCP_VOLUMES) & set(vols),
+                                 f"{role} must never mount inference or MCP volumes")
+            if role not in ("api", "worker"):
+                self.assertFalse(VAULT_VOLUMES & set(vols), f"{role} must never mount vault volumes")
+            if role != "backup":
+                self.assertFalse(BACKUP_VOLUMES & set(vols), f"{role} must never mount backup volumes")
             if role_kind(role) == "gateway":
                 self.assertNotIn("artifacts", vols, f"{role} must never mount artifacts")
-            if role == "migrate":
-                self.assertNotIn("otlp-ca", vols, "migrate must never mount otlp-ca")
-            if "artifacts" in vols:
-                self.assertEqual(set(vols["artifacts"]), {"name", "persistentVolumeClaim"})
-            for cm_vol in ("db-ca", "auth-config", "auth-provider-ca", "otlp-ca", "inference-config", "inference-ca"):
+            if role in ("migrate", "backup"):
+                self.assertNotIn("otlp-ca", vols, f"{role} must never mount otlp-ca")
+            for pvc_vol in ("artifacts", "backup-destination", "neo4j-dump", "chroma-archive"):
+                if pvc_vol in vols:
+                    self.assertEqual(set(vols[pvc_vol]), {"name", "persistentVolumeClaim"})
+            for cm_vol in ("db-ca-src", "auth-config", "auth-provider-ca", "otlp-ca",
+                           "inference-config", "inference-ca", "mcp-ca", "backup-config-src"):
                 if cm_vol in vols:
                     self.assertEqual(set(vols[cm_vol]), {"name", "configMap"})
-            if "auth-login-keys" in vols:
-                self.assertEqual(set(vols["auth-login-keys"]), {"name", "secret"})
-            for container in containers(pod):
-                vol_mounts = container.get("volumeMounts", [])
-                self.assertEqual(sorted(m["name"] for m in vol_mounts), sorted(vols))
+            if "db-ca" in vols:
+                expected_type = "emptyDir" if role == "backup" else "configMap"
+                self.assertEqual(set(vols["db-ca"]), {"name", expected_type})
+            for sec_vol in ("auth-login-keys", "vault-keys-secret", "backup-keys-secret"):
+                if sec_vol in vols:
+                    self.assertEqual(set(vols[sec_vol]), {"name", "secret"})
+            for mem_vol in ("vault-keys", "backup-keys", "tmp", "backup-config"):
+                if mem_vol in vols:
+                    self.assertEqual(vols[mem_vol]["emptyDir"].get("medium"), "Memory")
+            if "admin-bin" in vols:
+                self.assertEqual(set(vols["admin-bin"]), {"name", "emptyDir"})
+            mounted_union = set()
+            for init_c in pod.get("initContainers", []):
+                names = {m["name"] for m in init_c.get("volumeMounts", [])}
+                self.assertLessEqual(names, set(vols))
+                self.assertFalse(names & {"artifacts", "backup-destination", "neo4j-dump", "chroma-archive", "tmp",
+                                          "auth-config", "auth-login-keys", "inference-config", "otlp-ca", "mcp-ca"})
+                mounted_union |= names
+            for main_c in pod["containers"]:
+                names = {m["name"] for m in main_c.get("volumeMounts", [])}
+                self.assertLessEqual(names, set(vols))
+                self.assertFalse(names & RAW_STAGED_SOURCES,
+                                 f"{role} main container must never mount raw staged source {names & RAW_STAGED_SOURCES}")
+                mounted_union |= names
+            self.assertEqual(mounted_union, set(vols))
 
     def test_volume_mount_paths_are_non_overlapping(self):
         """Fails if any volumeMount is nested inside another mountPath (read-only ConfigMap mounts fail nested mkdir with EROFS)."""
@@ -242,15 +300,26 @@ class PodPolicyTest(Rendered):
             self.assertIs(pod.get("enableServiceLinks"), False)
 
     def test_environment_is_explicit_and_prefixed(self):
-        """Fails on envFrom, an env name outside the component's own prefix, or a literal DATABASE_URL."""
+        """Fails on envFrom, env vars on staging initContainers, unexpected env prefixes, or a literal DATABASE_URL."""
         for _, role, pod in self.each_pod():
             kind = role_kind(role)
-            for container in containers(pod):
+            for init_c in pod.get("initContainers", []):
+                self.assertNotIn("envFrom", init_c)
+                self.assertEqual(init_c.get("env", []), [], f"{role} initContainer {init_c['name']} must not take env vars")
+            for container in pod["containers"]:
                 self.assertNotIn("envFrom", container)
                 env = container.get("env", [])
                 self.assertTrue(env)
-                for entry in env:
-                    self.assertTrue(entry["name"].startswith(PREFIX[kind]), entry["name"])
+                if kind == "backup":
+                    self.assertEqual({e["name"] for e in env},
+                                     {"OPENMETTLE_ADMIN_DATABASE_URL", "OPENMETTLE_BACKUP_JOB_UID"})
+                    self.assertEqual(
+                        env_map(container)["OPENMETTLE_BACKUP_JOB_UID"]["valueFrom"],
+                        {"fieldRef": {"fieldPath": "metadata.labels['batch.kubernetes.io/controller-uid']"}},
+                    )
+                else:
+                    for entry in env:
+                        self.assertTrue(entry["name"].startswith(PREFIX[kind]), entry["name"])
                 url = env_map(container)[PREFIX[kind] + "DATABASE_URL"]
                 self.assertNotIn("value", url)
                 self.assertEqual(set(url["valueFrom"]), {"secretKeyRef"})
@@ -259,7 +328,7 @@ class PodPolicyTest(Rendered):
     def test_bind_is_explicit(self):
         """Fails if BIND is removed (core would default to loopback) or set to the wrong port."""
         for _, role, pod in self.each_pod():
-            if role == "migrate":
+            if role in ("migrate", "backup"):
                 continue
             kind = role_kind(role)
             env = env_map(pod["containers"][0])
@@ -368,35 +437,42 @@ class ReleasePolicyTest(Rendered):
                 self.assertEqual(find(docs, "Service", "-api")["spec"]["type"], "ClusterIP")
 
     def test_owner_credential_only_in_migration_job(self):
-        """Fails if the migrate (owner) Secret is referenced outside the Job, or a role reads another's Secret."""
+        """Fails if an owner/backup Secret is referenced outside Job/CronJob, or a role reads another's Secret."""
         for name, docs in self.renders.items():
             with self.subTest(values=name):
                 for role, pod in pods(docs):
                     kind = role_kind(role)
                     ref = env_map(pod["containers"][0])[PREFIX[kind] + "DATABASE_URL"]["valueFrom"]["secretKeyRef"]
-                    expected = {"api": "openmettle-api-database", "worker": "openmettle-worker-database",
-                                "migrate": "openmettle-owner-database", "gateway": "openmettle-gateway-database"}[kind]
-                    self.assertEqual(ref["name"], expected)
-                rendered = yaml.safe_dump_all(d for d in docs if d["kind"] != "Job")
+                    if kind == "backup":
+                        self.assertIn(ref["name"], {"openmettle-owner-database", "openmettle-backup-database"})
+                    else:
+                        expected = {"api": "openmettle-api-database", "worker": "openmettle-worker-database",
+                                    "migrate": "openmettle-owner-database", "gateway": "openmettle-gateway-database"}[kind]
+                        self.assertEqual(ref["name"], expected)
+                rendered = yaml.safe_dump_all(d for d in docs if d["kind"] not in ("Job", "CronJob"))
                 self.assertNotIn("openmettle-owner-database", rendered)
+                self.assertNotIn("openmettle-backup-database", rendered)
 
     def test_values_reach_the_environment(self):
         """Fails if a settings value or Secret key is not plumbed into the matching env var."""
         docs = self.renders["all-keys"]
         expected = {
             "api": {"DB_MAX_CONNECTIONS": "6", "DB_TIMEOUT_MS": "2500", "SHUTDOWN_TIMEOUT_MS": "8000",
-                    "ISSUANCE_DB_MAX_CONNECTIONS": "3"},
+                    "ISSUANCE_DB_MAX_CONNECTIONS": "3", "VAULT_KEYS_CONFIG": f"{VAULT_KEYS_DIR}/vault-keyring.json"},
             "worker": {"DB_MAX_CONNECTIONS": "2", "DB_TIMEOUT_MS": "1000", "SHUTDOWN_TIMEOUT_MS": "3000",
                        "SWEEP_MS": "30000", "POLL_MS": "500", "INFERENCE_CONFIG": INFERENCE_CONFIG_PATH,
                        "RUN_SLOTS": "8", "LEASE_MS": "60000", "EXECUTION_TIMEOUT_MS": "180000",
-                       "EXECUTING_PER_ACTOR": "3", "EXECUTING_PER_SCOPE": "6"},
+                       "EXECUTING_PER_ACTOR": "3", "EXECUTING_PER_SCOPE": "6",
+                       "VAULT_KEYS_CONFIG": f"{VAULT_KEYS_DIR}/vault-keyring.json"},
             "migrate": {"CONNECT_TIMEOUT_MS": "10000", "LOCK_TIMEOUT_MS": "30000", "STATEMENT_TIMEOUT_MS": "600000"},
             "gateway-a": {"DB_MAX_CONNECTIONS": "3", "DB_TIMEOUT_MS": "1500", "SHUTDOWN_TIMEOUT_MS": "7000",
                           "MODEL": "model-a", "UPSTREAM_URL": "http://sglang-a.inference.example.test:30000",
                           "CACHE_MODE": "per_request", "UPSTREAM_CONNECT_TIMEOUT_MS": "4000",
                           "UPSTREAM_IDLE_TIMEOUT_MS": "90000"},
+            "backup": {},
         }
-        keys = {"api": "api-url", "worker": "worker-url", "migrate": "owner-url", "gateway-a": "gateway-url"}
+        keys = {"api": "api-url", "worker": "worker-url", "migrate": "owner-url",
+                "gateway-a": "gateway-url", "backup": "backup-url"}
         for role, pod in pods(docs):
             kind = role_kind(role)
             env = env_map(pod["containers"][0])
@@ -524,7 +600,7 @@ class NetworkPolicyTest(Rendered):
     """Design §5: a chart-scoped deny-all plus DNS and database egress, and API/gateway ingress from configured peers."""
 
     ENABLED = ("minimal", "all-keys", "migration-disabled", "auth-enabled", "telemetry-otlp-enabled",
-               "gateway-and-inference-enabled", "gateway-tls-terminator")
+               "gateway-and-inference-enabled", "gateway-tls-terminator", "vault-and-backup-enabled")
 
     def policies(self, name):
         return [d for d in self.renders[name] if d["kind"] == "NetworkPolicy"]
@@ -574,20 +650,27 @@ class NetworkPolicyTest(Rendered):
             {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-ingress"}},
              "podSelector": {"matchLabels": {"app.kubernetes.io/name": "example-gateway-tls"}}},
         ]
+        all_keys_worker_mcp = [{"ipBlock": {"cidr": "198.51.100.80/32"}}]
         expected = {
-            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None, None, None, {}),
+            "minimal": (DEFAULT_DNS_PEERS, default_db, 5432, None, None, None, None, {}, False),
             "auth-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, ([{"ipBlock": {"cidr": "192.0.2.20/32"}}], 443),
-                             None, None, {}),
+                             None, None, None, {}, False),
             "telemetry-otlp-enabled": (DEFAULT_DNS_PEERS, default_db, 5432, None,
-                                       ([{"ipBlock": {"cidr": "192.0.2.30/32"}}], 4318), None, {}),
+                                       ([{"ipBlock": {"cidr": "192.0.2.30/32"}}], 4318), None, None, {}, False),
+            "vault-and-backup-enabled": (
+                DEFAULT_DNS_PEERS, default_db, 5432, None, None,
+                ([{"ipBlock": {"cidr": "192.0.2.40/32"}}], 8082),
+                ([{"ipBlock": {"cidr": "192.0.2.50/32"}}], [443]),
+                {}, True,
+            ),
             "all-keys": ([{"ipBlock": {"cidr": "192.0.2.10/32"}},
                           {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "example-dns"}}}],
                          [{"ipBlock": {"cidr": "198.51.100.0/24"}}, {"ipBlock": {"cidr": "2001:db8::/64"}}],
                          5433, (all_keys_oidc, 8443), (all_keys_otlp, 4319),
-                         (all_keys_worker_inf, 8443),
-                         {"gateway-a": ([{"ipBlock": {"cidr": "198.51.100.70/32"}}], 30000)}),
+                         (all_keys_worker_inf, 8443), (all_keys_worker_mcp, [443, 8443]),
+                         {"gateway-a": ([{"ipBlock": {"cidr": "198.51.100.70/32"}}], 30000)}, True),
         }
-        for name, (dns, database, port, api_oidc, otlp, worker_inf, gw_upstreams) in expected.items():
+        for name, (dns, database, port, api_oidc, otlp, worker_inf, worker_mcp, gw_upstreams, has_backup) in expected.items():
             roles = []
             for role, labels in pod_labels(self.renders[name]):
                 roles.append(role)
@@ -598,17 +681,21 @@ class NetworkPolicyTest(Rendered):
                     if role == "api" and api_oidc is not None:
                         oidc_peers, oidc_port = api_oidc
                         rules.append({"to": oidc_peers, "ports": [{"protocol": "TCP", "port": oidc_port}]})
-                    if role != "migrate" and otlp is not None:
+                    if role not in ("migrate", "backup") and otlp is not None:
                         otlp_peers, otlp_port = otlp
                         rules.append({"to": otlp_peers, "ports": [{"protocol": "TCP", "port": otlp_port}]})
                     if role == "worker" and worker_inf is not None:
                         inf_peers, inf_port = worker_inf
                         rules.append({"to": inf_peers, "ports": [{"protocol": "TCP", "port": inf_port}]})
+                    if role == "worker" and worker_mcp is not None:
+                        mcp_peers, mcp_ports = worker_mcp
+                        rules.append({"to": mcp_peers, "ports": [{"protocol": "TCP", "port": p} for p in mcp_ports]})
                     if role in gw_upstreams:
                         up_peers, up_port = gw_upstreams[role]
                         rules.append({"to": up_peers, "ports": [{"protocol": "TCP", "port": up_port}]})
                     self.assertEqual(egress, rules)
-            self.assertEqual(sorted(roles), sorted(["api", "migrate", "worker", *gw_upstreams]))
+            expected_roles = ["api", "migrate", "worker", *gw_upstreams, *(["backup"] if has_backup else [])]
+            self.assertEqual(sorted(roles), sorted(expected_roles))
 
     def test_ingress_only_to_api_from_configured_peers(self):
         """Fails if a worker or migrate pod accepts ingress, or API/gateway ingress is open, widened or on another port."""
@@ -696,7 +783,8 @@ class NetworkPolicyTest(Rendered):
         """Fails if values.yaml stops enabling policies, changes the DNS peer or ships database, API, worker or OTLP peers."""
         defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))["networkPolicy"]
         self.assertEqual(defaults, {"enabled": True, "api": {"ingressFrom": [], "oidc": {"to": [], "port": 443}},
-                                    "worker": {"inference": {"to": [], "port": 8082}},
+                                    "worker": {"inference": {"to": [], "port": 8082},
+                                               "mcp": {"to": [], "ports": [443]}},
                                     "dns": {"to": DEFAULT_DNS_PEERS}, "database": {"to": [], "port": 5432},
                                     "telemetry": {"otlp": {"to": [], "port": 4318}}})
 
@@ -706,6 +794,7 @@ class NetworkPolicyTest(Rendered):
         self.assertIn("r" * 52 + "-deny-all", names)
         self.assertIn("r" * 52 + "-artifacts", names)
         self.assertIn("r" * 52 + "-gateway-a", names)
+        self.assertIn("r" * 52 + "-backup", names)
         self.assertLessEqual(max(map(len, names)), 63, names)
 
 
@@ -763,9 +852,13 @@ class OptionalDefaultsTest(Rendered):
             },
         })
         self.assertEqual(defaults["networkPolicy"]["telemetry"], {"otlp": {"to": [], "port": 4318}})
-        self.assertEqual(defaults["networkPolicy"]["worker"], {"inference": {"to": [], "port": 8082}})
+        self.assertEqual(defaults["networkPolicy"]["worker"], {"inference": {"to": [], "port": 8082},
+                                                               "mcp": {"to": [], "ports": [443]}})
         self.assertEqual(defaults["images"]["gateway"], {"registry": "", "repository": "", "digest": ""})
+        self.assertEqual(defaults["images"]["admin"], {"registry": "", "repository": "", "digest": ""})
+        self.assertEqual(defaults["images"]["postgresClient"], {"registry": "", "repository": "", "digest": ""})
         self.assertEqual(defaults["database"]["gateway"], {"existingSecret": "", "key": "url"})
+        self.assertEqual(defaults["database"]["backup"], {"existingSecret": "", "key": "url"})
         self.assertIsNone(defaults["worker"]["pollMs"])
         self.assertEqual(defaults["worker"]["inference"], {
             "enabled": False,
@@ -781,7 +874,17 @@ class OptionalDefaultsTest(Rendered):
             },
             "caBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
         })
+        self.assertEqual(defaults["worker"]["mcp"], {
+            "enabled": False,
+            "caBundle": {"enabled": False, "configMapName": "", "key": "ca.crt"},
+        })
         self.assertEqual(defaults["gateways"], {})
+        self.assertEqual(defaults["vault"], {"enabled": False, "existingSecret": "", "configKey": "keyring.json"})
+        self.assertIs(defaults["backup"]["enabled"], False)
+        self.assertEqual(defaults["backup"]["existingKeysSecret"], "")
+        self.assertEqual(defaults["backup"]["destination"]["existingClaim"], "")
+        self.assertEqual(defaults["backup"]["destination"]["domain"], "")
+        self.assertEqual(defaults["backup"]["operatorId"], "")
 
     def test_defaults_render_no_optional_resource_volume_or_env(self):
         """Fails if a default render gains a PVC, Ingress, PDB, volume, mount, fsGroup or environment variable."""
@@ -802,15 +905,21 @@ class DatabaseCaTest(Rendered):
     """database.caBundle mounts one existing ConfigMap key read-only into every component."""
 
     def test_mounted_read_only_into_every_component(self):
-        """Fails if api, worker, migrate or gateway lacks the CA volume, the mount is writable or the file name changes."""
+        """Fails if api, worker, migrate, gateway or backup lacks the CA volume, the mount is writable or the file name changes."""
         roles = []
         for role, pod in pods(self.renders["all-keys"]):
             roles.append(role)
             with self.subTest(component=role):
-                self.assertEqual(volumes(pod)["db-ca"], {"name": "db-ca", "configMap": {
-                    "name": "example-db-ca", "items": [{"key": "root-ca.pem", "path": "ca.crt"}]}})
+                if role == "backup":
+                    self.assertEqual(volumes(pod)["db-ca-src"], {"name": "db-ca-src", "configMap": {
+                        "name": "example-db-ca", "items": [{"key": "root-ca.pem", "path": "ca.crt"}]}})
+                    self.assertEqual(volumes(pod)["db-ca"], {"name": "db-ca", "emptyDir": {
+                        "medium": "Memory", "sizeLimit": "1Mi"}})
+                else:
+                    self.assertEqual(volumes(pod)["db-ca"], {"name": "db-ca", "configMap": {
+                        "name": "example-db-ca", "items": [{"key": "root-ca.pem", "path": "ca.crt"}]}})
                 self.assertEqual(mounts(pod)["db-ca"], {"name": "db-ca", "mountPath": DB_CA_DIRECTORY, "readOnly": True})
-        self.assertEqual(sorted(roles), ["api", "gateway-a", "migrate", "worker"])
+        self.assertEqual(sorted(roles), ["api", "backup", "gateway-a", "migrate", "worker"])
 
     def test_no_environment_variable(self):
         """Fails if the CA adds an environment variable (core ADR 0002: no shared PG* defaults; use sslrootcert in the URL)."""
@@ -858,26 +967,36 @@ class ArtifactStorageTest(Rendered):
         self.assertEqual(find(docs, "PersistentVolumeClaim", "-artifacts")["spec"]["storageClassName"], "")
 
     def test_artifacts_dir_env_follows_the_mount(self):
-        """Fails if ARTIFACTS_DIR is missing or wrong where the volume mounts, set where it does not, or reaches migrate or gateway."""
-        enabled = {"all-keys", "storage-existing-claim"}
+        """Fails if ARTIFACTS_DIR is missing or wrong on api/worker, or reaches migrate, gateway or backup."""
+        enabled = {"all-keys", "storage-existing-claim", "vault-and-backup-enabled"}
         for name, docs in self.renders.items():
             for role, pod in pods(docs):
                 with self.subTest(values=name, component=role):
                     kind = role_kind(role)
                     env = env_map(pod["containers"][0])
-                    self.assertEqual("artifacts" in volumes(pod), name in enabled and kind in ("api", "worker"))
-                    if "artifacts" in volumes(pod):
+                    expect_vol = name in enabled and kind in ("api", "worker", "backup")
+                    self.assertEqual("artifacts" in volumes(pod), expect_vol)
+                    if name in enabled and kind in ("api", "worker"):
                         self.assertEqual(env[PREFIX[kind] + "ARTIFACTS_DIR"],
                                          {"name": PREFIX[kind] + "ARTIFACTS_DIR", "value": ARTIFACTS_PATH})
                     else:
                         self.assertFalse([key for key in env if "ARTIFACTS" in key])
 
     def test_mounted_read_write_into_api_and_worker_only(self):
-        """Fails if migrate or gateway mounts artifacts, the mount is read-only or moves, or the claim name is wrong."""
-        expected = {"all-keys": f"{RELEASE}-openmettle-core-artifacts", "storage-existing-claim": "example-artifacts"}
+        """Fails if migrate or gateway mounts artifacts, backup mounts it read-write, or api/worker mounts drift."""
+        expected = {
+            "all-keys": f"{RELEASE}-openmettle-core-artifacts",
+            "storage-existing-claim": "example-artifacts",
+            "vault-and-backup-enabled": "example-artifacts",
+        }
         for name, claim in expected.items():
             for role, pod in pods(self.renders[name]):
                 with self.subTest(values=name, component=role):
+                    if role_kind(role) == "backup":
+                        self.assertEqual(volumes(pod)["artifacts"], {"name": "artifacts",
+                                                                     "persistentVolumeClaim": {"claimName": claim, "readOnly": True}})
+                        self.assertEqual(mounts(pod)["artifacts"], {"name": "artifacts", "mountPath": ARTIFACTS_PATH, "readOnly": True})
+                        continue
                     if role_kind(role) not in ("api", "worker"):
                         self.assertNotIn("artifacts", volumes(pod))
                         continue
@@ -1002,7 +1121,10 @@ class AuthTest(Rendered):
                     self.assertEqual(mounts(api)["auth-provider-ca"],
                                      {"name": "auth-provider-ca", "mountPath": AUTH_CA_DIR, "readOnly": True})
                 for mount in container["volumeMounts"]:
-                    self.assertNotIn("subPath", mount)
+                    if mount["name"] == "vault-keys":
+                        self.assertEqual(mount["subPath"], "keys")
+                    else:
+                        self.assertNotIn("subPath", mount)
 
     def test_worker_and_migrate_never_receive_auth_env_volumes_or_secrets(self):
         """Fails if worker or migrate mounts auth config/keys/CA, sets AUTH_CONFIG or references auth object names."""
@@ -1109,7 +1231,8 @@ class IssuanceTest(Rendered):
                 others = yaml.safe_dump_all(d for d in docs if not (d["kind"] == "Deployment" and component(d) == "api"))
                 self.assertNotIn(ISSUANCE_SECRET, others)
                 self.assertNotIn("ISSUANCE", others)
-                expected_roles = ["api", "gateway-a", "migrate", "worker"] if name == "all-keys" else ["api", "migrate", "worker"]
+                expected_roles = (["api", "backup", "gateway-a", "migrate", "worker"] if name == "all-keys"
+                                  else ["api", "migrate", "worker"])
                 self.assertEqual(sorted(role for role, _ in pods(docs)), expected_roles)
 
     def test_pool_size_bounds_reach_the_api(self):
@@ -1147,6 +1270,8 @@ class TelemetryTest(Rendered):
         }
         for name, (fmt, level) in cases.items():
             for role, pod in pods(self.renders[name]):
+                if role == "backup":
+                    continue
                 kind = role_kind(role)
                 with self.subTest(values=name, component=role):
                     env = env_map(pod["containers"][0])
@@ -1195,7 +1320,7 @@ class TelemetryTest(Rendered):
             ),
         }
         for name, (traces_ep, metrics_ep, ranges, ca) in cases.items():
-            roles = [role for role, _ in pods(self.renders[name]) if role != "migrate"]
+            roles = [role for role, _ in pods(self.renders[name]) if role not in ("migrate", "backup")]
             for role in roles:
                 kind = role_kind(role)
                 with self.subTest(values=name, component=role):
@@ -1230,7 +1355,10 @@ class TelemetryTest(Rendered):
                         self.assertEqual(mounts(pod)["otlp-ca"],
                                          {"name": "otlp-ca", "mountPath": OTLP_CA_DIR, "readOnly": True})
                     for mount in container.get("volumeMounts", []):
-                        self.assertNotIn("subPath", mount)
+                        if mount["name"] == "vault-keys":
+                            self.assertEqual(mount["subPath"], "keys")
+                        else:
+                            self.assertNotIn("subPath", mount)
 
     def test_sibling_mount_paths_never_overlap(self):
         """Fails if any volume mount path is duplicated or nested inside another read-only mount directory."""
@@ -2311,6 +2439,225 @@ class NegativeCaseTest(unittest.TestCase):
           "database.connectionBudget=24"],
          ["--set-json", 'gateways.a.networkPolicy.upstream.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
          ["database.connectionBudget (24) is below the release's peak of 25 connections", "gateways 8"]),
+        # Credential vault (ADR 0045, V1-28).
+        ("vault enabled without existingSecret", ["vault.enabled=true"], [], [SCHEMA, "/vault/existingSecret"]),
+        ("vault enabled without existingSecret without schema", ["vault.enabled=true"], [SKIP],
+         ["vault.existingSecret is required when vault.enabled is true"]),
+        ("vault existingSecret while disabled", ["vault.existingSecret=vault-keys"], [],
+         [SCHEMA, "/vault/existingSecret"]),
+        ("vault existingSecret while disabled without schema", ["vault.existingSecret=vault-keys"], [SKIP],
+         ["vault.existingSecret must be empty when vault.enabled is false"]),
+        ("vault configKey starting with dot", ["vault.enabled=true", "vault.existingSecret=vault-keys",
+                                               "vault.configKey=.keyring.json"], [], [SCHEMA, "/vault/configKey"]),
+        ("vault configKey starting with dot without schema",
+         ["vault.enabled=true", "vault.existingSecret=vault-keys", "vault.configKey=..keyring"], [SKIP],
+         ["vault.configKey must start with an ASCII letter or digit"]),
+        ("vault reuses auth loginKeysSecretName",
+         [*AUTH, ISSUANCE, "vault.enabled=true", "vault.existingSecret=auth-keys"], OIDC_PEER,
+         ['vault.existingSecret ("auth-keys") must differ from auth.loginKeysSecretName']),
+        ("vault existingSecret aliases database.migrate owner Secret",
+         ["vault.enabled=true", "vault.existingSecret=openmettle-owner-database"], [],
+         ['vault.existingSecret ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
+        ("vault existingSecret aliases database.backup owner Secret",
+         ["vault.enabled=true", "vault.existingSecret=backup-owner-db",
+          "backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=backup-owner-db",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['vault.existingSecret ("backup-owner-db") must differ from database.backup.existingSecret']),
+        ("auth loginKeysSecretName aliases database.migrate owner Secret",
+         ["auth.enabled=true", "auth.configMapName=auth-cm",
+          "auth.loginKeysSecretName=openmettle-owner-database", ISSUANCE], OIDC_PEER,
+         ['auth.loginKeysSecretName ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
+        ("backup existingKeysSecret aliases database.backup owner Secret",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=openmettle-owner-database", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['backup.existingKeysSecret ("openmettle-owner-database") must differ from database.migrate.existingSecret']),
+        ("non-string boolean database.migrate.existingSecret refused without schema",
+         ["vault.enabled=true"],
+         ["--set-json", "database.migrate.existingSecret=false",
+          "--set-string", "vault.existingSecret=false", SKIP],
+         ["database.migrate.existingSecret must be a string"]),
+        ("non-string numeric database.migrate.existingSecret refused without schema",
+         ["vault.enabled=true"],
+         ["--set-json", "database.migrate.existingSecret=0",
+          "--set-string", "vault.existingSecret=0", SKIP],
+         ["database.migrate.existingSecret must be a string"]),
+        ("non-string boolean database.backup.existingSecret refused without schema",
+         ["vault.enabled=true"],
+         ["--set-json", "database.backup.existingSecret=false",
+          "--set-string", "vault.existingSecret=false", SKIP],
+         ["database.backup.existingSecret must be a string"]),
+        ("string 'false' database.migrate.existingSecret aliasing vault refused without schema",
+         ["vault.enabled=true"],
+         ["--set-string", "database.migrate.existingSecret=false",
+          "--set-string", "vault.existingSecret=false", SKIP],
+         ['vault.existingSecret ("false") must differ from database.migrate.existingSecret']),
+        ("string '0' database.migrate.existingSecret aliasing auth loginKeysSecretName refused without schema",
+         ["auth.enabled=true", "auth.configMapName=auth-cm", ISSUANCE],
+         [*OIDC_PEER, "--set-string", "database.migrate.existingSecret=0",
+          "--set-string", "auth.loginKeysSecretName=0", SKIP],
+         ['auth.loginKeysSecretName ("0") must differ from database.migrate.existingSecret']),
+        # Worker external MCP/OAuth egress (V1-14, ADR 0045).
+        ("worker mcp enabled without worker inference", ["worker.mcp.enabled=true"],
+         ["--set-json", 'networkPolicy.worker.mcp.to=[{"ipBlock":{"cidr":"192.0.2.50/32"}}]'],
+         [SCHEMA, "/worker/inference/enabled"]),
+        ("worker mcp enabled without worker inference without schema", ["worker.mcp.enabled=true"],
+         ["--set-json", 'networkPolicy.worker.mcp.to=[{"ipBlock":{"cidr":"192.0.2.50/32"}}]', SKIP],
+         ["worker.mcp.enabled requires worker.inference.enabled"]),
+        ("worker mcp enabled without egress peers",
+         ["worker.inference.enabled=true", "worker.inference.configMapName=inf-cm", "worker.mcp.enabled=true"],
+         ["--set-json", 'networkPolicy.worker.inference.to=[{"ipBlock":{"cidr":"192.0.2.40/32"}}]'],
+         ["networkPolicy.worker.mcp.to must list at least one external MCP"]),
+        ("worker mcp egress peers while disabled", [],
+         ["--set-json", 'networkPolicy.worker.mcp.to=[{"ipBlock":{"cidr":"192.0.2.50/32"}}]'],
+         ["networkPolicy.worker.mcp.to must be empty when worker.mcp.enabled is false"]),
+        ("worker mcp CA enabled while disabled",
+         ["worker.mcp.caBundle.enabled=true", "worker.mcp.caBundle.configMapName=mcp-ca"], [],
+         [SCHEMA, "/worker/mcp/caBundle/enabled"]),
+        ("worker mcp CA enabled while disabled without schema",
+         ["worker.mcp.caBundle.enabled=true", "worker.mcp.caBundle.configMapName=mcp-ca"], [SKIP],
+         ["worker.mcp.caBundle.enabled cannot be true when worker.mcp.enabled is false"]),
+        ("worker mcp empty ports list without schema", [],
+         ["--set-json", "networkPolicy.worker.mcp.ports=[]", SKIP],
+         ["networkPolicy.worker.mcp.ports must list between 1 and 16 TCP ports"]),
+        ("worker mcp duplicate ports without schema", [],
+         ["--set-json", "networkPolicy.worker.mcp.ports=[443,443]", SKIP],
+         ["networkPolicy.worker.mcp.ports contains duplicate port 443"]),
+        # Coordinated maintenance-window backup CronJob (ADR 0046, V1-30).
+        ("backup enabled without required images/secrets/claim/operatorId", ["backup.enabled=true"], [],
+         [SCHEMA, "/backup/existingKeysSecret"]),
+        ("backup images.admin tag instead of digest",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", "images.admin.digest=latest",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         [SCHEMA, "/images/admin/digest"]),
+        ("backup images.admin tag without schema",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", "images.admin.digest=latest",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [SKIP],
+         ["images.admin.digest must be sha256:<64 lowercase hex>"]),
+        ("backup images.postgresClient tag in repository",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres:18", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         [SCHEMA, "/images/postgresClient/repository"]),
+        ("backup images.postgresClient tag without schema",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", "images.postgresClient.digest=18.1",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [SKIP],
+         ["images.postgresClient.digest must be sha256:<64 lowercase hex>"]),
+        ("backup existingKeysSecret equals vault existingSecret",
+         ["vault.enabled=true", "vault.existingSecret=shared-keys",
+          "backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=shared-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['backup.existingKeysSecret ("shared-keys") must differ from vault.existingSecret']),
+        ("backup destination claim collides with existing artifacts claim",
+         ["storage.artifacts.enabled=true", "storage.artifacts.existingClaim=shared-pvc",
+          "backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=shared-pvc",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['backup.destination.existingClaim ("shared-pvc") must differ from the resolved storage.artifacts claim']),
+        ("backup destination claim collides with chart-owned artifacts claim",
+         ["storage.artifacts.enabled=true", "storage.artifacts.size=1Gi",
+          "backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", f"backup.destination.existingClaim={FULL}-artifacts",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         [f'backup.destination.existingClaim ("{FULL}-artifacts") must differ from the resolved storage.artifacts claim']),
+        ("backup operatorId not a UUID",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=not-a-uuid"], [],
+         [SCHEMA, "/backup/operatorId"]),
+        ("backup operatorId not a UUID without schema",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=not-a-uuid"], [SKIP],
+         ["backup.operatorId is required when backup.enabled is true and must be a canonical lowercase UUID"]),
+        ("backup activeDeadlineSeconds does not exceed drainTimeoutSecs",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001",
+          "backup.drainTimeoutSecs=300", "backup.activeDeadlineSeconds=300"], [],
+         ["backup.activeDeadlineSeconds (300 s) must exceed backup.drainTimeoutSecs (300 s)"]),
+        ("backup database reuses api Secret",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-api-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         ['database.backup must not reuse database.api']),
+        ("backup destination subPath traversal",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.subPath=../escape", "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001"], [],
+         [SCHEMA, "/backup/destination/subPath"]),
+        ("backup images.admin set while disabled",
+         ["images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}"], [],
+         [SCHEMA, "/images/admin"]),
+        ("backup images.admin set while disabled without schema",
+         ["images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}"], [SKIP],
+         ["images.admin.{registry,repository,digest} must be empty when backup.enabled is false"]),
+        ("backup configBundle reserved vault-key-inventory.json name",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001",
+          "backup.configBundle.enabled=true", "backup.configBundle.configMapName=cfg"],
+         ["--set-json", 'backup.configBundle.files=[{"name":"vault-key-inventory.json","key":"inv.json"}]'],
+         ["must not be vault-key-inventory.json"]),
+        ("backup connection budget counts +3 owner connections",
+         ["backup.enabled=true", "images.admin.repository=openmettle/admin", f"images.admin.digest={DIGEST}",
+          "images.postgresClient.repository=library/postgres", f"images.postgresClient.digest={DIGEST}",
+          "database.backup.existingSecret=openmettle-owner-database",
+          "backup.existingKeysSecret=backup-keys", "backup.destination.existingClaim=backup-dest",
+          "backup.destination.domain=nas.example.test/openmettle",
+          "backup.operatorId=00000000-0000-4000-8000-000000000001",
+          "database.connectionBudget=19"], [],
+         ["database.connectionBudget (19) is below the release's peak of 20 connections", "3 backup"]),
     ]
 
     def test_cases_fail_with_intended_message(self):
@@ -2572,6 +2919,354 @@ class YamlScalarTest(unittest.TestCase):
                          {"name": "789", "key": "null"})
         gw_np = find(docs, "NetworkPolicy", "-gateway-123")["spec"]
         self.assertEqual(gw_np["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"], "123")
+
+    def test_vault_and_backup_ambiguous_names_stay_strings(self):
+        """Fails if ambiguous vault/backup Secret, PVC, ServiceAccount or config names render unquoted."""
+        result = helm_template(
+            release="123",
+            extra=[
+                "--set", "vault.enabled=true",
+                "--set-string", "vault.existingSecret=456",
+                "--set-string", "vault.configKey=true",
+                "--set", "backup.enabled=true",
+                "--set", "images.admin.repository=openmettle/admin",
+                "--set", f"images.admin.digest={DIGEST}",
+                "--set", "images.postgresClient.repository=library/postgres",
+                "--set", f"images.postgresClient.digest={DIGEST}",
+                "--set-string", "database.backup.existingSecret=789",
+                "--set-string", "database.backup.key=null",
+                "--set-string", "backup.existingKeysSecret=999",
+                "--set-string", "backup.keysConfigKey=false",
+                "--set-string", "backup.destination.existingClaim=111",
+                "--set-string", "backup.destination.subPath=true/123",
+                "--set-string", "backup.destination.domain=123.example.test",
+                "--set", "backup.operatorId=00000000-0000-4000-8000-000000000001",
+                "--set-string", "backup.reason=true",
+                "--set-string", "backup.serviceAccount.name=false",
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        api_pod = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(api_pod)["vault-keys-secret"]["secret"]["secretName"], "456")
+        self.assertEqual(env_map(api_pod["containers"][0])["OPENMETTLE_API_VAULT_KEYS_CONFIG"]["value"],
+                         f"{VAULT_KEYS_DIR}/true")
+        cron = find(docs, "CronJob", "-backup")
+        b_pod = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+        self.assertEqual(b_pod["serviceAccountName"], "false")
+        self.assertEqual(volumes(b_pod)["backup-keys-secret"]["secret"]["secretName"], "999")
+        self.assertEqual(volumes(b_pod)["backup-destination"]["persistentVolumeClaim"]["claimName"], "111")
+        self.assertEqual(mounts(b_pod)["backup-destination"]["subPath"], "true/123")
+        b_env = env_map(b_pod["containers"][0])
+        self.assertEqual(b_env["OPENMETTLE_ADMIN_DATABASE_URL"]["valueFrom"]["secretKeyRef"],
+                         {"name": "789", "key": "null"})
+        args = b_pod["containers"][0]["args"]
+        self.assertEqual(args[args.index("--reason") + 1], "true")
+        self.assertEqual(args[args.index("--backup-keys-config") + 1], f"{BACKUP_KEYS_DIR}/false")
+
+
+class VaultAndMcpTest(Rendered):
+    """Opt-in credential vault staging (ADR 0045, V1-28) and worker external MCP egress/CA (V1-14)."""
+
+    def test_vault_stages_0400_memory_keys_on_api_and_worker_only(self):
+        """Fails if vault mounts raw Secrets into main containers, leaks to gateway/migrate/backup, or omits 0400 staging."""
+        for name, cfg_key in (("vault-and-backup-enabled", "keyring.json"),
+                              ("backup-network-policy-disabled", "keyring.json"),
+                              ("all-keys", "vault-keyring.json")):
+            docs = self.renders[name]
+            with self.subTest(values=name):
+                for role, pod in pods(docs):
+                    if role in ("api", "worker"):
+                        self.assertEqual(pod["securityContext"]["fsGroup"], 65532)
+                        init_cs = pod.get("initContainers", [])
+                        self.assertEqual([c["name"] for c in init_cs], ["stage-vault-keys"])
+                        script = init_cs[0]["command"][3]
+                        self.assertIn("umask 077", script)
+                        self.assertIn("chmod 0700", script)
+                        self.assertIn("chmod 0400", script)
+                        self.assertIn("cp -L", script)
+                        self.assertIn(cfg_key, script)
+                        self.assertEqual(volumes(pod)["vault-keys-secret"]["secret"],
+                                         {"secretName": "example-vault-keys", "defaultMode": 0o440})
+                        self.assertEqual(volumes(pod)["vault-keys"]["emptyDir"],
+                                         {"medium": "Memory", "sizeLimit": "1Mi"})
+                        self.assertNotIn("vault-keys-secret", mounts(pod))
+                        self.assertEqual(mounts(pod)["vault-keys"], {
+                            "name": "vault-keys", "mountPath": VAULT_KEYS_DIR,
+                            "subPath": "keys", "readOnly": True,
+                        })
+                        env = env_map(pod["containers"][0])
+                        self.assertEqual(env[PREFIX[role] + "VAULT_KEYS_CONFIG"]["value"],
+                                         f"{VAULT_KEYS_DIR}/{cfg_key}")
+                    else:
+                        self.assertFalse(VAULT_VOLUMES & set(volumes(pod)), role)
+                        self.assertFalse([c for c in pod.get("initContainers", []) if c["name"] == "stage-vault-keys"])
+                        env = env_map(pod["containers"][0])
+                        self.assertFalse([k for k in env if "VAULT" in k], role)
+
+    def test_worker_mcp_ca_and_multiport_egress_isolated_to_worker(self):
+        """Fails if worker.mcp CA bundle or egress leaks outside worker."""
+        docs = self.renders["all-keys"]
+        worker = find(docs, "Deployment", "-worker")["spec"]["template"]["spec"]
+        self.assertEqual(volumes(worker)["mcp-ca"], {"name": "mcp-ca", "configMap": {
+            "name": "example-mcp-ca", "items": [{"key": "mcp-ca.pem", "path": "ca.crt"}]}})
+        self.assertEqual(mounts(worker)["mcp-ca"], {"name": "mcp-ca", "mountPath": MCP_CA_DIR, "readOnly": True})
+        for role, pod in pods(docs):
+            if role != "worker":
+                self.assertNotIn("mcp-ca", volumes(pod), role)
+        worker_np = find(docs, "NetworkPolicy", "-worker")["spec"]["egress"]
+        self.assertIn({"to": [{"ipBlock": {"cidr": "198.51.100.80/32"}}],
+                       "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 8443}]}, worker_np)
+
+
+class BackupCronJobTest(Rendered):
+    """Opt-in coordinated maintenance-window backup CronJob (core ADR 0046, V1-30)."""
+
+    def test_default_disabled_renders_no_cronjob_sa_or_networkpolicy(self):
+        """Fails if backup resources leak into a default minimal render."""
+        docs = self.renders["minimal"]
+        self.assertNotIn("CronJob", {d["kind"] for d in docs})
+        self.assertFalse([d for d in docs if component(d) == "backup"])
+
+    def test_cronjob_contract_staging_and_isolation(self):
+        """Fails if CronJob concurrency, backoff, 0400 staging, RAM /tmp, read-only artifacts or args drift."""
+        docs = self.renders["all-keys"]
+        cron = find(docs, "CronJob", "-backup")
+        self.assertEqual(cron["apiVersion"], "batch/v1")
+        spec = cron["spec"]
+        self.assertEqual(spec["schedule"], "30 2 * * *")
+        self.assertEqual(spec["timeZone"], "UTC")
+        self.assertIs(spec["suspend"], True)
+        self.assertEqual(spec["concurrencyPolicy"], "Forbid")
+        self.assertEqual(spec["startingDeadlineSeconds"], 300)
+        self.assertEqual(spec["successfulJobsHistoryLimit"], 2)
+        self.assertEqual(spec["failedJobsHistoryLimit"], 4)
+        job_spec = spec["jobTemplate"]["spec"]
+        self.assertEqual(job_spec["backoffLimit"], 0)
+        self.assertEqual(job_spec["activeDeadlineSeconds"], 1800)
+        self.assertIn({"action": "FailJob",
+                       "onExitCodes": {"containerName": "prepare-backup-runtime", "operator": "In", "values": [78]}},
+                      job_spec["podFailurePolicy"]["rules"])
+        pod = job_spec["template"]["spec"]
+        self.assertEqual(pod["restartPolicy"], "Never")
+        self.assertEqual(pod["serviceAccountName"], "example-backup")
+        self.assertEqual(pod["securityContext"], {
+            "runAsNonRoot": True, "runAsUser": 65532, "runAsGroup": 65532,
+            "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch",
+            "seccompProfile": {"type": "RuntimeDefault"},
+        })
+        init_c = pod["initContainers"][0]
+        self.assertEqual(init_c["name"], "prepare-backup-runtime")
+        self.assertEqual(init_c["image"], f"registry.example.test:5000/openmettle/admin@{DIGEST}")
+        script = init_c["command"][3]
+        self.assertIn("cp -f /usr/local/bin/openmettle-admin /opt/openmettle-bin/openmettle-admin", script)
+        self.assertIn("chmod 0555 /opt/openmettle-bin/openmettle-admin", script)
+        self.assertIn("chmod 0700", script)
+        self.assertIn("chmod 0400", script)
+        self.assertIn("backup-keyring.json", script)
+        main_c = pod["containers"][0]
+        self.assertEqual(main_c["name"], "backup")
+        self.assertEqual(main_c["image"], f"registry.example.test:5000/library/postgres@{DIGEST}")
+        self.assertEqual(main_c["command"], ["/opt/openmettle-bin/openmettle-admin"])
+        args = main_c["args"]
+        self.assertEqual(args[:2], ["backup", "capture"])
+        self.assertEqual(args[args.index("--destination-root") + 1], BACKUP_DEST_DIR)
+        self.assertEqual(args[args.index("--destination-domain") + 1], "nas.example.test/openmettle")
+        self.assertEqual(args[args.index("--backup-keys-config") + 1], f"{BACKUP_KEYS_DIR}/backup-keyring.json")
+        self.assertEqual(args[args.index("--artifact-root") + 1], ARTIFACTS_PATH)
+        self.assertEqual(args[args.index("--operator-id") + 1], "00000000-0000-4000-8000-000000000001")
+        self.assertEqual(args[args.index("--request-key") + 1], "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)")
+        b_env = env_map(main_c)
+        self.assertEqual(b_env["OPENMETTLE_BACKUP_JOB_UID"]["valueFrom"]["fieldRef"]["fieldPath"],
+                         "metadata.labels['batch.kubernetes.io/controller-uid']")
+        self.assertEqual(args[args.index("--drain-timeout-secs") + 1], "180")
+        self.assertIn("--require-separate-device", args)
+        self.assertEqual(args[args.index("--graphiti-mode") + 1], "offline-dump")
+        self.assertEqual(args[args.index("--neo4j-dump") + 1], f"{BACKUP_NEO4J_DIR}/dumps/neo4j.dump")
+        self.assertEqual(args[args.index("--chroma-mode") + 1], "archive")
+        self.assertEqual(args[args.index("--chroma-archive") + 1], f"{BACKUP_CHROMA_DIR}/snapshots/chroma.tar")
+        self.assertEqual(args[args.index("--config-file") + 1], f"cluster.yaml={BACKUP_CONFIG_DIR}/cluster.yaml")
+        self.assertEqual(args[args.index("--keep-daily") + 1], "14")
+        self.assertEqual(args[args.index("--keep-weekly") + 1], "6")
+        self.assertEqual(args[args.index("--keep-monthly") + 1], "6")
+        self.assertIn("--release-on-success", args)
+        self.assertEqual(volumes(pod)["tmp"], {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"}})
+        self.assertEqual(mounts(pod)["tmp"], {"name": "tmp", "mountPath": "/tmp"})
+        self.assertEqual(mounts(pod)["backup-keys"], {
+            "name": "backup-keys", "mountPath": BACKUP_KEYS_DIR, "subPath": "keys", "readOnly": True,
+        })
+        self.assertEqual(mounts(pod)["admin-bin"], {"name": "admin-bin", "mountPath": "/opt/openmettle-bin", "readOnly": True})
+        self.assertEqual(mounts(pod)["artifacts"], {"name": "artifacts", "mountPath": ARTIFACTS_PATH, "readOnly": True})
+        self.assertEqual(mounts(pod)["backup-destination"], {
+            "name": "backup-destination", "mountPath": BACKUP_DEST_DIR, "subPath": "prod/cluster-a",
+        })
+        # Dedicated NetworkPolicy allows DNS + DB only and zero ingress.
+        np = find(docs, "NetworkPolicy", "-backup")["spec"]
+        self.assertNotIn("ingress", np)
+        self.assertEqual(len(np["egress"]), 2)
+
+    def test_no_prune_qualified_rebuild_and_dollar_escaping(self):
+        """Fails if --no-prune, qualified-rebuild or $ escaping on reason/qualificationRef drifts."""
+        docs = self.renders["backup-network-policy-disabled"]
+        self.assertNotIn("NetworkPolicy", {d["kind"] for d in docs})
+        cron = find(docs, "CronJob", "-backup")
+        args = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"]
+        self.assertIn("--no-prune", args)
+        self.assertNotIn("--keep-daily", args)
+        self.assertNotIn("--require-separate-device", args)
+        self.assertNotIn("--release-on-success", args)
+        self.assertNotIn("--artifact-root", args)
+        self.assertEqual(args[args.index("--chroma-mode") + 1], "qualified-rebuild")
+        self.assertEqual(args[args.index("--chroma-qualification-ref") + 1], "qual-2026-11-27-chroma-rebuild")
+        escaped = render(
+            ("backup-network-policy-disabled.yaml",),
+            ["backup.reason=nightly $(OPENMETTLE_ADMIN_DATABASE_URL) run",
+             "backup.chroma.qualificationRef=ref-$1"],
+        )
+        e_args = find(escaped, "CronJob", "-backup")["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"]
+        self.assertEqual(e_args[e_args.index("--reason") + 1], "nightly $$(OPENMETTLE_ADMIN_DATABASE_URL) run")
+        self.assertEqual(e_args[e_args.index("--chroma-qualification-ref") + 1], "ref-$$1")
+        self.assertEqual(e_args[e_args.index("--request-key") + 1], "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)")
+
+    def test_cronjob_name_stays_within_52_chars_and_collision_free(self):
+        """Fails if a long Helm release name produces a CronJob name > 52 chars or collides across suffixes."""
+        names = set()
+        for rel in ("integration-observability-europe-central",
+                    "integration-observability-europe-central-a",
+                    "integration-observability-europe-central-b",
+                    "r" * 53):
+            docs = render(("vault-and-backup-enabled.yaml",), release=rel)
+            cron_name = find(docs, "CronJob", "-backup")["metadata"]["name"]
+            self.assertLessEqual(len(cron_name), 52, cron_name)
+            self.assertRegex(cron_name, r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?-backup$")
+            names.add(cron_name)
+        self.assertEqual(len(names), 4)
+
+    def test_reuse_values_from_pre_vault_backup_release_renders_cleanly(self):
+        """Fails if helm upgrade --reuse-values from an older release omitting optional database/image/feature sections fails schema or template guards."""
+        common_optional = [
+            "images.gateway=null",
+            "images.admin=null",
+            "images.postgresClient=null",
+            "database.gateway=null",
+            "database.backup=null",
+            "worker.inference=null",
+            "worker.mcp=null",
+            "networkPolicy.worker=null",
+            "gateways=null",
+            "vault=null",
+            "backup=null",
+        ]
+        cases = (
+            ((), [*common_optional, "database.issuance=null", "api.settings.issuanceDbMaxConnections=null"]),
+            (("auth-enabled.yaml",), common_optional),
+        )
+        for overlays, unset_optional in cases:
+            for extra in ((), (SKIP,)):
+                with self.subTest(overlays=overlays, extra=extra):
+                    res = helm_template(overlays, unset_optional, extra=extra)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    docs = [d for d in yaml.safe_load_all(res.stdout) if d]
+                    self.assertEqual(docs, render(overlays))
+        for missing_auth_field, needle in (
+            ("database.issuance=null", "issuance"),
+            ("api.settings.issuanceDbMaxConnections=null", "issuanceDbMaxConnections"),
+        ):
+            for extra in ((), (SKIP,)):
+                with self.subTest(missing_auth_field=missing_auth_field, extra=extra):
+                    res = helm_template(("auth-enabled.yaml",), [missing_auth_field], extra=extra)
+                    self.assertNotEqual(res.returncode, 0)
+                    self.assertIn(needle, res.stderr)
+
+    def test_rendered_keyring_staging_scripts_enforce_referenced_and_non_dot_keys(self):
+        """Executes rendered stage-vault-keys and prepare-backup-runtime scripts against valid, missing and dot-prefixed keys."""
+        docs = self.renders["vault-and-backup-enabled"]
+        api_script = find(docs, "Deployment", "-api")["spec"]["template"]["spec"]["initContainers"][0]["command"][3]
+        backup_raw = find(docs, "CronJob", "-backup")["spec"]["jobTemplate"]["spec"]["template"]["spec"]["initContainers"][0]["command"][3]
+        # Strip only the /usr/local/bin/openmettle-admin binary copy lines to test key staging in isolation.
+        backup_script = "\n".join(
+            ln for ln in backup_raw.splitlines()
+            if "/opt/openmettle-bin/openmettle-admin" not in ln
+        )
+        for label, raw_script, src_const, stage_const, mount_dir in (
+            ("vault", api_script, "/run/openmettle-vault-src", "/run/openmettle-vault-stage", VAULT_KEYS_DIR),
+            ("backup", backup_script, "/run/openmettle-backup-src", "/run/openmettle-backup-stage", BACKUP_KEYS_DIR),
+        ):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    stage_parent = Path(tmp) / "stage"
+                    src.mkdir()
+                    stage_parent.mkdir()
+                    script = raw_script.replace(src_const, str(src)).replace(stage_const, str(stage_parent))
+                    # 1. Valid multi-key manifests (both plain and JSON-escaped property names & slashes) succeed.
+                    (src / "k1.key").write_bytes(b"\x42" * 32)
+                    (src / "k2.key").write_bytes(b"\x24" * 32)
+                    plain_two = json.dumps({
+                        "version": 1, "active_key_id": "k2",
+                        "keys": [
+                            {"id": "k1", "file": f"{mount_dir}/k1.key"},
+                            {"id": "k2", "file": f"{mount_dir}/k2.key"},
+                        ],
+                    })
+                    escaped_mount = mount_dir.replace("/", r"\/")
+                    unicode_mount = mount_dir.replace("/", r"\u002f")
+                    escaped_two = (
+                        "{\n"
+                        '  "active_key_id": "k\\u0032",\n'
+                        '  "\\u006beys": [\n'
+                        f'    {{"f\\u0069le": "{escaped_mount}\\/k1.key", "id": "k1"}},\n'
+                        f'    {{"id": "k2", "f\\u0069le": "{unicode_mount}\\u002fk2.key"}}\n'
+                        "  ],\n"
+                        '  "version": 1\n'
+                        "}\n"
+                    )
+                    for doc_text in (plain_two, escaped_two):
+                        (src / "keyring.json").write_text(doc_text, encoding="utf-8")
+                        ok = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                        self.assertEqual(ok.returncode, 0, ok.stderr)
+                        self.assertEqual((stage_parent / "keys").stat().st_mode & 0o777, 0o700)
+                        self.assertEqual((stage_parent / "keys" / "k1.key").stat().st_mode & 0o777, 0o400)
+                        self.assertEqual((stage_parent / "keys" / "k2.key").stat().st_mode & 0o777, 0o400)
+                        self.assertFalse((stage_parent / ".refs").exists())
+                    # 2. Missing second referenced key file exits 78 under both plain and JSON-escaped encodings.
+                    (src / "k2.key").unlink()
+                    for doc_text in (plain_two, escaped_two):
+                        (src / "keyring.json").write_text(doc_text, encoding="utf-8")
+                        missing = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                        self.assertEqual(missing.returncode, 78, missing.stderr)
+                        self.assertIn(f"missing referenced {label} key file: k2.key", missing.stderr)
+                        self.assertFalse((stage_parent / ".refs").exists())
+                    # 3. Escaped path traversal and malformed/duplicate-member JSON exit 78.
+                    for bad_doc in (
+                        f'{{"version":1,"active_key_id":"k1","keys":[{{"id":"k1","file":"{escaped_mount}\\/..\\/k1.key"}}]}}',
+                        f'{{"version":1,"version":1,"active_key_id":"k1","keys":[{{"id":"k1","file":"{mount_dir}/k1.key"}}]}}',
+                        f'{{"version":1,"extra":true,"active_key_id":"k1","keys":[{{"id":"k1","file":"{mount_dir}/k1.key"}}]}}',
+                    ):
+                        (src / "keyring.json").write_text(bad_doc, encoding="utf-8")
+                        bad = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                        self.assertEqual(bad.returncode, 78, bad.stderr)
+                    # 4. Dotted key IDs ("v.1"): core forbids dots in VaultKeyRing IDs (exit 78) and permits them in BackupKeyRing IDs (exit 0).
+                    (src / "k2.key").write_bytes(b"\x24" * 32)
+                    (src / "keyring.json").write_text(json.dumps({
+                        "version": 1, "active_key_id": "v.1",
+                        "keys": [{"id": "v.1", "file": f"{mount_dir}/k1.key"}],
+                    }), encoding="utf-8")
+                    dotted_id = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                    if label == "vault":
+                        self.assertEqual(dotted_id.returncode, 78, dotted_id.stderr)
+                    else:
+                        self.assertEqual(dotted_id.returncode, 0, dotted_id.stderr)
+                    # 5. Dot-prefixed Secret entry exits 78.
+                    (src / ".k1.key").write_bytes(b"\x42" * 32)
+                    (src / "keyring.json").write_text(json.dumps({
+                        "version": 1, "active_key_id": "k1",
+                        "keys": [{"id": "k1", "file": f"{mount_dir}/.k1.key"}],
+                    }), encoding="utf-8")
+                    dotted = subprocess.run(["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False)
+                    self.assertEqual(dotted.returncode, 78, dotted.stderr)
+                    self.assertIn("dot-prefixed", dotted.stderr)
+                    subprocess.run(["chmod", "-R", "u+w", str(stage_parent)], check=False)
 
 
 class WorkerInferenceTest(Rendered):

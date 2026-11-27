@@ -9,6 +9,14 @@ images:
     registry: registry.example.test:5000
     repository: openmettle/gateway
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  admin:
+    registry: registry.example.test:5000
+    repository: openmettle/admin
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  postgresClient:
+    registry: registry.example.test:5000
+    repository: library/postgres
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 database:
   api:
     key: api-url
@@ -22,7 +30,10 @@ database:
   gateway:
     existingSecret: openmettle-gateway-database
     key: gateway-url
-  connectionBudget: 40
+  backup:
+    existingSecret: openmettle-backup-database
+    key: backup-url
+  connectionBudget: 41
   caBundle:
     enabled: true
     configMapName: example-db-ca
@@ -70,6 +81,12 @@ worker:
       enabled: true
       configMapName: example-inference-ca
       key: inference-ca.pem
+  mcp:
+    enabled: true
+    caBundle:
+      enabled: true
+      configMapName: example-mcp-ca
+      key: mcp-ca.pem
   replicas: 3
   resources:
     requests: {cpu: 150m, memory: 96Mi}
@@ -135,6 +152,11 @@ networkPolicy:
             matchLabels:
               app.kubernetes.io/name: example-gateway-tls
       port: 8443
+    mcp:
+      to:
+        - ipBlock:
+            cidr: 198.51.100.80/32
+      ports: [443, 8443]
   dns:
     to:
       - ipBlock:
@@ -253,3 +275,65 @@ gateways:
               topologyKey: kubernetes.io/hostname
               labelSelector:
                 matchLabels: {app.kubernetes.io/component: gateway-a}
+# Reserved synthetic credential vault keyring (ADR 0045, V1-28).
+vault:
+  enabled: true
+  existingSecret: example-vault-keys
+  configKey: vault-keyring.json
+# Reserved synthetic coordinated maintenance-window backup CronJob (ADR 0046, V1-30).
+backup:
+  enabled: true
+  schedule: "30 2 * * *"
+  timeZone: UTC
+  suspend: true
+  startingDeadlineSeconds: 300
+  activeDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 4
+  existingKeysSecret: example-backup-keys
+  keysConfigKey: backup-keyring.json
+  destination:
+    existingClaim: example-backup-destination
+    subPath: prod/cluster-a
+    domain: nas.example.test/openmettle
+    requireSeparateDevice: true
+  operatorId: 00000000-0000-4000-8000-000000000001
+  reason: Scheduled nightly coordinated backup
+  drainTimeoutSecs: 180
+  releaseOnSuccess: true
+  retention:
+    prune: true
+    daily: 14
+    weekly: 6
+    monthly: 6
+  graphiti:
+    mode: offline-dump
+    existingClaim: example-neo4j-dumps
+    dumpPath: dumps/neo4j.dump
+  chroma:
+    mode: archive
+    existingClaim: example-chroma-archives
+    archivePath: snapshots/chroma.tar
+  configBundle:
+    enabled: true
+    configMapName: example-backup-config
+    files:
+      - name: cluster.yaml
+        key: cluster-config.yaml
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: "1", memory: 512Mi, ephemeral-storage: 128Mi}
+  serviceAccount:
+    create: true
+    name: example-backup
+    annotations: {example.test/role: backup}
+  podAnnotations: {example.test/note: backup}
+  nodeSelector: {kubernetes.io/os: linux}
+  tolerations:
+    - {key: example.test/dedicated, operator: Exists, effect: NoSchedule}
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: kubernetes.io/arch, operator: In, values: [amd64]}

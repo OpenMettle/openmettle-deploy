@@ -157,3 +157,35 @@ telemetry:
       enabled: true
       configMapName: example-openmettle-otlp-ca
       key: ca.crt
+
+# Opt-in ADR 0045 credential vault (V1-28), worker MCP/OAuth egress (V1-14) and ADR 0046 backup
+# CronJob (V1-30) stay off by default here; uncomment and replace placeholders in your private
+# site overlay when enabling them (see charts/openmettle-core/README.md):
+#
+# images:
+#   admin:
+#     registry: registry.openmettle.example
+#     repository: openmettle/admin
+#     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+#   postgresClient:
+#     registry: registry.openmettle.example
+#     repository: library/postgres
+#     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+# database:
+#   backup:
+#     existingSecret: example-openmettle-owner-database
+# vault:
+#   enabled: true
+#   existingSecret: example-openmettle-vault-keys   # distinct from auth.loginKeysSecretName & backup.existingKeysSecret
+#   configKey: keyring.json
+# backup:
+#   enabled: true
+#   schedule: "0 3 * * *"
+#   existingKeysSecret: example-openmettle-backup-keys
+#   keysConfigKey: keyring.json
+#   destination:
+#     existingClaim: example-openmettle-backups     # pre-existing off-host PVC, distinct from storage.artifacts
+#     domain: backups.openmettle.example
+#     requireSeparateDevice: true
+#   operatorId: "00000000-0000-4000-8000-00000000b046"
+#   reason: "scheduled coordinated maintenance backup"

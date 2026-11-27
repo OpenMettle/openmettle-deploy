@@ -10,9 +10,12 @@ Without its own hook policy, the migrate pod would have no egress in a namespace
 default, and on upgrade the release's deny-all would block it.
 */ -}}
 {{- if .Values.networkPolicy.enabled }}
-{{- $workerInferenceEgress := list }}
+{{- $workerExtraEgress := list }}
 {{- if default false (get (default dict .Values.worker.inference) "enabled") }}
-{{- $workerInferenceEgress = list .Values.networkPolicy.worker.inference }}
+{{- $workerExtraEgress = append $workerExtraEgress .Values.networkPolicy.worker.inference }}
+{{- end }}
+{{- if default false (get (default dict .Values.worker.mcp) "enabled") }}
+{{- $workerExtraEgress = append $workerExtraEgress .Values.networkPolicy.worker.mcp }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -30,10 +33,14 @@ spec:
 ---
 {{ include "openmettle-core.networkPolicy" (dict "root" . "component" "api" "ingressFrom" .Values.networkPolicy.api.ingressFrom "port" 8080 "oidc" .Values.auth.enabled "otlp" .Values.telemetry.otlp.enabled) }}
 ---
-{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "worker" "otlp" .Values.telemetry.otlp.enabled "extraEgress" $workerInferenceEgress) }}
+{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "worker" "otlp" .Values.telemetry.otlp.enabled "extraEgress" $workerExtraEgress) }}
 {{- if .Values.migration.enabled }}
 ---
 {{ include "openmettle-core.networkPolicy" (dict "root" . "component" "migrate" "annotations" (dict "helm.sh/hook" "pre-install,pre-upgrade" "helm.sh/hook-weight" "-10" "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded")) }}
+{{- end }}
+{{- if default false (get (default dict .Values.backup) "enabled") }}
+---
+{{ include "openmettle-core.networkPolicy" (dict "root" . "component" "backup") }}
 {{- end }}
 {{- range $name := keys (default dict .Values.gateways) | sortAlpha }}
 {{- $g := dict }}

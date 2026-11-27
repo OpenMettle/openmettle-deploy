@@ -77,6 +77,7 @@ openmettle-smoke.invalid/openmettle/api:smoke-0a1b2c3d application/vnd.oci.image
 openmettle-smoke.invalid/openmettle/worker:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json {DIGEST['worker']} 40.0 MiB linux/amd64 io.cri-containerd.image=managed
 openmettle-smoke.invalid/openmettle/migrate:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json not-a-digest 39.0 MiB linux/amd64 -
 openmettle-smoke.invalid/openmettle/gateway:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json {DIGEST['gateway']} 40.2 MiB linux/amd64 io.cri-containerd.image=managed
+openmettle-smoke.invalid/openmettle/admin:smoke-0a1b2c3d application/vnd.oci.image.index.v1+json {DIGEST['admin']} 40.3 MiB linux/amd64 io.cri-containerd.image=managed
 """
 
 STUB_CORE = '''
@@ -439,14 +440,20 @@ class FakeCluster:
         self.generation = {"api": 1, "worker": 1}
         self.profile_enabled = False
         self.gateway_mode = None
+        self.vault_and_backup_enabled = False
         self.inference_fixtures_applied = False
+        self.vault_backup_fixtures_applied = False
         self.artifacts_pvc_created = False
         self.healthz = 200
         self.readyz = 200
         self.auth_http_overrides = {}
         self.run_admission = ["t" if expected else "f" for _, expected in smoke.RUN_ADMISSION_CHECKS]
         self.gateway_schema = ["t" if expected else "f" for _, expected in smoke.GATEWAY_SCHEMA_CHECKS]
+        self.migration_38_45 = ["t" if expected else "f" for _, expected in smoke.MIGRATION_38_45_CHECKS]
         self.gateway_settlements = {}
+        self.backup_run_id = "00000000-0000-4000-e000-000000000001"
+        self.backup_bundle_digest = "b" * 64
+        self.backup_dir = f"{smoke.BACKUP_DEST_DIR}/20261127T080000Z-{self.backup_run_id}"
         self.fresh_bootstrap = "t|t"
         self.session = None  # (session id, secret hash hex) as seeded
         self.replaced = False
@@ -564,8 +571,9 @@ class FakeCluster:
             digest = self.ctr.get(args[-1])
             if digest is None:
                 return 1, "", "no such image"
-            role = next(r for r in smoke.ROLES if DIGEST[r] == digest)
-            return 0, json.dumps({"status": {"id": IMAGE_ID[role]}}), ""
+            role = next((r for r in smoke.ROLES if DIGEST[r] == digest), None)
+            image_id = IMAGE_ID[role] if role else digest
+            return 0, json.dumps({"status": {"id": image_id}}), ""
         if args[:2] == ["crictl", "ps"]:
             role = args[args.index("--id") + 1].split("-")[1]
             return 0, json.dumps({"containers": [{"id": "c", "imageRef": IMAGE_ID[role]}]}), ""
@@ -635,10 +643,10 @@ class FakeCluster:
         return self.admitted_at is not None and smoke.time.monotonic() >= self.admitted_at + smoke.QUEUE_TIMEOUT_SECONDS
 
     def database(self, sql):
-        """`psql` on stdin in the fixture database: migration history, migrations 19/20/37 grants,
-        fresh-install markers, session seed and settled gateway requests."""
+        """`psql` on stdin in the fixture database: migration history, migrations 19/20/37 and 38–45 grants,
+        fresh-install markers, session seed, settled gateway requests and backup run status."""
         if "openmettle._sqlx_migrations" in sql:
-            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in range(17, 38)), ""
+            return 0, "".join(f"{v}|t|{v:02x}|2026-11-19 10:01:00\n" for v in range(17, 46)), ""
         if sql == smoke.FRESH_BOOTSTRAP_SQL:
             return 0, self.fresh_bootstrap + "\n", ""
         if "xmin::text" in sql:
@@ -648,6 +656,11 @@ class FakeCluster:
             return 0, "|".join(self.run_admission) + "\n", ""
         if sql == smoke.gateway_schema_sql():
             return 0, "|".join(self.gateway_schema) + "\n", ""
+        if sql == smoke.migration_38_45_sql():
+            return 0, "|".join(self.migration_38_45) + "\n", ""
+        if "FROM openmettle.backup_runs r" in sql:
+            return 0, (f"{self.backup_run_id}|succeeded|{smoke.BACKUP_DESTINATION_DOMAIN}|"
+                       f"{smoke.BACKUP_KEY_ID}|{self.backup_bundle_digest}|t|t|f|t\n"), ""
         if "FROM openmettle.gateway_requests q" in sql:
             match = re.search(r"WHERE q\.run_id = '([0-9a-f-]+)'::uuid", sql)
             req_id = self.gateway_settlements.get(match.group(1)) if match else None
@@ -733,6 +746,22 @@ class FakeCluster:
                     {"name": "OPENMETTLE_WORKER_EXECUTING_PER_ACTOR", "value": "2"},
                     {"name": "OPENMETTLE_WORKER_EXECUTING_PER_SCOPE", "value": "4"},
                 ]
+            if self.vault_and_backup_enabled and component in ("api", "worker"):
+                spec["initContainers"] = [{
+                    "name": "stage-vault-keys",
+                    "image": smoke.digest_reference(component, DIGEST[component]),
+                    "imagePullPolicy": "Never",
+                }]
+                spec["volumes"] += [
+                    {"name": "vault-keys-secret", "secret": {"secretName": smoke.VAULT_KEYS_SECRET, "defaultMode": 288}},
+                    {"name": "vault-keys", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+                ]
+                container["volumeMounts"].append({
+                    "name": "vault-keys", "mountPath": smoke.VAULT_KEYS_DIR, "subPath": "keys", "readOnly": True,
+                })
+                container["env"].append({
+                    "name": f"OPENMETTLE_{component.upper()}_VAULT_KEYS_CONFIG", "value": smoke.VAULT_CONFIG_PATH,
+                })
         return {"metadata": {"name": name, "uid": f"{name}-{self.replaced}", "labels": {"app.kubernetes.io/instance": smoke.RELEASE,
                                                       "app.kubernetes.io/component": component}},
                 "spec": spec,
@@ -802,9 +831,13 @@ class FakeCluster:
         if args[:2] == ["apply", "-f"] and args[-1].endswith("/ingress.yaml"):
             return ok("configured")
         if args[:3] == ["apply", "--filename", "-"]:
-            for item in json.loads(input)["items"]:
+            payload = json.loads(input)
+            applied_items = payload["items"] if payload.get("kind") == "List" else [payload]
+            for item in applied_items:
                 if item["kind"] == "Namespace":
                     self.namespaces[item["metadata"]["name"]] = item["metadata"]["labels"]
+                if item["kind"] == "Deployment" and item["metadata"]["name"] == "postgres":
+                    self.ctr[self.core.POSTGRES_IMAGE] = self.core.POSTGRES_IMAGE.partition("@")[2]
                 if item["metadata"]["name"] == "postgres-fixture":
                     self.passwords["admin"] = item["stringData"]["admin-password"]
                 if item["kind"] == "Secret" and "url" in item.get("stringData", {}):
@@ -813,6 +846,11 @@ class FakeCluster:
                 if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.AUTH_LOGIN_KEYS_SECRET:
                     self.passwords["auth_cursor_key"] = item["data"]["cursor.key"]
                     self.passwords["auth_login_key"] = item["data"]["active.key"]
+                if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.VAULT_KEYS_SECRET:
+                    self.passwords["vault_key"] = item["data"][smoke.VAULT_KEY_FILE]
+                    self.vault_backup_fixtures_applied = True
+                if item["kind"] == "Secret" and item["metadata"]["name"] == smoke.BACKUP_KEYS_SECRET:
+                    self.passwords["backup_key"] = item["data"][smoke.BACKUP_KEY_FILE]
                 if item["kind"] == "ConfigMap" and item["metadata"]["name"] == smoke.INFERENCE_PLAIN_CONFIG_MAP:
                     self.inference_fixtures_applied = True
             return 0, "applied", ""
@@ -830,11 +868,20 @@ class FakeCluster:
         if namespace == smoke.APP_NAMESPACE and args[:1] == ["exec"] and smoke.AUTH_CHECK_BINARY in args:
             return 0, smoke.AUTH_CHECK_OK, ""
         if namespace == smoke.APP_NAMESPACE and args[:1] == ["exec"] and "stat" in args:
+            if smoke.VAULT_CONFIG_PATH in args:
+                return 0, (f"{smoke.VAULT_CONFIG_PATH}|regular file|400|65532\n"
+                           f"{smoke.VAULT_KEYS_DIR}/{smoke.VAULT_KEY_FILE}|regular file|400|65532\n"), ""
             return 0, "".join(f"{smoke.ARTIFACTS_MOUNT_PATH}/{d}|directory|2700|65532\n"
                               for d in smoke.ARTIFACT_SUBDIRS), ""
         if namespace == smoke.APP_NAMESPACE:
             if args[:3] == ["create", "secret", "tls"]:
                 return ok("created")
+            if args[:2] == ["create", "job"]:
+                return ok("created")
+            if args[:1] == ["wait"]:
+                return ok("condition met")
+            if args[:2] == ["delete", "job"]:
+                return ok("deleted")
             if args[:3] == ["rollout", "restart", f"deployment/{smoke.FULLNAME}-api"]:
                 self.replaced = True
                 return ok("restarted")
@@ -861,7 +908,47 @@ class FakeCluster:
             return 0, "rolled out", ""
         if args[:2] == ["get", "networkpolicies"]:
             return listing(self.network_policies())
-        if args[:2] == ["get", "pvc,pdb"]:
+        if args[:3] == ["get", "networkpolicy", smoke.BACKUP_NETWORK_POLICY]:
+            return ok({"metadata": {"name": smoke.BACKUP_NETWORK_POLICY},
+                       "spec": {"policyTypes": ["Ingress", "Egress"],
+                                "egress": [{"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+                                           {"ports": [{"protocol": "TCP", "port": 5432}]}]}})
+        if args[:3] == ["get", "cronjob", smoke.BACKUP_CRONJOB]:
+            pg_parts = smoke.postgres_client_image_parts(self.core.POSTGRES_IMAGE)
+            pg_ref = f"{pg_parts['registry']}/{pg_parts['repository']}@{pg_parts['digest']}"
+            return ok({
+                "metadata": {"name": smoke.BACKUP_CRONJOB},
+                "spec": {
+                    "concurrencyPolicy": "Forbid", "suspend": True,
+                    "jobTemplate": {"spec": {
+                        "backoffLimit": 0,
+                        "template": {"spec": {
+                            "initContainers": [{"name": "prepare-backup-runtime",
+                                                "image": smoke.digest_reference("admin", DIGEST["admin"]),
+                                                "imagePullPolicy": "Never"}],
+                            "containers": [{
+                                "name": "backup", "image": pg_ref, "imagePullPolicy": "Never",
+                                "args": ["backup", "capture", "--destination-root", "/var/backups/openmettle",
+                                         "--request-key", "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)"],
+                                "env": [
+                                    {"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}},
+                                    {"name": "OPENMETTLE_BACKUP_JOB_UID",
+                                     "valueFrom": {"fieldRef": {
+                                         "fieldPath": "metadata.labels['batch.kubernetes.io/controller-uid']"}}},
+                                ],
+                                "volumeMounts": [
+                                    {"name": "backup-keys", "mountPath": smoke.BACKUP_KEYS_DIR,
+                                     "subPath": "keys", "readOnly": True},
+                                    {"name": "artifacts", "mountPath": smoke.ARTIFACTS_MOUNT_PATH, "readOnly": True},
+                                    {"name": "backup-destination", "mountPath": "/var/backups/openmettle"},
+                                ],
+                            }],
+                        }},
+                    }},
+                },
+            })
+        if args[:2] in (["get", "pvc,pdb"], ["get", "pvc,pdb,cronjobs,jobs"]):
             return ok("NAME\n")
         if args[:3] == ["get", "poddisruptionbudget", smoke.API_PDB]:
             healthy = self.replicas["api"]
@@ -895,9 +982,11 @@ class FakeCluster:
                                  "involvedObject": {"kind": "Job", "name": f"{smoke.FULLNAME}-migrate",
                                                     "uid": f"job-{r}"}} for r in range(1, self.revision + 1)])
             if selectors == "reason=Pulled":
-                return listing([{"reason": "Pulled", "message": f'Container image '
-                                 f'"{smoke.digest_reference(r, DIGEST[r])}" already present on machine'}
-                                for r in smoke.ROLES])
+                pg_parts = smoke.postgres_client_image_parts(self.core.POSTGRES_IMAGE)
+                pg_ref = f"{pg_parts['registry']}/{pg_parts['repository']}@{pg_parts['digest']}"
+                refs = [*(smoke.digest_reference(r, DIGEST[r]) for r in smoke.ROLES), pg_ref]
+                return listing([{"reason": "Pulled", "message": f'Container image "{ref}" already present on machine'}
+                                for ref in refs])
         if args[:1] == ["get"] and args[1] in (smoke.INVENTORY_KINDS, smoke.RELEASE_KINDS):
             return listing(self.items(smoke.expected_release_objects()) if self.installed else [])
         if args[:3] == ["get", "--filename", "-"]:
@@ -905,20 +994,33 @@ class FakeCluster:
         if args[:2] == ["get", smoke.OPTIONAL_KINDS]:
             return listing([])
         if args[:2] in (["get", "secrets"], ["get", "configmaps,secrets,networkpolicies"],
+                        ["get", "configmaps,secrets,networkpolicies,persistentvolumeclaims"],
                         ["get", "endpointslices"]):
             if selector == smoke.RUN_LABEL:
                 owned = [f"Secret/{smoke.AUTH_LOGIN_KEYS_SECRET}",
                          *(f"Secret/{smoke.SECRET[r]}" for r in smoke.DB_LOGINS)]
-                if args[1] == "configmaps,secrets,networkpolicies":
+                if args[1].startswith("configmaps,secrets,networkpolicies"):
                     owned.extend([f"ConfigMap/{smoke.AUTH_CONFIG_MAP}",
                                   f"NetworkPolicy/{smoke.NAMESPACE_DENY}"])
                     if self.inference_fixtures_applied:
                         owned.extend([f"ConfigMap/{smoke.INFERENCE_PLAIN_CONFIG_MAP}",
                                       f"ConfigMap/{smoke.INFERENCE_TLS_CONFIG_MAP}",
                                       f"ConfigMap/{smoke.INFERENCE_CA_CONFIG_MAP}"])
+                    if self.vault_backup_fixtures_applied:
+                        owned.extend([f"Secret/{smoke.VAULT_KEYS_SECRET}",
+                                      f"Secret/{smoke.BACKUP_KEYS_SECRET}"])
+                        if "persistentvolumeclaims" in args[1]:
+                            owned.append(f"PersistentVolumeClaim/{smoke.BACKUP_DEST_CLAIM}")
                 return listing(self.items(owned))
             return listing([])
         if args[:1] == ["logs"]:
+            if len(args) >= 2 and args[1] == f"job/{smoke.BACKUP_RUN_JOB}":
+                return 0, (f"backup.capture_succeeded run_id={self.backup_run_id} dir={self.backup_dir} "
+                           f"key_id={smoke.BACKUP_KEY_ID} bundle_digest={self.backup_bundle_digest} "
+                           f"journal_seq=2 pruned=0 skipped_unverified=0 maintenance_released=true\n"), ""
+            if len(args) >= 2 and args[1] == f"job/{smoke.BACKUP_VERIFY_JOB}":
+                return 0, (f"backup.verified run_id={self.backup_run_id} schema=45 key_id={smoke.BACKUP_KEY_ID} "
+                           f"components=5 journal_seq=2 artifact_revisions=2\n"), ""
             if "--container" in args:
                 role = args[args.index("--container") + 1]
                 lines = [json.dumps({"timestamp": "2026-11-19T10:04:00.000000Z", "level": "INFO",
@@ -944,10 +1046,12 @@ class FakeCluster:
             if values.get("gateways"):
                 gw_mode = ("tls" if values.get("worker", {}).get("inference", {}).get("caBundle", {}).get("enabled")
                            else "plain")
+            vault_backup = bool(values.get("vault", {}).get("enabled") and values.get("backup", {}).get("enabled"))
             if self.installed and (worker_replicas != self.replicas["worker"] or profile != self.profile_enabled
-                                   or gw_mode != self.gateway_mode):
+                                   or gw_mode != self.gateway_mode or vault_backup != self.vault_and_backup_enabled):
                 self.generation["worker"] += 1
-            if self.installed and (api_replicas != self.replicas["api"] or profile != self.profile_enabled):
+            if self.installed and (api_replicas != self.replicas["api"] or profile != self.profile_enabled
+                                   or vault_backup != self.vault_and_backup_enabled):
                 self.generation["api"] += 1
             self.replicas["worker"] = worker_replicas
             self.replicas["api"] = api_replicas
@@ -958,6 +1062,7 @@ class FakeCluster:
                 self.replicas.pop(smoke.GATEWAY_COMPONENT, None)
             self.profile_enabled = profile
             self.gateway_mode = gw_mode
+            self.vault_and_backup_enabled = vault_backup
             if profile:
                 self.artifacts_pvc_created = True
             self.installed, self.revision = True, self.revision + 1
@@ -1097,7 +1202,7 @@ class OrchestrationTest(unittest.TestCase):
         status, report, _ = self.run_main()
         self.assertEqual(self.fake.unknown, [])
         self.assertEqual((status, report["result"]), (0, "passed"), report.get("error"))
-        self.assertEqual(len(report["checks"]), 13)
+        self.assertEqual(len(report["checks"]), 14)
         self.assertEqual(self.fake.resumes, [(False, None), (False, "start"), (True, "start"),
                                              (True, None), (True, "end")])
         self.assertEqual(next(c["quiet_seconds"] for c in report["checks"] if "quiet_seconds" in c), 30)
@@ -1131,6 +1236,12 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(install_check["gateway_schema"], {"gateway_function_only": True,
                                                            "superseded_tables_absent": True,
                                                            "checks": len(smoke.GATEWAY_SCHEMA_CHECKS)})
+        self.assertEqual(install_check["migration_38_45"], {
+            "runtime_gates_and_restore_ok": True,
+            "vault_column_scoped": True,
+            "backup_definer_only": True,
+            "checks": len(smoke.MIGRATION_38_45_CHECKS),
+        })
         self.assertEqual(install_check["fresh_bootstrap"], {"metering_and_overrides_enforced": True,
                                                             "artifact_volume_unpinned_auto_pin_allowed": True})
         self.assertEqual(profile_check["artifacts"], {
@@ -1173,12 +1284,23 @@ class OrchestrationTest(unittest.TestCase):
                 "settlement": {"prompt_tokens": 11, "completion_tokens": 7, "settled_units": 18},
                 "upstream": {"model": smoke.CATALOG_MODEL, "authorization_stripped": True, "cache_salt_len": 64},
             })
+        vb_check = next(c for c in report["checks"] if "backup CronJob capture" in c["check"])
+        self.assertEqual(vb_check["vault_staged_pods"], 3)
+        self.assertEqual(vb_check["spec"]["cronjob"], smoke.BACKUP_CRONJOB)
+        self.assertEqual(vb_check["backup_run"], {
+            "state": "succeeded", "destination_domain": smoke.BACKUP_DESTINATION_DOMAIN,
+            "key_id": smoke.BACKUP_KEY_ID, "maintenance_active": False,
+        })
+        self.assertEqual(vb_check["verified"], {
+            "schema": 45, "key_id": smoke.BACKUP_KEY_ID, "components": 5, "artifact_revisions": 2,
+        })
         self.assertEqual(len(self.fake.commands("helm", "get", "hooks", smoke.RELEASE)), 2)
         self.assertEqual(profile_check["pvc"], {"claim": smoke.ARTIFACTS_CLAIM, "phase": "Bound",
                                                 "mount_path": smoke.ARTIFACTS_MOUNT_PATH, "mounted_pods": 3,
                                                 "store_subdirectories": ["staging", "revisions"]})
         stats = [c for c in self.fake.commands("kubectl") if "exec" in c and "stat" in c]
-        self.assertEqual(sorted(c[c.index("--container") + 1] for c in stats), ["api", "api", "worker"])
+        self.assertEqual(sorted(c[c.index("--container") + 1] for c in stats),
+                         ["api", "api", "api", "api", "worker", "worker"])
         self.assertEqual(profile_check["auth"], {
             "api_pods": 2, "config_path": smoke.AUTH_CONFIG_PATH, "catalog_path": smoke.AUTH_CATALOG_PATH,
             "keys_dir": smoke.AUTH_KEYS_DIR, "secret_mode": smoke.AUTH_SECRET_MODE, "worker_isolated": True,
@@ -1195,12 +1317,14 @@ class OrchestrationTest(unittest.TestCase):
         self.assertIn("poddisruptionbudgets", smoke.RELEASE_KINDS.split(","))
         self.assertIn("networkpolicies", smoke.INVENTORY_KINDS.split(","))
         self.assertNotIn("networkpolicies", smoke.OPTIONAL_KINDS.split(","))
+        self.assertIn("cronjobs", smoke.RELEASE_KINDS.split(","))
+        self.assertIn("cronjobs", smoke.OPTIONAL_KINDS.split(","))
         self.assertNotIn("error", report)
         self.assert_cleaned_up(built=(*smoke.ROLES, smoke.STANDIN))
         self.assertEqual([c[1:3] for c in self.fake.commands("helm") if c[1] in ("install", "upgrade", "uninstall")],
                          [["install", smoke.RELEASE], ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE],
                           ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE], ["upgrade", smoke.RELEASE],
-                          ["uninstall", smoke.RELEASE]])
+                          ["upgrade", smoke.RELEASE], ["uninstall", smoke.RELEASE]])
         for role in smoke.ROLES:
             self.assertEqual(report["images"][role], {"reference": smoke.digest_reference(role, DIGEST[role]),
                                                       "cri_image_id": IMAGE_ID[role],
@@ -1257,15 +1381,16 @@ class OrchestrationTest(unittest.TestCase):
         mutations = 0
         previous = None
         for call in map(FakeCluster.strip, self.fake.calls):
-            ingress_mutation = (call[:2] == ["kubectl", "--namespace"]
+            cluster_mutation = (call[:2] == ["kubectl", "--namespace"]
                                 and (call[3:6] in (["create", "secret", "tls"], ["rollout", "restart", f"deployment/{smoke.FULLNAME}-api"])
+                                     or call[3:5] in (["create", "job"], ["delete", "job"])
                                      or call[3:4] == ["cp"] or "/tmp/kind-admit" in call))
-            if tuple(call[:2]) in MUTATING or ingress_mutation:
+            if tuple(call[:2]) in MUTATING or cluster_mutation:
                 self.assertEqual(previous, ["IDENTITY"], f"{call[:2]} ran without an identity check just before")
                 mutations += 1
             if call[:3] != ["kubectl", "get", "namespace"]:
                 previous = call
-        self.assertEqual(mutations, 16)  # includes gateway stand-in, gateway TLS secret, inference fixtures and rev 5/6 upgrades
+        self.assertEqual(mutations, 21)  # includes gateway stand-in/TLS/rev 5-6 and vault/backup fixtures, rev 7, jobs and cleanup
 
     def test_namespace_from_another_run_is_refused_before_any_change(self):
         self.fake.namespaces[smoke.APP_NAMESPACE] = {smoke.RUN_LABEL: "ffffffff"}
@@ -1327,9 +1452,11 @@ class OrchestrationTest(unittest.TestCase):
         (text, values), _ = guard.call_args
         self.assertEqual(json.loads(text), report)
         self.assertEqual(sorted(values), sorted(self.fake.passwords.values()))
-        self.assertEqual(len(self.fake.passwords), 9)
+        self.assertEqual(len(self.fake.passwords), 11)
         self.assertIn("issuance", self.fake.passwords)
         self.assertIn("gateway", self.fake.passwords)
+        self.assertIn("vault_key", self.fake.passwords)
+        self.assertIn("backup_key", self.fake.passwords)
         self.assertEqual(len(self.fake.passwords["session"]), 87)
 
     def test_a_v1_failure_echoing_the_session_cookie_is_redacted(self):
@@ -1386,7 +1513,9 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(status, 0, report.get("error"))
         self.assertTrue(report["images"]["api"]["resolved_before_alias"])
         tagged = [c[-1] for c in self.fake.commands("docker", "exec") if c[5:7] == ["images", "tag"]]
-        self.assertEqual(tagged, [smoke.digest_reference(r, DIGEST[r]) for r in ("worker", "migrate", "gateway")])
+        pg_parts = smoke.postgres_client_image_parts(self.fake.core.POSTGRES_IMAGE)
+        pg_ref = f"{pg_parts['registry']}/{pg_parts['repository']}@{pg_parts['digest']}"
+        self.assertEqual(tagged, [*[smoke.digest_reference(r, DIGEST[r]) for r in ("worker", "migrate", "gateway", "admin")], pg_ref])
 
     def test_reference_resolving_before_the_name_exists_is_still_named(self):
         """CRI resolving the digest reference does not mean containerd holds that name."""
@@ -1400,7 +1529,9 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(status, 0, report.get("error"))
         self.assertTrue(report["images"]["api"]["resolved_before_alias"])
         tagged = [c[-1] for c in self.fake.commands("docker", "exec") if c[5:7] == ["images", "tag"]]
-        self.assertEqual(tagged, [smoke.digest_reference(r, DIGEST[r]) for r in smoke.ROLES])
+        pg_parts = smoke.postgres_client_image_parts(self.fake.core.POSTGRES_IMAGE)
+        pg_ref = f"{pg_parts['registry']}/{pg_parts['repository']}@{pg_parts['digest']}"
+        self.assertEqual(tagged, [*[smoke.digest_reference(r, DIGEST[r]) for r in smoke.ROLES], pg_ref])
 
     def test_each_assertion_fails_on_a_doctored_observation(self):
         fake_ref = lambda: self.fake  # noqa: E731 - doctors read the fake of the current subtest
@@ -1551,6 +1682,22 @@ class OrchestrationTest(unittest.TestCase):
             "gateway schema privilege violation": (
                 lambda args, result: fake_ref().gateway_schema.__setitem__(0, "f"),
                 "migration 37 gateway boundary"),
+            "migrations 38-45 privilege violation": (
+                lambda args, result: fake_ref().migration_38_45.__setitem__(0, "f"),
+                "migrations 38-45 role boundary"),
+            "vault key staged group-readable": (doctor_output(
+                ["exec", smoke.VAULT_CONFIG_PATH],
+                stdout=f"{smoke.VAULT_CONFIG_PATH}|regular file|440|65532\n"
+                       f"{smoke.VAULT_KEYS_DIR}/{smoke.VAULT_KEY_FILE}|regular file|400|65532\n"),
+                "expected a 0400 regular file owned by 65532"),
+            "backup capture missing success line": (doctor_output(
+                ["logs", f"job/{smoke.BACKUP_RUN_JOB}"], stdout="capture failed\n"),
+                "backup Job output lacks backup.capture_succeeded line"),
+            "backup verify wrong revision count": (doctor_output(
+                ["logs", f"job/{smoke.BACKUP_VERIFY_JOB}"],
+                stdout="backup.verified run_id=00000000-0000-4000-e000-000000000001 schema=45 "
+                       f"key_id={smoke.BACKUP_KEY_ID} components=5 journal_seq=2 artifact_revisions=1\n"),
+                "unexpected backup verify summary"),
             "gateway plain topology leaks to api": (doctor_output(
                 ["exec", f"deployment/{api}", f"{smoke.GATEWAY_WORKLOAD}.{smoke.APP_NAMESPACE}.svc.cluster.local"],
                 returncode=0, stdout="HTTP/1.1 200 OK\r\n"),
@@ -3214,6 +3361,149 @@ class GatewayAndInferenceHelpersTest(unittest.TestCase):
         ):
             with self.subTest(bad=bad[:30]), self.assertRaises(smoke.SmokeFailure):
                 smoke.evaluate_settled_round(bad)
+
+
+class VaultBackupAndMigrations38To45Test(unittest.TestCase):
+    """Unit tests for migrations 38–45 boundary queries, postgresClient parsing, vault and backup helpers."""
+
+    def test_migration_38_45_sql_and_evaluate(self):
+        sql = smoke.migration_38_45_sql()
+        self.assertTrue(sql.startswith("SELECT ") and sql.endswith(";"))
+        for fragment in (
+            "openmettle.runtime_feature_gates",
+            "openmettle.restore_reconciliation_gate",
+            "openmettle.restore_gate_lock_open()",
+            "openmettle.deletion_journal",
+            "openmettle.external_connections",
+            "refresh_ciphertext",
+            "openmettle.external_connection_shares",
+            "openmettle.backup_maintenance_gate",
+            "openmettle.backup_runs",
+            "openmettle.backup_rpo_telemetry_state",
+            "openmettle.backup_maintenance_is_active()",
+            "openmettle.backup_maintenance_lock_open()",
+            "openmettle.backup_observe_telemetry()",
+            "openmettle.backup_enter_maintenance(uuid,text,text)",
+        ):
+            self.assertIn(fragment, sql)
+        good = "|".join("t" if expected else "f" for _, expected in smoke.MIGRATION_38_45_CHECKS)
+        self.assertEqual(smoke.evaluate_migration_38_45(good + "\n"), {
+            "runtime_gates_and_restore_ok": True,
+            "vault_column_scoped": True,
+            "backup_definer_only": True,
+            "checks": len(smoke.MIGRATION_38_45_CHECKS),
+        })
+        flipped = good.split("|")
+        flipped[-1] = "t"
+        with self.assertRaisesRegex(smoke.SmokeFailure, "migrations 38-45 role boundary"):
+            smoke.evaluate_migration_38_45("|".join(flipped))
+        with self.assertRaisesRegex(smoke.SmokeFailure, "migrations 38-45 privilege query returned"):
+            smoke.evaluate_migration_38_45("t|f")
+
+    def test_postgres_client_image_parts_and_ctr_lookup(self):
+        d = "sha256:" + "e" * 64
+        self.assertEqual(
+            smoke.postgres_client_image_parts(f"docker.io/library/postgres:18.1-bookworm@{d}"),
+            {"registry": "docker.io", "repository": "library/postgres", "digest": d},
+        )
+        self.assertEqual(
+            smoke.postgres_client_image_parts(f"postgres@{d}"),
+            {"registry": "docker.io", "repository": "library/postgres", "digest": d},
+        )
+        self.assertEqual(
+            smoke.postgres_client_image_parts(f"ghcr.io/org/pg:18@{d}"),
+            {"registry": "ghcr.io", "repository": "org/pg", "digest": d},
+        )
+        for bad in ("postgres:18", "postgres@sha256:bad", f"@{d}"):
+            with self.subTest(bad=bad), self.assertRaises(smoke.SmokeFailure):
+                smoke.postgres_client_image_parts(bad)
+        listing = f"REF TYPE DIGEST\ndocker.io/library/postgres:18.1-bookworm@{d} t {d}\nother:1 t {d}\n"
+        self.assertEqual(
+            smoke.find_ctr_image_for_digest(listing, d, preferred=f"docker.io/library/postgres:18.1-bookworm@{d}"),
+            f"docker.io/library/postgres:18.1-bookworm@{d}",
+        )
+        self.assertEqual(
+            smoke.find_ctr_image_for_digest(listing, d),
+            f"docker.io/library/postgres:18.1-bookworm@{d}",
+        )
+        with self.assertRaisesRegex(smoke.SmokeFailure, "no containerd image"):
+            smoke.find_ctr_image_for_digest(listing, "sha256:" + "0" * 64)
+
+    def test_vault_and_backup_values_render_with_helm(self):
+        if shutil.which(HELM) is None:
+            self.skipTest("helm not on PATH")
+        pg_parts = smoke.postgres_client_image_parts("docker.io/library/postgres:18.1-bookworm@sha256:" + "e" * 64)
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.smoke_values(DIGEST, 1, vault_and_backup=True)
+        values = smoke.smoke_values(DIGEST, 1, enabled_profile=True, gateway_mode="tls",
+                                    vault_and_backup=True, postgres_client_image=pg_parts)
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            json.dump(values, handle)
+            handle.flush()
+            result = subprocess.run([HELM, "template", smoke.RELEASE, str(smoke.CHART), "--values", handle.name],
+                                    capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kind: CronJob", result.stdout)
+        self.assertIn("name: stage-vault-keys", result.stdout)
+        self.assertIn("name: OPENMETTLE_API_VAULT_KEYS_CONFIG", result.stdout)
+        self.assertIn("name: OPENMETTLE_WORKER_VAULT_KEYS_CONFIG", result.stdout)
+        self.assertIn("name: OPENMETTLE_ADMIN_DATABASE_URL", result.stdout)
+        self.assertIn(f'name: {smoke.BACKUP_CRONJOB}', result.stdout)
+
+    def test_vault_and_backup_fixtures_and_parsers(self):
+        vk = base64.b64encode(b"v" * 32).decode("ascii")
+        bk = base64.b64encode(b"b" * 32).decode("ascii")
+        items = smoke.vault_and_backup_fixture_manifests(vk, bk, "0a1b2c3d")["items"]
+        self.assertEqual({(i["kind"], i["metadata"]["name"]) for i in items}, {
+            ("Secret", smoke.VAULT_KEYS_SECRET),
+            ("Secret", smoke.BACKUP_KEYS_SECRET),
+            ("PersistentVolumeClaim", smoke.BACKUP_DEST_CLAIM),
+        })
+        vault_ring = json.loads(base64.b64decode(items[0]["data"]["keyring.json"]))
+        self.assertEqual(vault_ring["keys"], [{"id": smoke.VAULT_KEY_ID,
+                                               "file": f"{smoke.VAULT_KEYS_DIR}/{smoke.VAULT_KEY_FILE}"}])
+        backup_ring = json.loads(base64.b64decode(items[1]["data"]["keyring.json"]))
+        self.assertEqual(backup_ring["keys"], [{"id": smoke.BACKUP_KEY_ID,
+                                                "file": f"{smoke.BACKUP_KEYS_DIR}/{smoke.BACKUP_KEY_FILE}"}])
+        good_stat = (f"{smoke.VAULT_CONFIG_PATH}|regular file|400|65532\n"
+                     f"{smoke.VAULT_KEYS_DIR}/{smoke.VAULT_KEY_FILE}|regular file|400|65532\n")
+        self.assertIsNone(smoke.evaluate_vault_key_files("api-0", good_stat))
+        for bad_stat in ("", good_stat.replace("400", "440"), good_stat.replace("regular file", "symbolic link")):
+            with self.assertRaises(smoke.SmokeFailure):
+                smoke.evaluate_vault_key_files("api-0", bad_stat)
+        run_id = "00000000-0000-4000-e000-000000000001"
+        digest = "b" * 64
+        cap_dir = f"{smoke.BACKUP_DEST_DIR}/20261127T080000Z-{run_id}"
+        parsed = smoke.parse_backup_capture_log(
+            f"backup.capture_succeeded run_id={run_id} dir={cap_dir} key_id={smoke.BACKUP_KEY_ID} "
+            f"bundle_digest={digest} journal_seq=2 pruned=0 skipped_unverified=0 maintenance_released=true\n"
+        )
+        self.assertEqual(parsed, {"run_id": run_id, "dir": cap_dir, "key_id": smoke.BACKUP_KEY_ID,
+                                  "bundle_digest": digest, "maintenance_released": True})
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.parse_backup_capture_log("no marker\n")
+        row = f"{run_id}|succeeded|{smoke.BACKUP_DESTINATION_DOMAIN}|{smoke.BACKUP_KEY_ID}|{digest}|t|t|f|t\n"
+        self.assertEqual(smoke.evaluate_backup_run_row(row, run_id, digest), {
+            "state": "succeeded", "destination_domain": smoke.BACKUP_DESTINATION_DOMAIN,
+            "key_id": smoke.BACKUP_KEY_ID, "maintenance_active": False,
+        })
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.evaluate_backup_run_row(row.replace("|f|t", "|t|t"), run_id, digest)
+        verify_job = smoke.backup_verify_job_manifest(smoke.digest_reference("admin", DIGEST["admin"]), cap_dir, "1")
+        self.assertEqual(verify_job["spec"]["template"]["spec"]["containers"][0]["args"][:3],
+                         ["backup", "verify", "--backup-dir"])
+        self.assertEqual(
+            smoke.parse_backup_verify_log(
+                f"backup.verified run_id={run_id} schema=45 key_id={smoke.BACKUP_KEY_ID} "
+                "components=5 journal_seq=2 artifact_revisions=2\n", run_id,
+            ),
+            {"schema": 45, "key_id": smoke.BACKUP_KEY_ID, "components": 5, "artifact_revisions": 2},
+        )
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.parse_backup_verify_log(
+                f"backup.verified run_id={run_id} schema=44 key_id={smoke.BACKUP_KEY_ID} "
+                "components=5 journal_seq=2 artifact_revisions=2\n", run_id,
+            )
 
 
 if __name__ == "__main__":

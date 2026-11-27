@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 / V1-06 smoke test).
+"""Install the openmettle-core chart on an ephemeral kind cluster (V1-32 / V1-06 / V1-28 / V1-30 smoke test).
 
-Test harness only; not an installer. It builds core's api, worker, migrate and gateway images from a
-pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
+Test harness only; not an installer. It builds core's api, worker, migrate, gateway and admin images
+from a pinned core checkout, loads them into a uniquely named kind cluster classified `dev` and
 installs the chart by image digest with a synthetic PostgreSQL fixture. It then checks:
-migration hook (through migration 37, including migrations 19/20/37 role boundaries and fresh-install
-quota/storage markers), readiness, worker scaling, an idempotent upgrade, an enabled-profile upgrade
-(API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug structured logs,
-API-only auth + /v1/* mounts and session issuance credential, and a live /v1/artifacts upload,
-idempotent retry, revision and byte-range download round trip across both API replicas on the
-PVC), queued-run SSE replay, API pod replacement and worker expiry through HTTPS ingress,
-live end-to-end turn execution through `openmettle-gateway` and `worker.inference` (both plain-HTTP
-in-cluster under NetworkPolicy and fronted by the Traefik TLS terminator with `worker.inference.caBundle`
-and `ingressFrom` enforcement, verified against a synthetic SGLang stand-in and settled PostgreSQL
-usage/quota rows), uninstall (with chart-owned PVC preservation), absence of optional packages,
-Pod Security `restricted` enforcement and NetworkPolicy enforcement. Every assertion reads
-live cluster, Helm, HTTP or database state. Core's process-contract assertions are not repeated
-(core tests/kubernetes).
+migration hook (through migration 45, including migrations 19/20/37 and 38–45 role boundaries and
+fresh-install quota/storage markers), readiness, worker scaling, an idempotent upgrade, an
+enabled-profile upgrade (API replicas=2, PodDisruptionBudget, artifact PVC, ADR 0024 JSON/debug
+structured logs, API-only auth + /v1/* mounts and session issuance credential, and a live
+/v1/artifacts upload, idempotent retry, revision and byte-range download round trip across both API
+replicas on the PVC), queued-run SSE replay, API pod replacement and worker expiry through HTTPS
+ingress, live end-to-end turn execution through `openmettle-gateway` and `worker.inference` (both
+plain-HTTP in-cluster under NetworkPolicy and fronted by the Traefik TLS terminator with
+`worker.inference.caBundle` and `ingressFrom` enforcement, verified against a synthetic SGLang
+stand-in and settled PostgreSQL usage/quota rows), opt-in `vault` RAM-staged `0400` keys on `api`
+and `worker` only plus opt-in `backup` CronJob manual capture and offline `openmettle-admin backup
+verify`, uninstall (with chart-owned PVC preservation), absence of optional packages, Pod Security
+`restricted` enforcement and NetworkPolicy enforcement. Every assertion reads live cluster, Helm,
+HTTP or database state. Core's process-contract assertions are not repeated (core tests/kubernetes).
 
 Safety guards, tool and image pins are imported from core tests/kubernetes/qualify.py at
 CORE_COMMIT; see tests/kind/README.md. Requires Python 3.10+, docker, the pinned kind and
@@ -73,7 +74,7 @@ FULLNAME = RELEASE  # the release name contains the chart name (templates/_helpe
 APP_NAMESPACE = "openmettle-smoke"
 DB_NAMESPACE = "openmettle-smoke-db"
 RUN_LABEL = "openmettle.dev/smoke-run"
-ROLES = ("api", "worker", "migrate", "gateway")
+ROLES = ("api", "worker", "migrate", "gateway", "admin")
 DEFAULT_ROLES = ("api", "worker", "migrate")
 WORKLOADS = ("api", "worker")
 # RFC 6761 reserves .invalid: the name never resolves. Images are never pulled (pullPolicy Never);
@@ -88,11 +89,124 @@ DB_ROLE = {"api": "openmettle_api", "worker": "openmettle_worker", "migrate": "o
 # Every PostgreSQL login the fixture provisions: api, worker, owner (migrate), session issuance
 # (core ADR 0030, migration 18) and gateway proxy (core ADR 0044, migrations 23 and 37).
 DB_LOGINS = ("api", "worker", "migrate", "issuance", "gateway")
-REQUIRED_MIGRATION = 37
+REQUIRED_MIGRATION = 45
+RUNTIME_DB_ROLES = ("openmettle_api", "openmettle_worker", "openmettle_gateway", "openmettle_issuance")
 RUN_DISPATCH_LOCK = "openmettle.run_dispatch_lock"
 GATEWAY_SETTLE_FN = (
     "openmettle.gateway_settle_report("
     "uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)"
+)
+# Migrations 38–45 role boundaries (core ADRs 0039, 0041, 0045, 0046; verified against core src/boundaries.sql):
+# - 0039: runtime_feature_gates SELECT only for api/worker; zero writes; zero access for gateway/issuance.
+# - 0041/0042: restore_reconciliation_gate SELECT for worker only; restore_gate_lock_open*() EXECUTE for
+#   api/worker only; zero table/column privileges on deletion_journal, deletion_journal_head and
+#   retention_upgrade_baseline for all runtime roles.
+# - 0043: external_connections column-scoped non-secret SELECT for api (secret/refresh columns denied);
+#   table SELECT + refresh UPDATE for worker (no INSERT/DELETE); external_connection_shares SELECT for
+#   api/worker (no DELETE for api, no writes for worker); zero privileges for gateway/issuance.
+# - 0045: zero table/column privileges on backup_maintenance_gate, backup_runs and backup_rpo_telemetry_state
+#   for all runtime roles; SECURITY DEFINER helpers backup_maintenance_{is_active,lock_open}() EXECUTE for
+#   api/worker only; backup_observe_telemetry() EXECUTE for worker only; owner maintenance/capture functions
+#   denied for all runtime roles.
+MIGRATION_38_45_CHECKS = (
+    # Migration 39: runtime_feature_gates
+    ("has_table_privilege('openmettle_api', 'openmettle.runtime_feature_gates', 'SELECT')", True),
+    ("has_table_privilege('openmettle_worker', 'openmettle.runtime_feature_gates', 'SELECT')", True),
+    *((f"has_table_privilege('{role}', 'openmettle.runtime_feature_gates', '{priv}')", False)
+      for role in ("openmettle_api", "openmettle_worker")
+      for priv in ("INSERT", "UPDATE", "DELETE")),
+    *((f"has_table_privilege('{role}', 'openmettle.runtime_feature_gates', '{priv}')", False)
+      for role in ("openmettle_gateway", "openmettle_issuance")
+      for priv in ("SELECT", "INSERT", "UPDATE", "DELETE")),
+    # Migration 40: API capacity visibility & two-phase dispatch fencing (V1-18 / ADR 0042)
+    ("has_table_privilege('openmettle_api', 'openmettle.capacity_profiles', 'SELECT')", True),
+    ("has_any_column_privilege('openmettle_api', 'openmettle.capacity_grants', 'SELECT')", False),
+    ("has_function_privilege('openmettle_api', 'openmettle.capacity_group_observations()', 'EXECUTE')", True),
+    *((f"has_function_privilege('{role}', 'openmettle.capacity_group_observations()', 'EXECUTE')", False)
+      for role in ("openmettle_worker", "openmettle_gateway", "openmettle_issuance")),
+    ("has_function_privilege('openmettle_worker', 'openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)', 'EXECUTE')", True),
+    *((f"has_function_privilege('{role}', 'openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)', 'EXECUTE')", False)
+      for role in ("openmettle_api", "openmettle_gateway", "openmettle_issuance")),
+    # Migrations 41–42: restore_reconciliation_gate & deletion journal / baseline tables
+    ("has_table_privilege('openmettle_worker', 'openmettle.restore_reconciliation_gate', 'SELECT')", True),
+    ("has_table_privilege('openmettle_worker', 'openmettle.restore_reconciliation_gate', 'UPDATE')", False),
+    *((f"has_any_column_privilege('{role}', 'openmettle.restore_reconciliation_gate', 'SELECT')", False)
+      for role in ("openmettle_api", "openmettle_gateway", "openmettle_issuance")),
+    ("has_function_privilege('openmettle_api', 'openmettle.restore_gate_lock_open()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_worker', 'openmettle.restore_gate_lock_open()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_gateway', 'openmettle.restore_gate_lock_open()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_issuance', 'openmettle.restore_gate_lock_open()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_api', 'openmettle.restore_gate_lock_open_generation()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_worker', 'openmettle.restore_gate_lock_open_generation()', 'EXECUTE')", True),
+    *((f"has_any_column_privilege('{role}', '{table}', '{priv}')", False)
+      for table in ("openmettle.deletion_journal", "openmettle.deletion_journal_head",
+                    "openmettle.retention_upgrade_baseline")
+      for role in RUNTIME_DB_ROLES
+      for priv in ("SELECT", "INSERT", "UPDATE")),
+    *((f"has_table_privilege('{role}', '{table}', 'DELETE')", False)
+      for table in ("openmettle.deletion_journal", "openmettle.deletion_journal_head",
+                    "openmettle.retention_upgrade_baseline")
+      for role in RUNTIME_DB_ROLES),
+    # Migration 43: external_connections & external_connection_shares (V1-28 / ADR 0045)
+    ("has_table_privilege('openmettle_api', 'openmettle.external_connections', 'SELECT')", False),
+    ("has_column_privilege('openmettle_api', 'openmettle.external_connections', 'id', 'SELECT')", True),
+    ("has_column_privilege('openmettle_api', 'openmettle.external_connections', 'state', 'SELECT')", True),
+    *((f"has_column_privilege('openmettle_api', 'openmettle.external_connections', '{col}', 'SELECT')", False)
+      for col in ("encryption_key_id", "access_salt", "access_nonce", "access_ciphertext",
+                  "refresh_salt", "refresh_nonce", "refresh_ciphertext",
+                  "refresh_claim_token", "refresh_lease_until")),
+    ("has_table_privilege('openmettle_api', 'openmettle.external_connections', 'DELETE')", False),
+    ("has_table_privilege('openmettle_worker', 'openmettle.external_connections', 'SELECT')", True),
+    *((f"has_column_privilege('openmettle_worker', 'openmettle.external_connections', '{col}', 'UPDATE')", True)
+      for col in ("refresh_salt", "refresh_nonce", "refresh_ciphertext",
+                  "refresh_claim_token", "refresh_lease_until")),
+    ("has_table_privilege('openmettle_worker', 'openmettle.external_connections', 'INSERT')", False),
+    ("has_table_privilege('openmettle_worker', 'openmettle.external_connections', 'DELETE')", False),
+    ("has_table_privilege('openmettle_api', 'openmettle.external_connection_shares', 'SELECT')", True),
+    ("has_table_privilege('openmettle_api', 'openmettle.external_connection_shares', 'DELETE')", False),
+    ("has_table_privilege('openmettle_worker', 'openmettle.external_connection_shares', 'SELECT')", True),
+    ("has_table_privilege('openmettle_worker', 'openmettle.external_connection_shares', 'INSERT')", False),
+    ("has_table_privilege('openmettle_worker', 'openmettle.external_connection_shares', 'UPDATE')", False),
+    *((f"has_any_column_privilege('{role}', '{table}', '{priv}')", False)
+      for table in ("openmettle.external_connections", "openmettle.external_connection_shares")
+      for role in ("openmettle_gateway", "openmettle_issuance")
+      for priv in ("SELECT", "INSERT", "UPDATE")),
+    *((f"has_table_privilege('{role}', '{table}', 'DELETE')", False)
+      for table in ("openmettle.external_connections", "openmettle.external_connection_shares")
+      for role in ("openmettle_gateway", "openmettle_issuance")),
+    # Migration 44: declare-lost artifact payloads (owner-only mutation, runtime read-only lost_at)
+    ("has_column_privilege('openmettle_api', 'openmettle.artifact_revisions', 'lost_at', 'SELECT')", True),
+    ("has_column_privilege('openmettle_worker', 'openmettle.artifact_revisions', 'lost_at', 'SELECT')", True),
+    *((f"has_column_privilege('{role}', 'openmettle.artifact_revisions', 'lost_at', 'UPDATE')", False)
+      for role in RUNTIME_DB_ROLES),
+    *((f"has_function_privilege('{role}', 'openmettle.storage_declare_payload_lost(uuid,uuid,text,text)', 'EXECUTE')", False)
+      for role in RUNTIME_DB_ROLES),
+    # Migration 45: backup tables (zero runtime table/column grants) & SECURITY DEFINER functions (V1-30 / ADR 0046)
+    *((f"has_any_column_privilege('{role}', '{table}', '{priv}')", False)
+      for table in ("openmettle.backup_maintenance_gate", "openmettle.backup_runs",
+                    "openmettle.backup_rpo_telemetry_state")
+      for role in RUNTIME_DB_ROLES
+      for priv in ("SELECT", "INSERT", "UPDATE")),
+    *((f"has_table_privilege('{role}', '{table}', 'DELETE')", False)
+      for table in ("openmettle.backup_maintenance_gate", "openmettle.backup_runs",
+                    "openmettle.backup_rpo_telemetry_state")
+      for role in RUNTIME_DB_ROLES),
+    ("has_function_privilege('openmettle_api', 'openmettle.backup_maintenance_is_active()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_worker', 'openmettle.backup_maintenance_is_active()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_gateway', 'openmettle.backup_maintenance_is_active()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_issuance', 'openmettle.backup_maintenance_is_active()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_api', 'openmettle.backup_maintenance_lock_open()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_worker', 'openmettle.backup_maintenance_lock_open()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_gateway', 'openmettle.backup_maintenance_lock_open()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_issuance', 'openmettle.backup_maintenance_lock_open()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_worker', 'openmettle.backup_observe_telemetry()', 'EXECUTE')", True),
+    ("has_function_privilege('openmettle_api', 'openmettle.backup_observe_telemetry()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_gateway', 'openmettle.backup_observe_telemetry()', 'EXECUTE')", False),
+    ("has_function_privilege('openmettle_issuance', 'openmettle.backup_observe_telemetry()', 'EXECUTE')", False),
+    *((f"has_function_privilege('{role}', '{fn}', 'EXECUTE')", False)
+      for fn in ("openmettle.backup_enter_maintenance(uuid,text,text)",
+                 "openmettle.backup_start_capture(uuid,text,text,text,integer)")
+      for role in RUNTIME_DB_ROLES),
 )
 # Migration 37 gateway boundaries (core ADR 0044 increment 6): openmettle_gateway has EXECUTE on
 # gateway_dispatch, gateway_dispatch_scoped and gateway_settle_report, zero table privileges on
@@ -171,8 +285,8 @@ ISSUANCE_POOL_ENV = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS"
 ISSUANCE_POOL = "2"  # chart default api.settings.issuanceDbMaxConnections
 HELM_TIMEOUT = "300s"  # >= migration.activeDeadlineSeconds below
 MIGRATION_DEADLINE_SECONDS = 120
-OPTIONAL_KINDS = "ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers"
-RELEASE_KINDS = "ingresses,deployments,replicasets,pods,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies,poddisruptionbudgets"
+OPTIONAL_KINDS = "ingresses,persistentvolumeclaims,poddisruptionbudgets,resourceclaims,horizontalpodautoscalers,cronjobs"
+RELEASE_KINDS = "ingresses,deployments,replicasets,pods,services,serviceaccounts,jobs,cronjobs,configmaps,secrets,networkpolicies,poddisruptionbudgets"
 INVENTORY_KINDS = "deployments,services,serviceaccounts,jobs,configmaps,secrets,networkpolicies"
 API_PDB = f"{FULLNAME}-api"
 ARTIFACTS_CLAIM = f"{FULLNAME}-artifacts"
@@ -276,6 +390,25 @@ INFERENCE_TLS_CONFIG_MAP = "openmettle-smoke-inference-tls"
 INFERENCE_CA_CONFIG_MAP = "openmettle-smoke-inference-ca"
 CLUSTER_PRIVATE_CIDRS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 CACHE_SALT = re.compile(r"[0-9a-f]{64}")
+# ADR 0045 vault + ADR 0046 backup CronJob live smoke fixtures.
+VAULT_KEYS_SECRET = "openmettle-smoke-vault-keys"
+VAULT_KEY_ID = "vault-k1"
+VAULT_KEY_FILE = "vault-k1.key"
+VAULT_KEYS_DIR = "/etc/openmettle/vault-keys"
+VAULT_CONFIG_PATH = f"{VAULT_KEYS_DIR}/keyring.json"
+BACKUP_KEYS_SECRET = "openmettle-smoke-backup-keys"
+BACKUP_KEY_ID = "backup-k1"
+BACKUP_KEY_FILE = "backup-k1.key"
+BACKUP_KEYS_DIR = "/etc/openmettle/backup-keys"
+BACKUP_CONFIG_PATH = f"{BACKUP_KEYS_DIR}/keyring.json"
+BACKUP_DEST_CLAIM = "openmettle-smoke-backup-dest"
+BACKUP_DEST_DIR = "/var/backups/openmettle"
+BACKUP_DESTINATION_DOMAIN = "kind-smoke.example.test"
+BACKUP_OPERATOR_ID = "00000000-0000-4000-8000-00000000b046"
+BACKUP_CRONJOB = f"{FULLNAME}-backup"
+BACKUP_NETWORK_POLICY = f"{FULLNAME}-backup"
+BACKUP_RUN_JOB = "openmettle-smoke-backup-run"
+BACKUP_VERIFY_JOB = "openmettle-smoke-backup-verify"
 # NetworkPolicy fixtures. The app namespace denies all traffic by default, as the owner's application
 # namespaces do; the release must work under it. PEER is a second PostgreSQL server in the database
 # namespace that is not a configured database peer; it is also the one configured API ingress peer.
@@ -421,11 +554,43 @@ def digest_reference(role: str, digest: str) -> str:
     return f"{REGISTRY}/openmettle/{role}@{digest}"
 
 
+def postgres_client_image_parts(image: str) -> dict:
+    """Split a digest-pinned PostgreSQL image reference into chart {registry, repository, digest} fields."""
+    name, sep, digest = image.partition("@")
+    if not sep or not DIGEST.fullmatch(digest):
+        raise SmokeFailure(f"POSTGRES_IMAGE must be digest-pinned, got {image!r}")
+    if ":" in name.rsplit("/", 1)[-1]:
+        name = name.rsplit(":", 1)[0]
+    if not name:
+        raise SmokeFailure(f"POSTGRES_IMAGE has no repository: {image!r}")
+    if "/" not in name:
+        registry, repository = "docker.io", f"library/{name}"
+    else:
+        first, rest = name.split("/", 1)
+        if "." in first or ":" in first or first == "localhost":
+            registry, repository = first, rest
+        else:
+            registry, repository = "docker.io", name
+    return {"registry": registry, "repository": repository, "digest": digest}
+
+
+def find_ctr_image_for_digest(output: str, digest: str, *, preferred: str | None = None) -> str:
+    """Find a containerd image name in `ctr images ls` whose target digest equals `digest`."""
+    rows = [line.split() for line in output.splitlines()[1:] if line.split()]
+    matches = [fields[0] for fields in rows if len(fields) >= 3 and fields[2] == digest]
+    if preferred and preferred in matches:
+        return preferred
+    if not matches:
+        raise SmokeFailure(f"no containerd image found with digest {digest}")
+    return sorted(matches)[0]
+
+
 def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool = False,
-                 gateway_mode: str | None = None) -> dict:
+                 gateway_mode: str | None = None, vault_and_backup: bool = False,
+                 postgres_client_image: dict | None = None) -> dict:
     """Chart values for the smoke release. Shorter migration timeouts bound a hung hook."""
     if set(digests) != set(ROLES):
-        raise SmokeFailure("a digest is required for each of api, worker, migrate and gateway")
+        raise SmokeFailure("a digest is required for each of api, worker, migrate, gateway and admin")
     for role in ROLES:
         digest_reference(role, digests[role])
     if worker_replicas not in (1, 2):
@@ -434,6 +599,8 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
         raise SmokeFailure(f"unexpected gateway_mode: {gateway_mode!r}")
     if gateway_mode is not None and not enabled_profile:
         raise SmokeFailure("gateway_mode requires enabled_profile=True")
+    if vault_and_backup and (not enabled_profile or not postgres_client_image):
+        raise SmokeFailure("vault_and_backup requires enabled_profile=True and postgres_client_image")
     values = {
         "images": {"pullPolicy": "Never", **{
             role: {"registry": REGISTRY, "repository": f"openmettle/{role}", "digest": digests[role]}
@@ -518,6 +685,35 @@ def smoke_values(digests: dict, worker_replicas: int, *, enabled_profile: bool =
                 "upstreamUrl": f"http://{STANDIN}.{DB_NAMESPACE}.svc.cluster.local:{STANDIN_PORT}",
                 "networkPolicy": gw_np,
             },
+        }
+    if vault_and_backup:
+        values["images"]["admin"] = {
+            "registry": REGISTRY, "repository": "openmettle/admin", "digest": digests["admin"],
+        }
+        values["images"]["postgresClient"] = dict(postgres_client_image)
+        values["database"]["backup"] = {"existingSecret": SECRET["migrate"]}
+        values["vault"] = {
+            "enabled": True,
+            "existingSecret": VAULT_KEYS_SECRET,
+            "configKey": "keyring.json",
+        }
+        values["backup"] = {
+            "enabled": True,
+            "suspend": True,
+            "schedule": "0 3 * * *",
+            "existingKeysSecret": BACKUP_KEYS_SECRET,
+            "keysConfigKey": "keyring.json",
+            "destination": {
+                "existingClaim": BACKUP_DEST_CLAIM,
+                "domain": BACKUP_DESTINATION_DOMAIN,
+                # Single-node kind local-path-provisioner backs every PVC from the same host root device.
+                "requireSeparateDevice": False,
+            },
+            "operatorId": BACKUP_OPERATOR_ID,
+            "reason": "kind smoke coordinated backup capture",
+            "drainTimeoutSecs": 60,
+            "activeDeadlineSeconds": 180,
+            "releaseOnSuccess": True,
         }
     return values
 
@@ -1228,6 +1424,285 @@ def evaluate_gateway_schema(output: str) -> dict:
         raise SmokeFailure("migration 37 gateway boundary: " + "; ".join(wrong))
     return {"gateway_function_only": True, "superseded_tables_absent": True,
             "checks": len(GATEWAY_SCHEMA_CHECKS)}
+
+
+def migration_38_45_sql() -> str:
+    return "SELECT " + ", ".join(expression for expression, _ in MIGRATION_38_45_CHECKS) + ";"
+
+
+def evaluate_migration_38_45(output: str) -> dict:
+    """Compare migration_38_45_sql()'s one psql -tA row with MIGRATION_38_45_CHECKS (migrations 38–45)."""
+    observed = output.strip().split("|")
+    expected = ["t" if value else "f" for _, value in MIGRATION_38_45_CHECKS]
+    if len(observed) != len(expected):
+        raise SmokeFailure(f"migrations 38-45 privilege query returned {output.strip()!r}")
+    wrong = [f"{expression} is {got!r}, expected {want!r}"
+             for (expression, _), got, want in zip(MIGRATION_38_45_CHECKS, observed, expected) if got != want]
+    if wrong:
+        raise SmokeFailure("migrations 38-45 role boundary: " + "; ".join(wrong))
+    return {"runtime_gates_and_restore_ok": True, "vault_column_scoped": True,
+            "backup_definer_only": True, "checks": len(MIGRATION_38_45_CHECKS)}
+
+
+def vault_and_backup_fixture_manifests(vault_key_b64: str, backup_key_b64: str, run_id: str) -> dict:
+    """Test-owned distinct vault/backup keyring Secrets and backup destination PVC (V1-28, V1-30)."""
+    labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
+    vault_keyring = json.dumps({
+        "version": 1,
+        "active_key_id": VAULT_KEY_ID,
+        "keys": [{"id": VAULT_KEY_ID, "file": f"{VAULT_KEYS_DIR}/{VAULT_KEY_FILE}"}],
+    }).encode("utf-8")
+    backup_keyring = json.dumps({
+        "version": 1,
+        "active_key_id": BACKUP_KEY_ID,
+        "keys": [{"id": BACKUP_KEY_ID, "file": f"{BACKUP_KEYS_DIR}/{BACKUP_KEY_FILE}"}],
+    }).encode("utf-8")
+    return {"apiVersion": "v1", "kind": "List", "items": [
+        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+         "metadata": {"name": VAULT_KEYS_SECRET, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"keyring.json": base64.b64encode(vault_keyring).decode("ascii"),
+                  VAULT_KEY_FILE: vault_key_b64}},
+        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+         "metadata": {"name": BACKUP_KEYS_SECRET, "namespace": APP_NAMESPACE, "labels": labels},
+         "data": {"keyring.json": base64.b64encode(backup_keyring).decode("ascii"),
+                  BACKUP_KEY_FILE: backup_key_b64}},
+        {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+         "metadata": {"name": BACKUP_DEST_CLAIM, "namespace": APP_NAMESPACE, "labels": labels},
+         "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "64Mi"}}}},
+    ]}
+
+
+def vault_key_files_command() -> list:
+    """stat(1) staged vault keyring and 32-byte key file inside api/worker pods."""
+    return ["stat", "--format=%n|%F|%a|%u", VAULT_CONFIG_PATH, f"{VAULT_KEYS_DIR}/{VAULT_KEY_FILE}"]
+
+
+def evaluate_vault_key_files(pod: str, output: str) -> None:
+    """Require staged vault files to be mode 0400 regular files owned by UID 65532 (core ADR 0045)."""
+    expected = [VAULT_CONFIG_PATH, f"{VAULT_KEYS_DIR}/{VAULT_KEY_FILE}"]
+    rows = [line.split("|") for line in output.splitlines()]
+    if [row[0] for row in rows] != expected or any(len(row) != 4 for row in rows):
+        raise SmokeFailure(f"{pod}: unexpected vault key listing {output!r}")
+    for path, kind, mode, uid in rows:
+        if kind != "regular file" or not re.fullmatch(r"[0-7]{3,4}", mode) or int(mode, 8) & 0o777 != 0o400 \
+                or uid != "65532":
+            raise SmokeFailure(f"{pod}: {path} is {kind} mode {mode} owner {uid}, "
+                               f"expected a 0400 regular file owned by 65532")
+
+
+def check_vault_and_backup_spec(pods_by_role: dict, cronjob: dict, backup_np: dict,
+                                *, admin_ref: str, postgres_client_ref: str) -> dict:
+    """Verify live api/worker vault RAM staging, gateway isolation, backup CronJob and backup NetworkPolicy."""
+    api_pods = pods_by_role.get("api") or []
+    worker_pods = pods_by_role.get("worker") or []
+    gateway_pods = pods_by_role.get(GATEWAY_COMPONENT) or []
+    if not api_pods or not worker_pods or not gateway_pods:
+        raise SmokeFailure("api, worker and gateway pods are required to verify vault and backup isolation")
+    for role in WORKLOADS:
+        for pod in pods_by_role[role]:
+            spec = pod.get("spec", {})
+            init = next((c for c in spec.get("initContainers") or [] if c.get("name") == "stage-vault-keys"), None)
+            if init is None:
+                raise SmokeFailure(f"{role} pod lacks stage-vault-keys initContainer")
+            vols = {v.get("name"): v for v in spec.get("volumes") or []}
+            if vols.get("vault-keys", {}).get("emptyDir", {}).get("medium") != "Memory":
+                raise SmokeFailure(f"{role} pod vault-keys volume must be a Memory emptyDir")
+            if vols.get("vault-keys-secret", {}).get("secret", {}).get("secretName") != VAULT_KEYS_SECRET:
+                raise SmokeFailure(f"{role} pod does not attach vault Secret {VAULT_KEYS_SECRET}")
+            container = next((c for c in spec.get("containers") or [] if c.get("name") == role), None)
+            if container is None:
+                raise SmokeFailure(f"{role} pod has no container named {role!r}")
+            mounts = {m.get("name"): m for m in container.get("volumeMounts") or []}
+            if "vault-keys-secret" in mounts:
+                raise SmokeFailure(f"{role} main container must not mount raw vault-keys-secret")
+            if mounts.get("vault-keys") != {"name": "vault-keys", "mountPath": VAULT_KEYS_DIR,
+                                            "subPath": "keys", "readOnly": True}:
+                raise SmokeFailure(f"{role} container does not mount staged vault-keys read-only with subPath keys")
+            env = {e.get("name"): e.get("value") for e in container.get("env") or []}
+            var = f"OPENMETTLE_{role.upper()}_VAULT_KEYS_CONFIG"
+            if env.get(var) != VAULT_CONFIG_PATH:
+                raise SmokeFailure(f"{role} container lacks {var}={VAULT_CONFIG_PATH}")
+    for pod in gateway_pods:
+        spec_text = json.dumps(pod.get("spec", {}))
+        if "vault-keys" in spec_text or "VAULT_KEYS" in spec_text or VAULT_KEYS_SECRET in spec_text:
+            raise SmokeFailure("gateway pod must not mount vault keys or receive VAULT_KEYS env")
+    cj_spec = cronjob.get("spec", {})
+    if cj_spec.get("concurrencyPolicy") != "Forbid" or cj_spec.get("suspend") is not True:
+        raise SmokeFailure("backup CronJob must have concurrencyPolicy=Forbid and suspend=true")
+    job_spec = cj_spec.get("jobTemplate", {}).get("spec", {})
+    if job_spec.get("backoffLimit") != 0:
+        raise SmokeFailure(f"backup CronJob backoffLimit is {job_spec.get('backoffLimit')!r}, expected 0")
+    pod_spec = job_spec.get("template", {}).get("spec", {})
+    init = next((c for c in pod_spec.get("initContainers") or [] if c.get("name") == "prepare-backup-runtime"), None)
+    if init is None or init.get("image") != admin_ref or init.get("imagePullPolicy") != "Never":
+        raise SmokeFailure(f"backup CronJob prepare-backup-runtime must run {admin_ref} with pullPolicy Never")
+    main = next((c for c in pod_spec.get("containers") or [] if c.get("name") == "backup"), None)
+    if main is None or main.get("image") != postgres_client_ref or main.get("imagePullPolicy") != "Never":
+        raise SmokeFailure(f"backup CronJob main container must run {postgres_client_ref} with pullPolicy Never")
+    main_env = {e.get("name"): e for e in main.get("env") or []}
+    ref = main_env.get("OPENMETTLE_ADMIN_DATABASE_URL", {}).get("valueFrom", {}).get("secretKeyRef", {})
+    if (ref.get("name"), ref.get("key")) != (SECRET["migrate"], "url") or ref.get("optional", False) is not False:
+        raise SmokeFailure("backup container OPENMETTLE_ADMIN_DATABASE_URL does not reference owner Secret url")
+    job_uid_field = (main_env.get("OPENMETTLE_BACKUP_JOB_UID", {})
+                     .get("valueFrom", {}).get("fieldRef", {}).get("fieldPath"))
+    if job_uid_field != "metadata.labels['batch.kubernetes.io/controller-uid']":
+        raise SmokeFailure("backup container OPENMETTLE_BACKUP_JOB_UID must use batch.kubernetes.io/controller-uid")
+    main_args = main.get("args") or []
+    if "--destination-root" not in main_args:
+        raise SmokeFailure("backup container args lack --destination-root")
+    dest_root = main_args[main_args.index("--destination-root") + 1]
+    if dest_root != BACKUP_DEST_DIR:
+        raise SmokeFailure(f"backup container --destination-root is {dest_root!r}, expected {BACKUP_DEST_DIR!r}")
+    if "--request-key" not in main_args or main_args[main_args.index("--request-key") + 1] != "cronjob-$(OPENMETTLE_BACKUP_JOB_UID)":
+        raise SmokeFailure("backup container --request-key must be cronjob-$(OPENMETTLE_BACKUP_JOB_UID)")
+    main_mounts = {m.get("name"): m for m in main.get("volumeMounts") or []}
+    if "backup-keys-secret" in main_mounts:
+        raise SmokeFailure("backup main container must not mount raw backup-keys-secret")
+    if main_mounts.get("backup-keys") != {"name": "backup-keys", "mountPath": BACKUP_KEYS_DIR,
+                                          "subPath": "keys", "readOnly": True}:
+        raise SmokeFailure("backup container does not mount staged backup-keys read-only with subPath keys")
+    if main_mounts.get("backup-destination", {}).get("mountPath") != dest_root:
+        raise SmokeFailure("backup container backup-destination mountPath disagrees with --destination-root")
+    if main_mounts.get("artifacts", {}).get("readOnly") is not True:
+        raise SmokeFailure("backup container must mount artifacts read-only")
+    np_spec = backup_np.get("spec", {})
+    if np_spec.get("policyTypes") != ["Ingress", "Egress"] or np_spec.get("ingress"):
+        raise SmokeFailure("backup NetworkPolicy must deny all ingress and enforce egress")
+    if len(np_spec.get("egress") or []) != 2:
+        raise SmokeFailure(f"backup NetworkPolicy expected 2 egress rules (DNS + DB), got {len(np_spec.get('egress') or [])}")
+    return {"api_pods": len(api_pods), "worker_pods": len(worker_pods), "gateway_isolated": True,
+            "cronjob": BACKUP_CRONJOB, "backup_network_policy": BACKUP_NETWORK_POLICY,
+            "destination_root": dest_root}
+
+
+def parse_backup_capture_log(output: str, expected_dest_dir: str = BACKUP_DEST_DIR) -> dict:
+    """Parse `backup.capture_succeeded ...` printed by `openmettle-admin backup capture`."""
+    line = next((ln.strip() for ln in output.splitlines() if ln.strip().startswith("backup.capture_succeeded ")), None)
+    if line is None:
+        raise SmokeFailure("backup Job output lacks backup.capture_succeeded line")
+    fields = dict(tok.split("=", 1) for tok in line.split()[1:] if "=" in tok)
+    run_id = fields.get("run_id", "")
+    backup_dir = fields.get("dir", "")
+    key_id = fields.get("key_id", "")
+    bundle_digest = fields.get("bundle_digest", "")
+    if not UUID.fullmatch(run_id):
+        raise SmokeFailure(f"backup capture reported invalid run_id: {run_id!r}")
+    if not backup_dir.startswith(f"{expected_dest_dir}/") or ".." in Path(backup_dir).parts:
+        raise SmokeFailure(f"backup capture reported unexpected dir: {backup_dir!r}")
+    if key_id != BACKUP_KEY_ID:
+        raise SmokeFailure(f"backup capture used unexpected key_id {key_id!r}, expected {BACKUP_KEY_ID!r}")
+    if not CACHE_SALT.fullmatch(bundle_digest):
+        raise SmokeFailure(f"backup capture reported malformed bundle_digest: {bundle_digest!r}")
+    if fields.get("maintenance_released") != "true":
+        raise SmokeFailure(f"backup capture did not release maintenance: {fields.get('maintenance_released')!r}")
+    return {"run_id": run_id, "dir": backup_dir, "key_id": key_id,
+            "bundle_digest": bundle_digest, "maintenance_released": True}
+
+
+def backup_run_sql(run_id: str) -> str:
+    if not UUID.fullmatch(run_id):
+        raise SmokeFailure(f"invalid backup run_id: {run_id!r}")
+    return (
+        "SELECT r.id::text, r.state, r.destination_domain, r.encryption_key_id,"
+        " encode(r.bundle_digest, 'hex'), r.completed_at IS NOT NULL, r.failure_code IS NULL,"
+        " g.maintenance_active, g.backup_run_id IS NULL"
+        " FROM openmettle.backup_runs r"
+        " CROSS JOIN openmettle.backup_maintenance_gate g"
+        f" WHERE r.id = '{run_id}'::uuid;"
+    )
+
+
+def evaluate_backup_run_row(output: str, expected_run_id: str, expected_bundle_digest: str) -> dict:
+    """Verify backup_runs recorded succeeded and backup_maintenance_gate released cleanly."""
+    rows = [line for line in output.splitlines() if line]
+    if len(rows) != 1:
+        raise SmokeFailure(f"expected one backup_runs row for {expected_run_id}, found {len(rows)}")
+    fields = rows[0].split("|")
+    expected = [expected_run_id, "succeeded", BACKUP_DESTINATION_DOMAIN, BACKUP_KEY_ID,
+                expected_bundle_digest, "t", "t", "f", "t"]
+    if fields != expected:
+        raise SmokeFailure(f"unexpected backup_runs / maintenance gate row: {fields!r}")
+    return {"state": "succeeded", "destination_domain": BACKUP_DESTINATION_DOMAIN,
+            "key_id": BACKUP_KEY_ID, "maintenance_active": False}
+
+
+def backup_verify_job_manifest(admin_image: str, backup_dir: str, run_id: str,
+                               dest_dir: str = BACKUP_DEST_DIR) -> dict:
+    """Offline PodSecurity-restricted Job running `openmettle-admin backup verify` against the published dir."""
+    labels = {"openmettle.dev/environment": "dev", RUN_LABEL: run_id}
+    stage_script = (
+        "umask 077\n"
+        "stage=/run/openmettle-backup-stage/keys\n"
+        "mkdir -p -- \"$stage\" && chmod 0700 \"$stage\"\n"
+        "for src in /run/openmettle-backup-src/*; do\n"
+        "  [ -f \"$src\" ] || continue\n"
+        "  cp -L -- \"$src\" \"$stage/${src##*/}\" && chmod 0400 \"$stage/${src##*/}\"\n"
+        "done\n"
+    )
+    container_sec = {"privileged": False, "allowPrivilegeEscalation": False,
+                     "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}}
+    return {
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"name": BACKUP_VERIFY_JOB, "namespace": APP_NAMESPACE, "labels": labels},
+        "spec": {
+            "backoffLimit": 0, "activeDeadlineSeconds": 120,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                    "securityContext": {"runAsNonRoot": True, "runAsUser": 65532, "runAsGroup": 65532,
+                                        "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch",
+                                        "seccompProfile": {"type": "RuntimeDefault"}},
+                    "initContainers": [{
+                        "name": "stage-backup-keys", "image": admin_image, "imagePullPolicy": "Never",
+                        "command": ["/bin/sh", "-eu", "-c", stage_script],
+                        "securityContext": container_sec,
+                        "volumeMounts": [
+                            {"name": "backup-keys-secret", "mountPath": "/run/openmettle-backup-src", "readOnly": True},
+                            {"name": "backup-keys", "mountPath": "/run/openmettle-backup-stage"},
+                        ],
+                    }],
+                    "containers": [{
+                        "name": "verify", "image": admin_image, "imagePullPolicy": "Never",
+                        "args": ["backup", "verify", "--backup-dir", backup_dir,
+                                 "--backup-keys-config", BACKUP_CONFIG_PATH],
+                        "securityContext": container_sec,
+                        "volumeMounts": [
+                            {"name": "backup-keys", "mountPath": BACKUP_KEYS_DIR, "subPath": "keys", "readOnly": True},
+                            {"name": "backup-destination", "mountPath": dest_dir, "readOnly": True},
+                        ],
+                    }],
+                    "volumes": [
+                        {"name": "backup-keys-secret", "secret": {"secretName": BACKUP_KEYS_SECRET, "defaultMode": 288}},
+                        {"name": "backup-keys", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+                        {"name": "backup-destination",
+                         "persistentVolumeClaim": {"claimName": BACKUP_DEST_CLAIM, "readOnly": True}},
+                    ],
+                },
+            },
+        },
+    }
+
+
+def parse_backup_verify_log(output: str, expected_run_id: str) -> dict:
+    """Parse `backup.verified ...` printed by `openmettle-admin backup verify`."""
+    line = next((ln.strip() for ln in output.splitlines() if ln.strip().startswith("backup.verified ")), None)
+    if line is None:
+        raise SmokeFailure("backup verify Job output lacks backup.verified line")
+    fields = dict(tok.split("=", 1) for tok in line.split()[1:] if "=" in tok)
+    if fields.get("run_id") != expected_run_id:
+        raise SmokeFailure(f"backup verify run_id {fields.get('run_id')!r} != {expected_run_id!r}")
+    try:
+        schema = int(fields.get("schema", "0"))
+        components = int(fields.get("components", "0"))
+        artifact_revisions = int(fields.get("artifact_revisions", "-1"))
+    except ValueError as exc:
+        raise SmokeFailure(f"backup verify reported non-integer counts: {line!r}") from exc
+    if schema < REQUIRED_MIGRATION or fields.get("key_id") != BACKUP_KEY_ID or components != 5 \
+            or artifact_revisions != 2:
+        raise SmokeFailure(f"unexpected backup verify summary: {line!r}")
+    return {"schema": schema, "key_id": BACKUP_KEY_ID, "components": components,
+            "artifact_revisions": artifact_revisions}
 
 
 def gateway_probe_plan(*, tls: bool) -> list:
@@ -2053,10 +2528,13 @@ class Smoke:
         return [line.split("|") for line in out.splitlines() if line]
 
     def helm_deploy(self, command: str, worker_replicas: int, *, enabled_profile: bool = False,
-                    gateway_mode: str | None = None):
+                    gateway_mode: str | None = None, vault_and_backup: bool = False,
+                    postgres_client_image: dict | None = None):
         self.values.write_text(json.dumps(smoke_values(self.digests, worker_replicas,
                                                        enabled_profile=enabled_profile,
-                                                       gateway_mode=gateway_mode)))
+                                                       gateway_mode=gateway_mode,
+                                                       vault_and_backup=vault_and_backup,
+                                                       postgres_client_image=postgres_client_image)))
         self.verify_identity()
         self.helm_run(command, RELEASE, str(CHART), "--values", str(self.values),
                       "--wait=watcher", "--timeout", HELM_TIMEOUT)
@@ -2442,6 +2920,82 @@ COPY --from=admission-build /source/target/release/kind-admit /kind-admit
         self.passed("HTTPS ingress queued run replay and worker expiry",
                     **self.ingress_replay(cookie, cert))
         self.gateway_end_to_end(history, cookie)
+        self.vault_and_backup(history)
+
+    def pin_postgres_client_image(self) -> tuple:
+        """Ensure the already-pulled PostgreSQL 18 fixture image resolves under its tagless digest name."""
+        parts = postgres_client_image_parts(self.core.POSTGRES_IMAGE)
+        reference = f"{parts['registry']}/{parts['repository']}@{parts['digest']}"
+        listing = self.node_exec("ctr", "--namespace=k8s.io", "images", "ls").stdout
+        if reference not in ctr_image_names(listing):
+            source = find_ctr_image_for_digest(listing, parts["digest"], preferred=self.core.POSTGRES_IMAGE)
+            self.node_exec("ctr", "--namespace=k8s.io", "images", "tag", source, reference)
+        self.wait_for(f"CRI to resolve {reference}",
+                      lambda r=reference: self.cri_image_id(r, check=False), timeout=30)
+        return parts, reference
+
+    def vault_and_backup(self, history: list):
+        """Exercise opt-in vault 0400 RAM staging on api/worker and backup CronJob capture + verify (rev 7)."""
+        pg_client_parts, pg_client_ref = self.pin_postgres_client_image()
+        vault_key_b64 = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+        backup_key_b64 = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+        self.passwords["vault_key"] = vault_key_b64
+        self.passwords["backup_key"] = backup_key_b64
+        self.verify_identity()
+        self.kube("apply", "--filename", "-", input=json.dumps(
+            vault_and_backup_fixture_manifests(vault_key_b64, backup_key_b64, self.run_id)))
+        self.helm_deploy("upgrade", worker_replicas=1, enabled_profile=True, gateway_mode="tls",
+                         vault_and_backup=True, postgres_client_image=pg_client_parts)
+        for deployment in (f"{FULLNAME}-api", f"{FULLNAME}-worker", GATEWAY_WORKLOAD):
+            self.kube("--namespace", APP_NAMESPACE, "rollout", "status", f"deployment/{deployment}",
+                      f"--timeout={PROFILE_ROLLOUT_TIMEOUT}", timeout=210)
+        profile = self.observe_release(revision=7)
+        self.expect(len(self.completions()) == 7, "vault/backup upgrade did not run the migrate hook")
+        self.expect(self.migrations() == history, "migration history changed on vault/backup upgrade")
+        gw_pods = self.observe_gateway_pod()
+        pods_by_role = {**{c: self.pods(c) for c in WORKLOADS}, GATEWAY_COMPONENT: gw_pods}
+        cronjob = self.kube_json("--namespace", APP_NAMESPACE, "get", "cronjob", BACKUP_CRONJOB)
+        backup_np = self.kube_json("--namespace", APP_NAMESPACE, "get", "networkpolicy", BACKUP_NETWORK_POLICY)
+        spec_summary = check_vault_and_backup_spec(
+            pods_by_role, cronjob, backup_np,
+            admin_ref=self.report["images"]["admin"]["reference"],
+            postgres_client_ref=pg_client_ref,
+        )
+        for role in WORKLOADS:
+            for pod_name in profile["pods"][role]:
+                listed = self.kube("--namespace", APP_NAMESPACE, "exec", pod_name, "--container", role, "--",
+                                   *vault_key_files_command(), timeout=60)
+                evaluate_vault_key_files(pod_name, listed.stdout)
+        self.verify_identity()
+        self.kube("--namespace", APP_NAMESPACE, "create", "job", BACKUP_RUN_JOB, f"--from=cronjob/{BACKUP_CRONJOB}")
+        self.kube("--namespace", APP_NAMESPACE, "wait", "--for=condition=complete",
+                  f"job/{BACKUP_RUN_JOB}", "--timeout=180s", timeout=210)
+        capture_logs = self.kube("--namespace", APP_NAMESPACE, "logs", f"job/{BACKUP_RUN_JOB}",
+                                 "--container", "backup", timeout=60).stdout
+        dest_root = spec_summary["destination_root"]
+        capture = parse_backup_capture_log(capture_logs, dest_root)
+        backup_row = evaluate_backup_run_row(
+            self.psql(backup_run_sql(capture["run_id"])), capture["run_id"], capture["bundle_digest"])
+        admin_ref = self.report["images"]["admin"]["reference"]
+        present = images_reported_present(self.events("reason=Pulled"), [admin_ref, pg_client_ref])
+        self.expect(present == sorted([admin_ref, pg_client_ref]),
+                    f"kubelet did not report backup digest references as present: {present}")
+        self.verify_identity()
+        self.kube("apply", "--filename", "-", input=json.dumps(
+            backup_verify_job_manifest(admin_ref, capture["dir"], self.run_id, dest_root)))
+        self.kube("--namespace", APP_NAMESPACE, "wait", "--for=condition=complete",
+                  f"job/{BACKUP_VERIFY_JOB}", "--timeout=120s", timeout=150)
+        verify_logs = self.kube("--namespace", APP_NAMESPACE, "logs", f"job/{BACKUP_VERIFY_JOB}",
+                                "--container", "verify", timeout=60).stdout
+        verified = parse_backup_verify_log(verify_logs, capture["run_id"])
+        self.verify_identity()
+        self.kube("--namespace", APP_NAMESPACE, "delete", "job", BACKUP_RUN_JOB, BACKUP_VERIFY_JOB,
+                  "--wait=true", timeout=120)
+        self.passed("opt-in vault RAM-staged 0400 keys and backup CronJob capture + offline verify",
+                    spec=spec_summary,
+                    vault_staged_pods=sum(len(profile["pods"][r]) for r in WORKLOADS),
+                    backup_run=backup_row,
+                    verified=verified)
 
     def prepare_gateway_fixtures(self):
         """Build & deploy the synthetic SGLang stand-in and apply plain/TLS inference fixtures."""
@@ -2637,6 +3191,7 @@ ENTRYPOINT ["/usr/local/bin/kind-standin"]
                     f"migration history ends at version {history[-1][0]}, before migration {REQUIRED_MIGRATION}")
         run_admission = evaluate_run_admission(self.psql(run_admission_sql()))
         gateway_schema = evaluate_gateway_schema(self.psql(gateway_schema_sql()))
+        migration_38_45 = evaluate_migration_38_45(self.psql(migration_38_45_sql()))
         fresh_bootstrap = evaluate_fresh_bootstrap(self.psql(FRESH_BOOTSTRAP_SQL))
         created = {c: parse_time(self.kube_json("--namespace", APP_NAMESPACE, "get", "deployment",
                                                 f"{FULLNAME}-{c}")["metadata"]["creationTimestamp"])
@@ -2649,9 +3204,10 @@ ENTRYPOINT ["/usr/local/bin/kind-standin"]
         self.expect(present == sorted(references),
                     f"kubelet did not report every digest reference as present: {present}")
         self.passed("install by digest: migrate hook completed before Deployments; API and worker Ready; "
-                    "migrations 19/20/37 role boundaries; fresh-install quota and artifact-volume markers",
+                    "migrations 19/20/37 and 38-45 role boundaries; fresh-install quota and artifact-volume markers",
                     migrations_applied=len(history), latest_version=int(history[-1][0]),
-                    run_admission=run_admission, gateway_schema=gateway_schema, fresh_bootstrap=fresh_bootstrap,
+                    run_admission=run_admission, gateway_schema=gateway_schema,
+                    migration_38_45=migration_38_45, fresh_bootstrap=fresh_bootstrap,
                     ready_replicas=installed["ready_replicas"], readyz=installed["readyz"],
                     images_present=len(present))
 
@@ -2752,9 +3308,9 @@ ENTRYPOINT ["/usr/local/bin/kind-standin"]
         self.expect(kept_pvcs == [f"PersistentVolumeClaim/{ARTIFACTS_CLAIM}"],
                     f"kept artifact PVC after uninstall: {kept_pvcs}")
         # The test, not the chart, owns the five URL Secrets (including issuance and gateway),
-        # synthetic auth/inference fixtures and namespace default-deny.
+        # synthetic auth/inference/vault/backup fixtures, backup destination PVC and namespace default-deny.
         remaining = object_names(self.kube_json("--namespace", APP_NAMESPACE, "get",
-                                                "configmaps,secrets,networkpolicies",
+                                                "configmaps,secrets,networkpolicies,persistentvolumeclaims",
                                                 "--selector", RUN_LABEL)["items"])
         expected_owned = sorted([
             f"ConfigMap/{AUTH_CONFIG_MAP}",
@@ -2762,7 +3318,10 @@ ENTRYPOINT ["/usr/local/bin/kind-standin"]
             f"ConfigMap/{INFERENCE_TLS_CONFIG_MAP}",
             f"ConfigMap/{INFERENCE_CA_CONFIG_MAP}",
             f"NetworkPolicy/{NAMESPACE_DENY}",
+            f"PersistentVolumeClaim/{BACKUP_DEST_CLAIM}",
             f"Secret/{AUTH_LOGIN_KEYS_SECRET}",
+            f"Secret/{BACKUP_KEYS_SECRET}",
+            f"Secret/{VAULT_KEYS_SECRET}",
             *(f"Secret/{SECRET[r]}" for r in DB_LOGINS),
         ])
         self.expect(remaining == expected_owned,
@@ -2780,7 +3339,7 @@ ENTRYPOINT ["/usr/local/bin/kind-standin"]
                       "--all-containers", "--prefix", "--tail=100"],
                      ["--namespace", DB_NAMESPACE, "get", "events", "--sort-by=.lastTimestamp"],
                      ["--namespace", APP_NAMESPACE, "get", "networkpolicies", "--output=wide"],
-                     ["--namespace", APP_NAMESPACE, "get", "pvc,pdb", "--output=wide"],
+                     ["--namespace", APP_NAMESPACE, "get", "pvc,pdb,cronjobs,jobs", "--output=wide"],
                      ["--namespace", DB_NAMESPACE, "logs", "--selector", f"app={INGRESS_CLASS}", "--tail=50"],
                      # kindnet enforces NetworkPolicy; its log shows whether the policy controller started.
                      ["--namespace", "kube-system", "logs", "--selector", "app=kindnet", "--tail=50"]):
