@@ -84,7 +84,7 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
-  {{- if or .storage .auth }}
+  {{- if or .storage .auth (default false .vault) }}
   fsGroup: 65532
   {{- end }}
   {{- if .storage }}
@@ -110,6 +110,13 @@ never block nested mountpoints under containerd/runc.
 {{- define "openmettle-core.inferenceConfigDirectory" -}}/etc/openmettle/inference{{- end -}}
 {{- define "openmettle-core.inferenceConfigPath" -}}/etc/openmettle/inference/inference.json{{- end -}}
 {{- define "openmettle-core.inferenceCaDirectory" -}}/etc/openmettle/inference-ca{{- end -}}
+{{- define "openmettle-core.mcpCaDirectory" -}}/etc/openmettle/mcp-ca{{- end -}}
+{{- define "openmettle-core.vaultKeysDirectory" -}}/etc/openmettle/vault-keys{{- end -}}
+{{- define "openmettle-core.backupKeysDirectory" -}}/etc/openmettle/backup-keys{{- end -}}
+{{- define "openmettle-core.backupDestinationDirectory" -}}/var/backups/openmettle{{- end -}}
+{{- define "openmettle-core.backupNeo4jDirectory" -}}/var/backups/openmettle-neo4j{{- end -}}
+{{- define "openmettle-core.backupChromaDirectory" -}}/var/backups/openmettle-chroma{{- end -}}
+{{- define "openmettle-core.backupConfigDirectory" -}}/etc/openmettle/backup-config{{- end -}}
 
 {{/*
 Resolve one gateways.<name> entry against per-gateway defaults without Sprig mergeOverwrite quirks
@@ -248,12 +255,17 @@ helper renders nothing when no volume applies.
 {{- $auth := .root.Values.auth -}}
 {{- $otlp := .root.Values.telemetry.otlp -}}
 {{- $inference := default dict .root.Values.worker.inference -}}
+{{- $mcp := default dict .root.Values.worker.mcp -}}
+{{- $vault := default dict .root.Values.vault -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
 {{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
 {{- $mountInference := and (default false .inference) (default false (get $inference "enabled")) -}}
 {{- $mountInferenceCa := and $mountInference (default false (get (default dict (get $inference "caBundle")) "enabled")) -}}
-{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference }}
+{{- $mountMcp := and (default false .mcp) (default false (get $mcp "enabled")) -}}
+{{- $mountMcpCa := and $mountMcp (default false (get (default dict (get $mcp "caBundle")) "enabled")) -}}
+{{- $mountVault := and (default false .vault) (default false (get $vault "enabled")) -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference $mountMcpCa $mountVault }}
 volumes:
   {{- if .artifacts }}
   - name: artifacts
@@ -300,6 +312,20 @@ volumes:
   {{- if $mountInferenceCa }}
   {{- include "openmettle-core.caBundleVolume" (dict "name" "inference-ca" "path" "worker.inference.caBundle" "bundle" $inference.caBundle) | nindent 2 }}
   {{- end }}
+  {{- if $mountMcpCa }}
+  {{- include "openmettle-core.caBundleVolume" (dict "name" "mcp-ca" "path" "worker.mcp.caBundle" "bundle" $mcp.caBundle) | nindent 2 }}
+  {{- end }}
+  {{- if $mountVault }}
+  - name: vault-keys-secret
+    secret:
+      secretName: {{ required "vault.existingSecret is required when vault.enabled is true" $vault.existingSecret | quote }}
+      # 0440 octal: readable by root and pod fsGroup 65532 only; staged to 0400 by stage-vault-keys.
+      defaultMode: 288
+  - name: vault-keys
+    emptyDir:
+      medium: Memory
+      sizeLimit: 1Mi
+  {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -317,12 +343,17 @@ volumes:
 {{- $auth := .root.Values.auth -}}
 {{- $otlp := .root.Values.telemetry.otlp -}}
 {{- $inference := default dict .root.Values.worker.inference -}}
+{{- $mcp := default dict .root.Values.worker.mcp -}}
+{{- $vault := default dict .root.Values.vault -}}
 {{- $mountAuth := and .auth $auth.enabled -}}
 {{- $mountProviderCa := and $mountAuth $auth.providerCaBundle.enabled -}}
 {{- $mountOtlpCa := and .otlp $otlp.enabled $otlp.caBundle.enabled -}}
 {{- $mountInference := and (default false .inference) (default false (get $inference "enabled")) -}}
 {{- $mountInferenceCa := and $mountInference (default false (get (default dict (get $inference "caBundle")) "enabled")) -}}
-{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference }}
+{{- $mountMcp := and (default false .mcp) (default false (get $mcp "enabled")) -}}
+{{- $mountMcpCa := and $mountMcp (default false (get (default dict (get $mcp "caBundle")) "enabled")) -}}
+{{- $mountVault := and (default false .vault) (default false (get $vault "enabled")) -}}
+{{- if or $ca.enabled .artifacts $mountAuth $mountOtlpCa $mountInference $mountMcpCa $mountVault }}
 volumeMounts:
   {{- if .artifacts }}
   - name: artifacts
@@ -359,6 +390,17 @@ volumeMounts:
   {{- if $mountInferenceCa }}
   - name: inference-ca
     mountPath: {{ include "openmettle-core.inferenceCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountMcpCa }}
+  - name: mcp-ca
+    mountPath: {{ include "openmettle-core.mcpCaDirectory" . | quote }}
+    readOnly: true
+  {{- end }}
+  {{- if $mountVault }}
+  - name: vault-keys
+    mountPath: {{ include "openmettle-core.vaultKeysDirectory" . | quote }}
+    subPath: keys
     readOnly: true
   {{- end }}
 {{- end }}
@@ -421,6 +463,68 @@ regardless of Helm's template rendering order). Argument: the root context.
 {{- if hasKey $infCa "enabled" -}}
 {{- include "openmettle-core.validate.bool" (dict "field" "worker.inference.caBundle.enabled" "value" (index $infCa "enabled")) -}}
 {{- end -}}
+{{- $mcp := default dict .Values.worker.mcp -}}
+{{- if not (kindIs "map" $mcp) -}}
+{{- fail "worker.mcp must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $mcp "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.mcp.enabled" "value" (index $mcp "enabled")) -}}
+{{- end -}}
+{{- $mcpCa := default dict (get $mcp "caBundle") -}}
+{{- if not (kindIs "map" $mcpCa) -}}
+{{- fail "worker.mcp.caBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $mcpCa "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "worker.mcp.caBundle.enabled" "value" (index $mcpCa "enabled")) -}}
+{{- end -}}
+{{- $vault := default dict .Values.vault -}}
+{{- if not (kindIs "map" $vault) -}}
+{{- fail "vault must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $vault "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "vault.enabled" "value" (index $vault "enabled")) -}}
+{{- end -}}
+{{- $backup := default dict .Values.backup -}}
+{{- if not (kindIs "map" $backup) -}}
+{{- fail "backup must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backup "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.enabled" "value" (index $backup "enabled")) -}}
+{{- end -}}
+{{- if hasKey $backup "suspend" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.suspend" "value" (index $backup "suspend")) -}}
+{{- end -}}
+{{- if hasKey $backup "releaseOnSuccess" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.releaseOnSuccess" "value" (index $backup "releaseOnSuccess")) -}}
+{{- end -}}
+{{- $backupDest := default dict (get $backup "destination") -}}
+{{- if not (kindIs "map" $backupDest) -}}
+{{- fail "backup.destination must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupDest "requireSeparateDevice" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.destination.requireSeparateDevice" "value" (index $backupDest "requireSeparateDevice")) -}}
+{{- end -}}
+{{- $backupRet := default dict (get $backup "retention") -}}
+{{- if not (kindIs "map" $backupRet) -}}
+{{- fail "backup.retention must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupRet "prune" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.retention.prune" "value" (index $backupRet "prune")) -}}
+{{- end -}}
+{{- $backupCb := default dict (get $backup "configBundle") -}}
+{{- if not (kindIs "map" $backupCb) -}}
+{{- fail "backup.configBundle must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupCb "enabled" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.configBundle.enabled" "value" (index $backupCb "enabled")) -}}
+{{- end -}}
+{{- $backupSa := default dict (get $backup "serviceAccount") -}}
+{{- if not (kindIs "map" $backupSa) -}}
+{{- fail "backup.serviceAccount must be a mapping" -}}
+{{- end -}}
+{{- if hasKey $backupSa "create" -}}
+{{- include "openmettle-core.validate.bool" (dict "field" "backup.serviceAccount.create" "value" (index $backupSa "create")) -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Render-time guards that do not depend on schema validation. */}}
@@ -481,6 +585,9 @@ ServiceAccount uniqueness and connection-budget checks so gateways participate i
 {{- $dbRoles := list "api" "worker" "migrate" -}}
 {{- if .Values.auth.enabled -}}
 {{- $dbRoles = append $dbRoles "issuance" -}}
+{{- end -}}
+{{- if default false (get (default dict .Values.backup) "enabled") -}}
+{{- $dbRoles = append $dbRoles "backup" -}}
 {{- end -}}
 {{- range $role := $dbRoles -}}
 {{- $ref := index $.Values.database $role -}}
@@ -569,6 +676,11 @@ delete policy remove another component's ServiceAccount on every install or upgr
 {{- $g := index $resolvedGateways $name -}}
 {{- $components = append $components (list (printf "gateway-%s" $name) (printf "gateways.%s" $name) $g.serviceAccount) -}}
 {{- end -}}
+{{- $backupCfg := default dict .Values.backup -}}
+{{- if default false (get $backupCfg "enabled") -}}
+{{- $backupSa := default (dict "create" true "name" "" "annotations" (dict)) (get $backupCfg "serviceAccount") -}}
+{{- $components = append $components (list "backup" "backup" $backupSa) -}}
+{{- end -}}
 {{- range $entry := $components -}}
 {{- $key := index $entry 1 -}}
 {{- $name := include "openmettle-core.serviceAccountName" (dict "root" $ "component" (index $entry 0) "field" $key "serviceAccount" (index $entry 2)) -}}
@@ -607,7 +719,8 @@ lists must not be empty while the NetworkPolicies are rendered.
 {{- end -}}
 {{- $npWorker := default dict .Values.networkPolicy.worker -}}
 {{- $npInference := default (dict "to" (list) "port" 8082) (get $npWorker "inference") -}}
-{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.worker.inference.to" "peers" $npInference.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
+{{- $npMcp := default (dict "to" (list) "ports" (list 443)) (get $npWorker "mcp") -}}
+{{- range $entry := list (dict "path" "networkPolicy.database.to" "peers" .Values.networkPolicy.database.to) (dict "path" "networkPolicy.dns.to" "peers" .Values.networkPolicy.dns.to) (dict "path" "networkPolicy.api.ingressFrom" "peers" .Values.networkPolicy.api.ingressFrom) (dict "path" "networkPolicy.api.oidc.to" "peers" .Values.networkPolicy.api.oidc.to) (dict "path" "networkPolicy.worker.inference.to" "peers" $npInference.to) (dict "path" "networkPolicy.worker.mcp.to" "peers" $npMcp.to) (dict "path" "networkPolicy.telemetry.otlp.to" "peers" .Values.networkPolicy.telemetry.otlp.to) -}}
 {{- range $i, $peer := $entry.peers -}}
 {{- if or (not (kindIs "map" $peer)) (eq (len $peer) 0) -}}
 {{- fail (printf "%s[%d] must be a non-empty NetworkPolicyPeer object" $entry.path $i) -}}
@@ -741,9 +854,10 @@ and are not counted; see the chart README. With auth, each API pod also opens it
 {{- $g := index $resolvedGateways $name -}}
 {{- $gateways = add $gateways (mul (add $g.replicas $g.strategy.maxSurge) $g.settings.dbMaxConnections) -}}
 {{- end -}}
-{{- $total := add $api $worker $gateways 1 -}}
+{{- $backupConns := ternary 3 0 (default false (get (default dict $.Values.backup) "enabled")) -}}
+{{- $total := add $api $worker $gateways 1 $backupConns -}}
 {{- if gt (int64 $total) (int64 .) -}}
-{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d + gateways %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator" (int64 .) (int64 $total) (int64 $api) (int64 $worker) (int64 $gateways)) -}}
+{{- fail (printf "database.connectionBudget (%d) is below the release's peak of %d connections: api %d + worker %d + gateways %d (replicas plus maxSurge, times dbMaxConnections, plus api.settings.issuanceDbMaxConnections while auth.enabled) + 1 migrator + %d backup" (int64 .) (int64 $total) (int64 $api) (int64 $worker) (int64 $gateways) (int64 $backupConns)) -}}
 {{- end -}}
 {{- end -}}
 {{- /*
@@ -796,6 +910,50 @@ worker pod only; never into api, gateway or migrate pods.
 {{- end -}}
 {{- end -}}
 {{- /*
+Worker external MCP and OAuth refresh egress/CA (core V1-14, ADR 0045). External MCP connections
+live inside inference.json, so worker.mcp.enabled requires worker.inference.enabled.
+*/ -}}
+{{- $npMcpAll := default (dict "to" (list) "ports" (list 443)) (get $npWorkerAll "mcp") -}}
+{{- if not (kindIs "map" $npMcpAll) -}}
+{{- fail "networkPolicy.worker.mcp must be a mapping" -}}
+{{- end -}}
+{{- $npMcpPorts := list 443 -}}
+{{- if hasKey $npMcpAll "ports" -}}
+{{- $npMcpPorts = index $npMcpAll "ports" -}}
+{{- end -}}
+{{- if or (not (kindIs "slice" $npMcpPorts)) (eq (len $npMcpPorts) 0) (gt (len $npMcpPorts) 16) -}}
+{{- fail "networkPolicy.worker.mcp.ports must list between 1 and 16 TCP ports (1-65535)" -}}
+{{- end -}}
+{{- $seenMcpPorts := dict -}}
+{{- range $i, $port := $npMcpPorts -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" (printf "networkPolicy.worker.mcp.ports[%d]" $i) "value" $port "min" 1 "max" 65535) -}}
+{{- $portKey := printf "%d" (int64 $port) -}}
+{{- if hasKey $seenMcpPorts $portKey -}}
+{{- fail (printf "networkPolicy.worker.mcp.ports contains duplicate port %d" (int64 $port)) -}}
+{{- end -}}
+{{- $_ := set $seenMcpPorts $portKey true -}}
+{{- end -}}
+{{- $mcp := default dict .Values.worker.mcp -}}
+{{- $mcpEnabled := default false (get $mcp "enabled") -}}
+{{- $mcpCa := default dict (get $mcp "caBundle") -}}
+{{- $mcpCaEnabled := default false (get $mcpCa "enabled") -}}
+{{- if $mcpEnabled -}}
+{{- if not $infEnabled -}}
+{{- fail "worker.mcp.enabled requires worker.inference.enabled (external_mcp connections and refresh_routes live in inference.json)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.caBundle" (dict "path" "worker.mcp.caBundle" "bundle" $mcpCa) -}}
+{{- if and .Values.networkPolicy.enabled (not (get $npMcpAll "to")) -}}
+{{- fail "networkPolicy.worker.mcp.to must list at least one external MCP or OAuth refresh peer when worker.mcp.enabled and networkPolicy.enabled are true (an empty list would block egress or allow egress to every destination)" -}}
+{{- end -}}
+{{- else -}}
+{{- if $mcpCaEnabled -}}
+{{- fail "worker.mcp.caBundle.enabled cannot be true when worker.mcp.enabled is false" -}}
+{{- end -}}
+{{- if get $npMcpAll "to" -}}
+{{- fail "networkPolicy.worker.mcp.to must be empty when worker.mcp.enabled is false; remove MCP egress peers or enable worker.mcp" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
 Sign-in / OIDC and /v1/* application routes (core ADRs 0025, 0027 and 0029). Mounted into the API pod only; never into worker or
 migrate pods. The checks repeat the schema for --skip-schema-validation and enforce cross-field
 provider CA, NetworkPolicy egress and session issuance credential (core ADR 0030) guards.
@@ -831,7 +989,11 @@ same login role twice (core exits 78) or mount a role's credential where it does
 {{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (toString $issuance.key)) -}}
 {{- fail "database.issuance.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
 {{- end -}}
-{{- range $role := list "api" "worker" "migrate" -}}
+{{- $issuanceDbRoles := list "api" "worker" "migrate" -}}
+{{- if default false (get (default dict .Values.backup) "enabled") -}}
+{{- $issuanceDbRoles = append $issuanceDbRoles "backup" -}}
+{{- end -}}
+{{- range $role := $issuanceDbRoles -}}
 {{- $ref := index $.Values.database $role -}}
 {{- if and (eq (toString $issuance.existingSecret) (toString $ref.existingSecret)) (eq (toString $issuance.key) (toString $ref.key)) -}}
 {{- fail (printf "database.issuance must not reuse database.%s (Secret %q, key %q); session issuance needs its own openmettle_issuance login (core ADR 0030)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
@@ -925,6 +1087,267 @@ cross-field CA, CIDR, port and NetworkPolicy guards.
 {{- end -}}
 {{- if .Values.networkPolicy.telemetry.otlp.to -}}
 {{- fail "networkPolicy.telemetry.otlp.to must be empty when telemetry.otlp.enabled is false; remove OTLP egress peers or enable telemetry.otlp" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Credential vault keyring (core ADR 0045, V1-28). Mounted into api and worker only via
+stage-vault-keys (never gateway, migrate or backup).
+*/ -}}
+{{- $vault := default dict .Values.vault -}}
+{{- $vaultEnabled := default false (get $vault "enabled") -}}
+{{- $vaultSecret := toString (default "" (get $vault "existingSecret")) -}}
+{{- $vaultConfigKey := toString (default "keyring.json" (get $vault "configKey")) -}}
+{{- if $vaultEnabled -}}
+{{- if not $vaultSecret -}}
+{{- fail "vault.existingSecret is required when vault.enabled is true (an existing Secret holding the vault keyring and 32-byte key files)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.nonDotKey" (dict "field" "vault.configKey" "key" $vaultConfigKey) -}}
+{{- if and .Values.auth.enabled (eq $vaultSecret (toString .Values.auth.loginKeysSecretName)) -}}
+{{- fail (printf "vault.existingSecret (%q) must differ from auth.loginKeysSecretName; keep vault master keys in a dedicated Secret (core ADR 0045)" $vaultSecret) -}}
+{{- end -}}
+{{- else -}}
+{{- if $vaultSecret -}}
+{{- fail "vault.existingSecret must be empty when vault.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
+*/ -}}
+{{- $backup := default dict .Values.backup -}}
+{{- $backupEnabled := default false (get $backup "enabled") -}}
+{{- $adminImage := default dict .Values.images.admin -}}
+{{- $pgClientImage := default dict .Values.images.postgresClient -}}
+{{- $backupDb := default dict .Values.database.backup -}}
+{{- $backupSecret := toString (default "" (get $backup "existingKeysSecret")) -}}
+{{- $backupKeysKey := toString (default "keyring.json" (get $backup "keysConfigKey")) -}}
+{{- $backupDest := default dict (get $backup "destination") -}}
+{{- $backupGraphiti := default dict (get $backup "graphiti") -}}
+{{- $backupChroma := default dict (get $backup "chroma") -}}
+{{- $backupCb := default dict (get $backup "configBundle") -}}
+{{- if $backupEnabled -}}
+{{- range $imgEntry := list (dict "name" "admin" "image" $adminImage) (dict "name" "postgresClient" "image" $pgClientImage) -}}
+{{- if not (get $imgEntry.image "repository") -}}
+{{- fail (printf "images.%s.repository is required when backup.enabled is true" $imgEntry.name) -}}
+{{- end -}}
+{{- if not (get $imgEntry.image "digest") -}}
+{{- fail (printf "images.%s.digest is required when backup.enabled is true (sha256:<64 lowercase hex>; tags are not accepted)" $imgEntry.name) -}}
+{{- end -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (toString (get $imgEntry.image "digest"))) -}}
+{{- fail (printf "images.%s.digest must be sha256:<64 lowercase hex>; tags are not accepted" $imgEntry.name) -}}
+{{- end -}}
+{{- if or (contains ":" (toString (get $imgEntry.image "repository"))) (contains "@" (toString (get $imgEntry.image "repository"))) -}}
+{{- fail (printf "images.%s.repository must not contain a tag or digest" $imgEntry.name) -}}
+{{- end -}}
+{{- end -}}
+{{- $backupDbSecret := toString (default "" (get $backupDb "existingSecret")) -}}
+{{- $backupDbKey := toString (default "" (get $backupDb "key")) -}}
+{{- if not $backupDbSecret -}}
+{{- fail "database.backup.existingSecret is required when backup.enabled is true (an existing Secret holding the openmettle_owner PostgreSQL URL; core ADR 0046)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $backupDbKey) -}}
+{{- fail "database.backup.key must be a Secret key: letters, digits, '-', '_' or '.'" -}}
+{{- end -}}
+{{- $nonOwnerRoles := list "api" "worker" -}}
+{{- if .Values.auth.enabled -}}
+{{- $nonOwnerRoles = append $nonOwnerRoles "issuance" -}}
+{{- end -}}
+{{- if gt (len $gwNames) 0 -}}
+{{- $nonOwnerRoles = append $nonOwnerRoles "gateway" -}}
+{{- end -}}
+{{- range $role := $nonOwnerRoles -}}
+{{- $ref := index $.Values.database $role -}}
+{{- if and (eq $backupDbSecret (toString $ref.existingSecret)) (eq $backupDbKey (toString $ref.key)) -}}
+{{- fail (printf "database.backup must not reuse database.%s (Secret %q, key %q); backup capture requires an openmettle_owner login (core ADR 0046)" $role (toString $ref.existingSecret) (toString $ref.key)) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not (kindIs "string" $backup.schedule)) (eq (len $backup.schedule) 0) (gt (len $backup.schedule) 128) (regexMatch "[\\x00-\\x1f\\x7f]" $backup.schedule) -}}
+{{- fail "backup.schedule must be a non-empty cron expression of at most 128 characters without control characters" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" $backup.timeZone) -}}
+{{- if or (not (kindIs "string" $backup.timeZone)) (not (regexMatch "^[A-Za-z0-9_./+-]{1,64}$" $backup.timeZone)) -}}
+{{- fail "backup.timeZone must be null or a valid IANA time zone name (1-64 characters)" -}}
+{{- end -}}
+{{- end -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.startingDeadlineSeconds" "value" $backup.startingDeadlineSeconds "min" 1 "max" 86400) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.activeDeadlineSeconds" "value" $backup.activeDeadlineSeconds "min" 60 "max" 86400) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.successfulJobsHistoryLimit" "value" $backup.successfulJobsHistoryLimit "min" 0 "max" 100) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.failedJobsHistoryLimit" "value" $backup.failedJobsHistoryLimit "min" 0 "max" 100) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.drainTimeoutSecs" "value" $backup.drainTimeoutSecs "min" 1 "max" 86400) -}}
+{{- if le (int64 $backup.activeDeadlineSeconds) (int64 $backup.drainTimeoutSecs) -}}
+{{- fail (printf "backup.activeDeadlineSeconds (%d s) must exceed backup.drainTimeoutSecs (%d s)" (int64 $backup.activeDeadlineSeconds) (int64 $backup.drainTimeoutSecs)) -}}
+{{- end -}}
+{{- if not $backupSecret -}}
+{{- fail "backup.existingKeysSecret is required when backup.enabled is true (an existing Secret holding the backup keyring and 32-byte key files)" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.nonDotKey" (dict "field" "backup.keysConfigKey" "key" $backupKeysKey) -}}
+{{- if and $vaultEnabled (eq $backupSecret $vaultSecret) -}}
+{{- fail (printf "backup.existingKeysSecret (%q) must differ from vault.existingSecret; backup and vault master keys require separate custody (core ADR 0046)" $backupSecret) -}}
+{{- end -}}
+{{- if and .Values.auth.enabled (eq $backupSecret (toString .Values.auth.loginKeysSecretName)) -}}
+{{- fail (printf "backup.existingKeysSecret (%q) must differ from auth.loginKeysSecretName; keep backup master keys in a dedicated Secret (core ADR 0046)" $backupSecret) -}}
+{{- end -}}
+{{- $destClaim := toString (default "" (get $backupDest "existingClaim")) -}}
+{{- $destSubPath := toString (default "" (get $backupDest "subPath")) -}}
+{{- $destDomain := toString (default "" (get $backupDest "domain")) -}}
+{{- if not $destClaim -}}
+{{- fail "backup.destination.existingClaim is required when backup.enabled is true (an existing off-host PVC)" -}}
+{{- end -}}
+{{- $artifactsClaim := include "openmettle-core.artifactsClaimName" . -}}
+{{- if and .Values.storage.artifacts.enabled (eq $destClaim $artifactsClaim) -}}
+{{- fail (printf "backup.destination.existingClaim (%q) must differ from the resolved storage.artifacts claim (%q); backups must write to an isolated destination PVC (core ADR 0046)" $destClaim $artifactsClaim) -}}
+{{- end -}}
+{{- if $destSubPath -}}
+{{- include "openmettle-core.validate.relativePath" (dict "field" "backup.destination.subPath" "path" $destSubPath) -}}
+{{- end -}}
+{{- if or (not (kindIs "string" (get $backupDest "domain"))) (not (regexMatch "^[A-Za-z0-9._:/-]{1,128}$" $destDomain)) -}}
+{{- fail "backup.destination.domain is required when backup.enabled is true (1-128 ASCII characters matching ^[A-Za-z0-9._:/-]+$)" -}}
+{{- end -}}
+{{- $opId := toString (default "" (get $backup "operatorId")) -}}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" $opId) -}}
+{{- fail "backup.operatorId is required when backup.enabled is true and must be a canonical lowercase UUID" -}}
+{{- end -}}
+{{- $reason := get $backup "reason" -}}
+{{- if or (not (kindIs "string" $reason)) (eq (len $reason) 0) (gt (len $reason) 512) (ne (trim $reason) $reason) (regexMatch "[\\x00-\\x1f\\x7f]" $reason) -}}
+{{- fail "backup.reason must be a trimmed non-empty string of at most 512 bytes without control characters" -}}
+{{- end -}}
+{{- $ret := default dict (get $backup "retention") -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.retention.daily" "value" $ret.daily "min" 1 "max" 3650) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.retention.weekly" "value" $ret.weekly "min" 1 "max" 520) -}}
+{{- include "openmettle-core.validate.intRange" (dict "field" "backup.retention.monthly" "value" $ret.monthly "min" 1 "max" 120) -}}
+{{- $gMode := toString (default "not-provisioned" (get $backupGraphiti "mode")) -}}
+{{- $gClaim := toString (default "" (get $backupGraphiti "existingClaim")) -}}
+{{- $gDump := toString (default "" (get $backupGraphiti "dumpPath")) -}}
+{{- if eq $gMode "not-provisioned" -}}
+{{- if or $gClaim $gDump -}}
+{{- fail "backup.graphiti.existingClaim and dumpPath must be empty when backup.graphiti.mode is \"not-provisioned\"" -}}
+{{- end -}}
+{{- else if eq $gMode "offline-dump" -}}
+{{- if not $gClaim -}}
+{{- fail "backup.graphiti.existingClaim is required when backup.graphiti.mode is \"offline-dump\"" -}}
+{{- end -}}
+{{- if eq $gClaim $destClaim -}}
+{{- fail "backup.graphiti.existingClaim must differ from backup.destination.existingClaim" -}}
+{{- end -}}
+{{- if and .Values.storage.artifacts.enabled (eq $gClaim $artifactsClaim) -}}
+{{- fail "backup.graphiti.existingClaim must differ from the storage.artifacts claim" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.relativePath" (dict "field" "backup.graphiti.dumpPath" "path" $gDump) -}}
+{{- else -}}
+{{- fail "backup.graphiti.mode must be \"not-provisioned\" or \"offline-dump\"" -}}
+{{- end -}}
+{{- $cMode := toString (default "not-provisioned" (get $backupChroma "mode")) -}}
+{{- $cClaim := toString (default "" (get $backupChroma "existingClaim")) -}}
+{{- $cArchive := toString (default "" (get $backupChroma "archivePath")) -}}
+{{- $cQual := toString (default "" (get $backupChroma "qualificationRef")) -}}
+{{- if eq $cMode "not-provisioned" -}}
+{{- if or $cClaim $cArchive $cQual -}}
+{{- fail "backup.chroma.existingClaim, archivePath and qualificationRef must be empty when backup.chroma.mode is \"not-provisioned\"" -}}
+{{- end -}}
+{{- else if eq $cMode "archive" -}}
+{{- if $cQual -}}
+{{- fail "backup.chroma.qualificationRef must be empty when backup.chroma.mode is \"archive\"" -}}
+{{- end -}}
+{{- if not $cClaim -}}
+{{- fail "backup.chroma.existingClaim is required when backup.chroma.mode is \"archive\"" -}}
+{{- end -}}
+{{- if eq $cClaim $destClaim -}}
+{{- fail "backup.chroma.existingClaim must differ from backup.destination.existingClaim" -}}
+{{- end -}}
+{{- if and .Values.storage.artifacts.enabled (eq $cClaim $artifactsClaim) -}}
+{{- fail "backup.chroma.existingClaim must differ from the storage.artifacts claim" -}}
+{{- end -}}
+{{- include "openmettle-core.validate.relativePath" (dict "field" "backup.chroma.archivePath" "path" $cArchive) -}}
+{{- else if eq $cMode "qualified-rebuild" -}}
+{{- if or $cClaim $cArchive -}}
+{{- fail "backup.chroma.existingClaim and archivePath must be empty when backup.chroma.mode is \"qualified-rebuild\"" -}}
+{{- end -}}
+{{- if or (eq (len $cQual) 0) (gt (len $cQual) 256) (ne (trim $cQual) $cQual) (not (regexMatch "^[\\x20-\\x7e]+$" $cQual)) -}}
+{{- fail "backup.chroma.qualificationRef is required when backup.chroma.mode is \"qualified-rebuild\" (1-256 trimmed printable ASCII characters)" -}}
+{{- end -}}
+{{- else -}}
+{{- fail "backup.chroma.mode must be \"not-provisioned\", \"archive\" or \"qualified-rebuild\"" -}}
+{{- end -}}
+{{- $cbEnabled := default false (get $backupCb "enabled") -}}
+{{- $cbCm := toString (default "" (get $backupCb "configMapName")) -}}
+{{- $cbFiles := default (list) (get $backupCb "files") -}}
+{{- if $cbEnabled -}}
+{{- if not $cbCm -}}
+{{- fail "backup.configBundle.configMapName is required when backup.configBundle.enabled is true" -}}
+{{- end -}}
+{{- if or (not (kindIs "slice" $cbFiles)) (eq (len $cbFiles) 0) (gt (len $cbFiles) 32) -}}
+{{- fail "backup.configBundle.files must list between 1 and 32 entries when backup.configBundle.enabled is true" -}}
+{{- end -}}
+{{- $seenCbNames := dict -}}
+{{- range $i, $entry := $cbFiles -}}
+{{- if not (kindIs "map" $entry) -}}
+{{- fail (printf "backup.configBundle.files[%d] must be a mapping with name and key" $i) -}}
+{{- end -}}
+{{- $fname := toString (default "" (get $entry "name")) -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" $fname)) (eq (lower $fname) "vault-key-inventory.json") -}}
+{{- fail (printf "backup.configBundle.files[%d].name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ and must not be vault-key-inventory.json" $i) -}}
+{{- end -}}
+{{- $lowerName := lower $fname -}}
+{{- if hasKey $seenCbNames $lowerName -}}
+{{- fail (printf "backup.configBundle.files contains duplicate case-insensitive name %q" $fname) -}}
+{{- end -}}
+{{- $_ := set $seenCbNames $lowerName true -}}
+{{- include "openmettle-core.validate.configMapKey" (dict "field" (printf "backup.configBundle.files[%d].key" $i) "key" (get $entry "key")) -}}
+{{- end -}}
+{{- else -}}
+{{- if $cbCm -}}
+{{- fail "backup.configBundle.configMapName must be empty when backup.configBundle.enabled is false" -}}
+{{- end -}}
+{{- if $cbFiles -}}
+{{- fail "backup.configBundle.files must be empty when backup.configBundle.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if or (get $adminImage "registry") (get $adminImage "repository") (get $adminImage "digest") -}}
+{{- fail "images.admin.{registry,repository,digest} must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (get $pgClientImage "registry") (get $pgClientImage "repository") (get $pgClientImage "digest") -}}
+{{- fail "images.postgresClient.{registry,repository,digest} must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if get $backupDb "existingSecret" -}}
+{{- fail "database.backup.existingSecret must be empty when backup.enabled is false; the backup owner URL is mounted only when backup.enabled is true (core ADR 0046)" -}}
+{{- end -}}
+{{- if $backupSecret -}}
+{{- fail "backup.existingKeysSecret must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (get $backupDest "existingClaim") (get $backupDest "subPath") (get $backupDest "domain") -}}
+{{- fail "backup.destination.{existingClaim,subPath,domain} must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if get $backup "operatorId" -}}
+{{- fail "backup.operatorId must be empty when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (ne (toString (default "not-provisioned" (get $backupGraphiti "mode"))) "not-provisioned") (get $backupGraphiti "existingClaim") (get $backupGraphiti "dumpPath") -}}
+{{- fail "backup.graphiti must stay not-provisioned with empty paths when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (ne (toString (default "not-provisioned" (get $backupChroma "mode"))) "not-provisioned") (get $backupChroma "existingClaim") (get $backupChroma "archivePath") (get $backupChroma "qualificationRef") -}}
+{{- fail "backup.chroma must stay not-provisioned with empty paths when backup.enabled is false" -}}
+{{- end -}}
+{{- if or (default false (get $backupCb "enabled")) (get $backupCb "configMapName") (get $backupCb "files") -}}
+{{- fail "backup.configBundle must stay disabled and empty when backup.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "field" <path> "key" <value> */}}
+{{- define "openmettle-core.validate.nonDotKey" -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$" (toString .key)) -}}
+{{- fail (printf "%s must start with an ASCII letter or digit and use only letters, digits, '-', '_' or '.'" .field) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: dict "field" <path> "path" <value> */}}
+{{- define "openmettle-core.validate.relativePath" -}}
+{{- $p := toString .path -}}
+{{- if or (eq (len $p) 0) (gt (len $p) 256) (not (regexMatch "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$" $p)) -}}
+{{- fail (printf "%s must be a non-empty relative path without leading slash, whitespace or traversal" .field) -}}
+{{- end -}}
+{{- range $seg := splitList "/" $p -}}
+{{- if or (eq $seg ".") (eq $seg "..") -}}
+{{- fail (printf "%s must not contain '.' or '..' path segments" $.field) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

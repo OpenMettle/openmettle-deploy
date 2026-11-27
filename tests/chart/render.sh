@@ -36,6 +36,8 @@ matrix=(
   "openmettle gateway-and-inference-enabled.yaml"
   "openmettle gateway-tls-terminator.yaml"
   "openmettle gateway-network-policy-disabled.yaml"
+  "openmettle vault-and-backup-enabled.yaml"
+  "openmettle backup-network-policy-disabled.yaml"
   "123 yaml-ambiguous.yaml"
 )
 # Standalone private-overlay examples, rendered without minimal.yaml.

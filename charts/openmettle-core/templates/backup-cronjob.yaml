@@ -1,0 +1,325 @@
+{{- /*
+Coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
+Runs openmettle-admin backup capture inside the publisher-pinned PostgreSQL 18 client container
+(images.postgresClient, providing pg_dump) after prepare-backup-runtime stages the openmettle-admin
+binary, owner-only 0400 backup keyring files (into a memory emptyDir), and any O_NOFOLLOW regular
+files (database CA bundle and optional --config-file bundle).
+*/ -}}
+{{- include "openmettle-core.validate.booleans" . -}}
+{{- $backup := default dict .Values.backup -}}
+{{- if default false (get $backup "enabled") }}
+{{- $context := dict "root" . "component" "backup" "field" "backup" "serviceAccount" $backup.serviceAccount }}
+{{- $serviceAccountName := include "openmettle-core.serviceAccountName" $context }}
+{{- $dest := $backup.destination }}
+{{- $retention := $backup.retention }}
+{{- $graphiti := $backup.graphiti }}
+{{- $chroma := $backup.chroma }}
+{{- $configBundle := $backup.configBundle }}
+{{- $ca := .Values.database.caBundle }}
+{{- $artifacts := .Values.storage.artifacts.enabled }}
+{{- $keysConfigKey := default "keyring.json" $backup.keysConfigKey }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "openmettle-core.fullname" . }}-backup
+  labels:
+    {{- include "openmettle-core.labels" $context | nindent 4 }}
+spec:
+  schedule: {{ $backup.schedule | quote }}
+  {{- if not (kindIs "invalid" $backup.timeZone) }}
+  timeZone: {{ $backup.timeZone | quote }}
+  {{- end }}
+  suspend: {{ $backup.suspend }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ int64 $backup.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ int64 $backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ int64 $backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "openmettle-core.labels" $context | nindent 8 }}
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ int64 $backup.activeDeadlineSeconds }}
+      podFailurePolicy:
+        rules:
+          # Exit 78 is invalid configuration; backoffLimit is 0 so any failure leaves
+          # maintenance_active=true for operator inspection rather than blind retry.
+          - action: FailJob
+            onExitCodes:
+              containerName: backup
+              operator: In
+              values: [78]
+      template:
+        metadata:
+          labels:
+            {{- include "openmettle-core.labels" $context | nindent 12 }}
+          {{- with $backup.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ $serviceAccountName | quote }}
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          {{- include "openmettle-core.podSecurityContext" (dict "storage" true "auth" false "vault" false) | nindent 10 }}
+          {{- with .Values.images.pullSecrets }}
+          imagePullSecrets:
+            {{- range . }}
+            - name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          initContainers:
+            - name: prepare-backup-runtime
+              image: {{ include "openmettle-core.image" (dict "name" "admin" "image" .Values.images.admin) | quote }}
+              imagePullPolicy: {{ .Values.images.pullPolicy | quote }}
+              command:
+                - /bin/sh
+                - -eu
+                - -c
+                - |
+                  umask 077
+                  cp -f /usr/local/bin/openmettle-admin /opt/openmettle-bin/openmettle-admin
+                  chmod 0555 /opt/openmettle-bin/openmettle-admin
+                  stage=/run/openmettle-backup-stage/keys
+                  if [ -d "$stage" ]; then
+                    chmod -R u+w -- "$stage"
+                    rm -rf -- "$stage"
+                  fi
+                  mkdir -p -- "$stage"
+                  chmod 0700 -- "$stage"
+                  for src in /run/openmettle-backup-src/*; do
+                    [ -f "$src" ] || continue
+                    dst="$stage/${src##*/}"
+                    cp -L -- "$src" "$dst"
+                    chmod 0400 -- "$dst"
+                  done
+                  [ -f "$stage/{{ $keysConfigKey }}" ] || { echo "missing backup keyring config" >&2; exit 78; }
+                  {{- if $ca.enabled }}
+                  cp -L /run/openmettle-db-ca-src/ca.crt /run/openmettle-db-ca-stage/ca.crt
+                  chmod 0444 /run/openmettle-db-ca-stage/ca.crt
+                  {{- end }}
+                  {{- if $configBundle.enabled }}
+                  for src in /run/openmettle-backup-config-src/*; do
+                    [ -f "$src" ] || continue
+                    dst="/run/openmettle-backup-config-stage/${src##*/}"
+                    cp -L -- "$src" "$dst"
+                    chmod 0444 -- "$dst"
+                  done
+                  {{- end }}
+              {{- with $backup.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- include "openmettle-core.containerSecurityContext" . | nindent 14 }}
+              volumeMounts:
+                - name: admin-bin
+                  mountPath: /opt/openmettle-bin
+                - name: backup-keys-secret
+                  mountPath: /run/openmettle-backup-src
+                  readOnly: true
+                - name: backup-keys
+                  mountPath: /run/openmettle-backup-stage
+                {{- if $ca.enabled }}
+                - name: db-ca-src
+                  mountPath: /run/openmettle-db-ca-src
+                  readOnly: true
+                - name: db-ca
+                  mountPath: /run/openmettle-db-ca-stage
+                {{- end }}
+                {{- if $configBundle.enabled }}
+                - name: backup-config-src
+                  mountPath: /run/openmettle-backup-config-src
+                  readOnly: true
+                - name: backup-config
+                  mountPath: /run/openmettle-backup-config-stage
+                {{- end }}
+          containers:
+            - name: backup
+              image: {{ include "openmettle-core.image" (dict "name" "postgresClient" "image" .Values.images.postgresClient) | quote }}
+              imagePullPolicy: {{ .Values.images.pullPolicy | quote }}
+              command:
+                - /opt/openmettle-bin/openmettle-admin
+              args:
+                - backup
+                - capture
+                - --destination-root
+                - {{ include "openmettle-core.backupDestinationDirectory" . | quote }}
+                - --destination-domain
+                - {{ $dest.domain | quote }}
+                - --backup-keys-config
+                - {{ printf "%s/%s" (include "openmettle-core.backupKeysDirectory" .) $keysConfigKey | quote }}
+                {{- if $artifacts }}
+                - --artifact-root
+                - {{ include "openmettle-core.artifactsMountPath" . | quote }}
+                {{- end }}
+                - --operator-id
+                - {{ $backup.operatorId | quote }}
+                - --request-key
+                - "cronjob-$(OPENMETTLE_BACKUP_POD_UID)"
+                - --reason
+                - {{ replace "$" "$$" $backup.reason | quote }}
+                - --drain-timeout-secs
+                - {{ int64 $backup.drainTimeoutSecs | quote }}
+                {{- if $dest.requireSeparateDevice }}
+                - --require-separate-device
+                {{- end }}
+                - --graphiti-mode
+                - {{ $graphiti.mode | quote }}
+                {{- if eq $graphiti.mode "offline-dump" }}
+                - --neo4j-dump
+                - {{ printf "%s/%s" (include "openmettle-core.backupNeo4jDirectory" .) $graphiti.dumpPath | quote }}
+                {{- end }}
+                - --chroma-mode
+                - {{ $chroma.mode | quote }}
+                {{- if eq $chroma.mode "archive" }}
+                - --chroma-archive
+                - {{ printf "%s/%s" (include "openmettle-core.backupChromaDirectory" .) $chroma.archivePath | quote }}
+                {{- else if eq $chroma.mode "qualified-rebuild" }}
+                - --chroma-qualification-ref
+                - {{ replace "$" "$$" $chroma.qualificationRef | quote }}
+                {{- end }}
+                {{- if $configBundle.enabled }}
+                {{- range $configBundle.files }}
+                - --config-file
+                - {{ printf "%s=%s/%s" .name (include "openmettle-core.backupConfigDirectory" $) .name | quote }}
+                {{- end }}
+                {{- end }}
+                {{- if $retention.prune }}
+                - --keep-daily
+                - {{ int64 $retention.daily | quote }}
+                - --keep-weekly
+                - {{ int64 $retention.weekly | quote }}
+                - --keep-monthly
+                - {{ int64 $retention.monthly | quote }}
+                {{- else }}
+                - --no-prune
+                {{- end }}
+                {{- if $backup.releaseOnSuccess }}
+                - --release-on-success
+                {{- end }}
+              env:
+                - name: OPENMETTLE_ADMIN_DATABASE_URL
+                  {{- include "openmettle-core.databaseUrlEnv" (dict "name" "backup" "ref" .Values.database.backup) | nindent 18 }}
+                - name: OPENMETTLE_BACKUP_POD_UID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.uid
+              {{- with $backup.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- include "openmettle-core.containerSecurityContext" . | nindent 14 }}
+              volumeMounts:
+                - name: admin-bin
+                  mountPath: /opt/openmettle-bin
+                  readOnly: true
+                - name: backup-keys
+                  mountPath: {{ include "openmettle-core.backupKeysDirectory" . | quote }}
+                  subPath: keys
+                  readOnly: true
+                - name: backup-destination
+                  mountPath: {{ include "openmettle-core.backupDestinationDirectory" . | quote }}
+                  {{- if $dest.subPath }}
+                  subPath: {{ $dest.subPath | quote }}
+                  {{- end }}
+                - name: tmp
+                  mountPath: /tmp
+                {{- if $ca.enabled }}
+                - name: db-ca
+                  mountPath: {{ include "openmettle-core.databaseCaDirectory" . | quote }}
+                  readOnly: true
+                {{- end }}
+                {{- if $artifacts }}
+                - name: artifacts
+                  mountPath: {{ include "openmettle-core.artifactsMountPath" . | quote }}
+                  readOnly: true
+                {{- end }}
+                {{- if eq $graphiti.mode "offline-dump" }}
+                - name: neo4j-dump
+                  mountPath: {{ include "openmettle-core.backupNeo4jDirectory" . | quote }}
+                  readOnly: true
+                {{- end }}
+                {{- if eq $chroma.mode "archive" }}
+                - name: chroma-archive
+                  mountPath: {{ include "openmettle-core.backupChromaDirectory" . | quote }}
+                  readOnly: true
+                {{- end }}
+                {{- if $configBundle.enabled }}
+                - name: backup-config
+                  mountPath: {{ include "openmettle-core.backupConfigDirectory" . | quote }}
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: admin-bin
+              emptyDir:
+                sizeLimit: 128Mi
+            - name: backup-keys-secret
+              secret:
+                secretName: {{ required "backup.existingKeysSecret is required when backup.enabled is true" $backup.existingKeysSecret | quote }}
+                # 0440 octal: readable by root and pod fsGroup 65532 only; staged to 0400 by prepare-backup-runtime.
+                defaultMode: 288
+            - name: backup-keys
+              emptyDir:
+                medium: Memory
+                sizeLimit: 1Mi
+            - name: backup-destination
+              persistentVolumeClaim:
+                claimName: {{ required "backup.destination.existingClaim is required when backup.enabled is true" $dest.existingClaim | quote }}
+            - name: tmp
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Mi
+            {{- if $ca.enabled }}
+            {{- include "openmettle-core.caBundleVolume" (dict "name" "db-ca-src" "path" "database.caBundle" "bundle" $ca) | nindent 12 }}
+            - name: db-ca
+              emptyDir:
+                medium: Memory
+                sizeLimit: 1Mi
+            {{- end }}
+            {{- if $artifacts }}
+            - name: artifacts
+              persistentVolumeClaim:
+                claimName: {{ include "openmettle-core.artifactsClaimName" . | quote }}
+                readOnly: true
+            {{- end }}
+            {{- if eq $graphiti.mode "offline-dump" }}
+            - name: neo4j-dump
+              persistentVolumeClaim:
+                claimName: {{ $graphiti.existingClaim | quote }}
+                readOnly: true
+            {{- end }}
+            {{- if eq $chroma.mode "archive" }}
+            - name: chroma-archive
+              persistentVolumeClaim:
+                claimName: {{ $chroma.existingClaim | quote }}
+                readOnly: true
+            {{- end }}
+            {{- if $configBundle.enabled }}
+            - name: backup-config-src
+              configMap:
+                name: {{ $configBundle.configMapName | quote }}
+                items:
+                  {{- range $configBundle.files }}
+                  - key: {{ .key | quote }}
+                    path: {{ .name | quote }}
+                  {{- end }}
+            - name: backup-config
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Mi
+            {{- end }}
+          {{- with $backup.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $backup.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $backup.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

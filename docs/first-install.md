@@ -1,6 +1,6 @@
 # First install with sign-in
 
-This guide takes an empty single-node Kubernetes cluster and an empty PostgreSQL 18 database to this end state: a person can sign in, call authenticated `/v1` routes, and a run can be admitted. It uses `charts/openmettle-core` at core commit `11f86638cdfbea938f3ea3230b38c0bf1bfa79a7` ([`CORE_COMMIT`](../CORE_COMMIT)).
+This guide takes an empty single-node Kubernetes cluster and an empty PostgreSQL 18 database to this end state: a person can sign in, call authenticated `/v1` routes, and a run can be admitted. It uses `charts/openmettle-core` at core commit `87a395e25e26f2e83c7ba34cc40561a0acf92b09` ([`CORE_COMMIT`](../CORE_COMMIT)).
 
 **Status.** This path has not yet been run end to end on a real cluster. The kind smoke test ([`tests/kind`](../tests/kind/README.md)) runs most of it on an ephemeral cluster; [How this guide differs from the kind smoke test](#how-this-guide-differs-from-the-kind-smoke-test) lists where they differ. A step marked *unverified* is not exercised by the kind smoke test or by core CI.
 
@@ -184,7 +184,7 @@ The subshell keeps your working directory unchanged.
 
 `NODE_ARCH` is your node's architecture (`amd64` or `arm64`), and `REGISTRY` is your registry host and path. The `Dockerfile` pins its base images by digest. This guide does not verify that those digests cover your architecture. Check with `docker buildx imagetools inspect` on each pinned `FROM` reference before you build. The kind smoke test builds amd64 only. If the registry is private, create a pull Secret and list it in `images.pullSecrets`. Image distribution remains subject to core's V1-42 provenance inventory, so keep the images in a private registry.
 
-Write `images.{api,worker,migrate}.{registry,repository,digest}` into the private overlay. The chart does not reference the `admin` image; record its digest for [`openmettle-admin`](#running-openmettle-admin).
+Write `images.{api,worker,migrate}.{registry,repository,digest}` into the private overlay. Record the `admin` image digest for [`openmettle-admin`](#running-openmettle-admin) (and for `images.admin` if you later enable the opt-in `backup` CronJob).
 
 **Check:** `docker buildx imagetools inspect "$REGISTRY/openmettle/api@<digest>"` resolves from a host that uses the same registry credentials as the node.
 
@@ -375,7 +375,7 @@ The migrate hook runs `openmettle-migrate` as the owner before Helm creates the 
 | Check | Expected |
 | --- | --- |
 | `kubectl -n openmettle get deploy` | `openmettle-openmettle-core-api` and `-worker` Ready |
-| As owner: `SELECT max(version) FROM openmettle._sqlx_migrations WHERE success;` | `37` |
+| As owner: `SELECT max(version) FROM openmettle._sqlx_migrations WHERE success;` | `45` |
 | As owner: core's marker query in `docs/operator/storage-adoption-and-quota-upgrade.md`, section 2 | `metering_enforced` and `overrides_enforced` true, with both timestamps set. A fresh database starts enforced. `adoption_run_id` is null |
 | `kubectl -n openmettle exec deploy/openmettle-openmettle-core-api -- /usr/local/bin/openmettle-api --check-auth-config /etc/openmettle/auth/auth.json` | `auth configuration valid (local files only)` |
 | `curl -i https://openmettle.example.test/healthz` | `200`, body `ok` |
@@ -423,7 +423,7 @@ With `-q`, success prints nothing and exits 0. A refusal prints `operator change
 
 ### 10.3 Invite the first person
 
-Follow core's [home invitations procedure](https://github.com/OpenMettle/openmettle-core/blob/11f86638cdfbea938f3ea3230b38c0bf1bfa79a7/docs/operator/home-invitations.md). Inspect the provider to get `expected_generation`, which is `0` for a new provider. Then run `"$CORE/docs/operator/home-invitation-create.psql"` with the person's exact issuer and `sub`. `redeem_before_ms` may be at most seven days ahead. Run it in an unrecorded terminal. Success prints two lines: `home invitation created`, then the one-time code. Deliver the code privately, and keep it out of tickets and logs.
+Follow core's [home invitations procedure](https://github.com/OpenMettle/openmettle-core/blob/87a395e25e26f2e83c7ba34cc40561a0acf92b09/docs/operator/home-invitations.md). Inspect the provider to get `expected_generation`, which is `0` for a new provider. Then run `"$CORE/docs/operator/home-invitation-create.psql"` with the person's exact issuer and `sub`. `redeem_before_ms` may be at most seven days ahead. Run it in an unrecorded terminal. Success prints two lines: `home invitation created`, then the one-time code. Deliver the code privately, and keep it out of tickets and logs.
 
 ### 10.4 Storage and run quotas
 
@@ -461,7 +461,7 @@ Project uploads also need `project_limit_bytes`. Size the storage values for you
 
 The code travels only in the form body, which the ingress must not log. If `/readyz` ever answers with `Referrer-Policy: no-referrer`, the browser sends `Origin: null` and initiation is refused. A malformed code is refused at once with `login request refused`. A wrong code is refused only after the provider step, with the same message as any other refused sign-in (core `home-invitations.md`).
 
-Redemption creates the user, identity, personal scope and approval. To make this person the first account administrator (optional), follow core's [account administrator procedure](https://github.com/OpenMettle/openmettle-core/blob/11f86638cdfbea938f3ea3230b38c0bf1bfa79a7/docs/operator/account-admin-recovery.md) with `"$CORE/docs/operator/grant-account-admin.psql"`, which prints `account admin grant committed` on success. That procedure needs the internal user UUID. Core names no query for it, so this read-only lookup by the invited issuer and subject is not defined by core:
+Redemption creates the user, identity, personal scope and approval. To make this person the first account administrator (optional), follow core's [account administrator procedure](https://github.com/OpenMettle/openmettle-core/blob/87a395e25e26f2e83c7ba34cc40561a0acf92b09/docs/operator/account-admin-recovery.md) with `"$CORE/docs/operator/grant-account-admin.psql"`, which prints `account admin grant committed` on success. That procedure needs the internal user UUID. Core names no query for it, so this read-only lookup by the invited issuer and subject is not defined by core:
 
 ```sql
 SELECT user_id FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject';
@@ -512,7 +512,7 @@ The run stays queued until `queue_timeout_seconds`. The worker then expires it a
 
 ## Running `openmettle-admin`
 
-`openmettle-admin` is core's owner-operated maintenance binary (`$CORE/src/bin/admin.rs`). It reads `OPENMETTLE_ADMIN_DATABASE_URL`, which is the `openmettle_owner` URL, and supports `storage adopt ROOT`, `quota drain-orphans`, `quota activate` and `quota verify [ROOT]`. A fresh install needs none of them. `quota verify` is an optional consistency check, and the others belong to the [upgrade runbook](https://github.com/OpenMettle/openmettle-core/blob/11f86638cdfbea938f3ea3230b38c0bf1bfa79a7/docs/operator/storage-adoption-and-quota-upgrade.md). The chart has no admin workload. Run the image as a one-off Job in the release namespace with the owner Secret and no other privileges:
+`openmettle-admin` is core's owner-operated maintenance binary (`$CORE/src/bin/admin.rs`). It reads `OPENMETTLE_ADMIN_DATABASE_URL`, which is the `openmettle_owner` URL, and supports `storage adopt ROOT`, `quota drain-orphans`, `quota activate`, `quota verify [ROOT]`, `backup ...` and `restore ...`. A fresh install needs none of them. `quota verify` is an optional consistency check, the `storage`/`quota` migration steps belong to the [upgrade runbook](https://github.com/OpenMettle/openmettle-core/blob/87a395e25e26f2e83c7ba34cc40561a0acf92b09/docs/operator/storage-adoption-and-quota-upgrade.md), and scheduled coordinated backup capture is packaged as an opt-in chart `CronJob` (`backup.enabled: true`; see [Coordinated maintenance-window backup](../charts/openmettle-core/README.md#coordinated-maintenance-window-backup-backup)). For ad-hoc maintenance commands, run the image as a one-off Job in the release namespace with the owner Secret and no other privileges:
 
 ```yaml
 apiVersion: batch/v1

@@ -24,6 +24,17 @@ images:
     registry: ""
     repository: ""
     digest: ""
+  # Required (repository and digest) while backup.enabled is true; must stay empty while backup.enabled is false.
+  admin:
+    registry: ""
+    repository: ""
+    digest: ""
+  # Publisher-pinned PostgreSQL 18 client image (providing pg_dump) for the backup CronJob (core ADR 0046,
+  # provenance/register.json group "database"). Required while backup.enabled is true; empty otherwise.
+  postgresClient:
+    registry: ""
+    repository: ""
+    digest: ""
 
 database:
   # Existing Secrets holding a full postgres:// URL, including an explicit sslmode.
@@ -51,15 +62,24 @@ database:
   gateway:
     existingSecret: ""
     key: url
+  # Owner (openmettle_owner) URL mounted into the backup CronJob container only as
+  # OPENMETTLE_ADMIN_DATABASE_URL (core ADR 0046). Required while backup.enabled is true and refused
+  # while false. May reference the same openmettle_owner Secret as database.migrate or a dedicated
+  # owner Secret; must never reuse api, worker, issuance or gateway Secrets.
+  backup:
+    existingSecret: ""
+    key: url
   # Optional PostgreSQL connections available to this release. When set, rendering fails if
   # (api.replicas + api.maxSurge) * (api.dbMaxConnections + api.issuanceDbMaxConnections if auth.enabled)
   #   + (worker.replicas + worker.maxSurge) * worker.dbMaxConnections
-  #   + sum_gateways((g.replicas + g.maxSurge) * g.dbMaxConnections) + 1 (migrator) exceeds it.
+  #   + sum_gateways((g.replicas + g.maxSurge) * g.dbMaxConnections)
+  #   + 1 (migrator) + (3 if backup.enabled: 2 backup pool + 1 pg_dump) exceeds it.
   connectionBudget: null
   # Optional CA bundle for verifying PostgreSQL server certificates. When enabled, one key of an
   # existing ConfigMap (the chart never creates ConfigMaps or Secrets) is mounted read-only at
-  # /etc/openmettle/db-ca/ca.crt in api, worker, migrate and (when configured) gateway pods. No
-  # environment variable is set: reference the file in each URL:
+  # /etc/openmettle/db-ca/ca.crt in api, worker, migrate, (when configured) gateway, and (when enabled,
+  # staged as a regular non-symlink file for O_NOFOLLOW) backup pods. No environment variable is set:
+  # reference the file in each URL:
   # ?sslmode=verify-full&sslrootcert=/etc/openmettle/db-ca/ca.crt
   caBundle:
     enabled: false
@@ -135,6 +155,17 @@ worker:
       enabled: false
       configMapName: ""
       key: ca.crt
+  # Optional external MCP server and OAuth refresh egress/CA configuration for worker only
+  # (core V1-14, ADR 0045). External MCP connections and refresh_routes live in the external_mcp
+  # block of inference.json, so worker.inference.enabled must be true when worker.mcp.enabled is true.
+  mcp:
+    enabled: false
+    # Optional CA bundle for verifying private/cluster-CA external MCP or OAuth token servers.
+    # Mounted read-only at /etc/openmettle/mcp-ca/ca.crt on worker only.
+    caBundle:
+      enabled: false
+      configMapName: ""
+      key: ca.crt
   resources:
     requests:
       cpu: 100m
@@ -200,6 +231,13 @@ networkPolicy:
       # may reach on `port` (default 8082). Must stay empty while worker.inference.enabled is false.
       to: []
       port: 8082
+    mcp:
+      # Required when worker.mcp.enabled and networkPolicy.enabled are true: external MCP server
+      # and OAuth token refresh peers that worker (and never api, gateway, migrate or backup) may
+      # reach on TCP `ports` (default [443]). Must stay empty while worker.mcp.enabled is false.
+      to: []
+      ports:
+        - 443
   dns:
     # Peers that every component may query on UDP and TCP 53. The default matches the CoreDNS pods
     # of kubeadm (kind) and K3s. Rendering fails if this is empty while enabled.
@@ -345,3 +383,93 @@ telemetry:
 #   tolerations: []
 #   affinity: {}
 gateways: {}
+
+# Opt-in credential vault keyring for external connections (core ADR 0045, V1-28).
+# Mounted into openmettle-api and openmettle-worker only (never gateway, migrate or backup).
+# Under PodSecurity: restricted, a stage-vault-keys initContainer copies the Secret's non-dotfile
+# entries into a memory emptyDir with 0700 directory / 0400 file permissions (required by
+# VaultKeyRing::load_from_config) and mounts that emptyDir read-only at /etc/openmettle/vault-keys.
+# Because staging snapshots the Secret at Pod start, key rotation requires rolling Pods.
+vault:
+  enabled: false
+  # Existing Secret holding keyring.json and 32-byte raw master key files. Must stay empty when
+  # disabled and must differ from backup.existingKeysSecret and auth.loginKeysSecretName.
+  existingSecret: ""
+  # Manifest key inside existingSecret (staged to /etc/openmettle/vault-keys/<configKey>).
+  configKey: keyring.json
+
+# Opt-in coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).
+# Off by default: when false, no CronJob, backup ServiceAccount or backup NetworkPolicy is
+# rendered, and images.admin, images.postgresClient, database.backup.existingSecret and backup
+# targets must stay empty. Connects as openmettle_owner via database.backup (peak 3 connections)
+# and stages openmettle-admin + 0400 backup keys in a prepare-backup-runtime initContainer before
+# executing openmettle-admin backup capture inside images.postgresClient.
+backup:
+  enabled: false
+  schedule: "0 3 * * *"
+  # Optional IANA time zone (Kubernetes CronJob spec.timeZone), e.g. "UTC" or "Europe/London".
+  timeZone: null
+  suspend: false
+  startingDeadlineSeconds: 600
+  # Job deadline in seconds; must exceed drainTimeoutSecs.
+  activeDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Existing Secret holding keyring.json and 32-byte raw backup master key files. Must stay empty
+  # when disabled and must differ from vault.existingSecret and auth.loginKeysSecretName.
+  existingKeysSecret: ""
+  # Manifest key inside existingKeysSecret (staged to /etc/openmettle/backup-keys/<keysConfigKey>).
+  keysConfigKey: keyring.json
+  destination:
+    # Existing off-host destination PVC mounted read-write at /var/backups/openmettle. Must differ
+    # from the resolved storage.artifacts claim.
+    existingClaim: ""
+    # Optional relative subdirectory inside existingClaim (no leading / or .. segments).
+    subPath: ""
+    # Off-host destination domain recorded in backup_runs and manifest.json.enc
+    # (1-128 chars matching ^[A-Za-z0-9._:/-]+$).
+    domain: ""
+    # Passes --require-separate-device to openmettle-admin backup capture (true by default for
+    # off-host NAS/CSI isolation; set false only in single-filesystem test clusters such as kind).
+    requireSeparateDevice: true
+  # Canonical lowercase UUID passed as --operator-id for audited scheduled backup runs.
+  operatorId: ""
+  # Operator reason passed as --reason (1-512 chars, trimmed, no control characters).
+  reason: "Scheduled coordinated backup"
+  # In-flight work drain timeout in seconds (1-86400), passed as --drain-timeout-secs.
+  drainTimeoutSecs: 300
+  # Release capture-owned maintenance automatically after durable backup confirmation.
+  releaseOnSuccess: true
+  # Grandfather-Father-Son retention counts (core ADR 0046; each >= 1). Set prune: false to pass --no-prune.
+  retention:
+    prune: true
+    daily: 7
+    weekly: 4
+    monthly: 3
+  # Graphiti / Neo4j capture disposition: "not-provisioned" or "offline-dump".
+  graphiti:
+    mode: not-provisioned
+    existingClaim: ""
+    dumpPath: ""
+  # Chroma vector store capture disposition: "not-provisioned", "archive", or "qualified-rebuild".
+  chroma:
+    mode: not-provisioned
+    existingClaim: ""
+    archivePath: ""
+    qualificationRef: ""
+  # Optional non-secret configuration files from an existing ConfigMap bundled into config.json.enc.
+  # Staged as regular non-symlink files for O_NOFOLLOW verification.
+  configBundle:
+    enabled: false
+    configMapName: ""
+    # List of {name: <bundle file name>, key: <ConfigMap key>}.
+    files: []
+  resources: {}
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

@@ -22,6 +22,14 @@
         "gateway": {
           "description": "Required (repository and digest) while gateways is non-empty; must stay empty while gateways is {}.",
           "$ref": "#/$defs/image"
+        },
+        "admin": {
+          "description": "openmettle-admin image required (repository and digest) while backup.enabled is true; must stay empty while backup.enabled is false.",
+          "$ref": "#/$defs/image"
+        },
+        "postgresClient": {
+          "description": "Publisher-pinned PostgreSQL 18 client image required (repository and digest) while backup.enabled is true; must stay empty while backup.enabled is false.",
+          "$ref": "#/$defs/image"
         }
       }
     },
@@ -34,11 +42,15 @@
         "worker": {"$ref": "#/$defs/secretKeyRef"},
         "migrate": {"$ref": "#/$defs/secretKeyRef"},
         "issuance": {
-          "description": "openmettle_issuance URL mounted into the API container only (core ADR 0030). Required while auth.enabled is true and empty otherwise; rendering also fails if it reuses the api, worker or migrate Secret key.",
+          "description": "openmettle_issuance URL mounted into the API container only (core ADR 0030). Required while auth.enabled is true and empty otherwise; rendering also fails if it reuses the api, worker, migrate or backup Secret key.",
           "$ref": "#/$defs/secretKeyRef"
         },
         "gateway": {
-          "description": "openmettle_gateway URL mounted into openmettle-gateway containers only (core ADR 0044). Required while gateways is non-empty and empty otherwise; rendering also fails if it reuses the api, worker, migrate or issuance Secret key.",
+          "description": "openmettle_gateway URL mounted into openmettle-gateway containers only (core ADR 0044). Required while gateways is non-empty and empty otherwise; rendering also fails if it reuses the api, worker, migrate, issuance or backup Secret key.",
+          "$ref": "#/$defs/secretKeyRef"
+        },
+        "backup": {
+          "description": "openmettle_owner URL mounted into the backup CronJob container only as OPENMETTLE_ADMIN_DATABASE_URL (core ADR 0046). Required while backup.enabled is true and empty otherwise.",
           "$ref": "#/$defs/secretKeyRef"
         },
         "connectionBudget": {"type": ["integer", "null"], "minimum": 1},
@@ -99,6 +111,7 @@
         "sweepMs": {"type": ["integer", "null"], "minimum": 1000, "maximum": 3600000},
         "pollMs": {"type": ["integer", "null"], "minimum": 100, "maximum": 60000},
         "inference": {"$ref": "#/$defs/workerInference"},
+        "mcp": {"$ref": "#/$defs/workerMcp"},
         "resources": {"$ref": "#/$defs/resources"},
         "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
         "settings": {"$ref": "#/$defs/processSettings"},
@@ -179,6 +192,22 @@
               "properties": {
                 "to": {"$ref": "#/$defs/networkPolicyPeers"},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            },
+            "mcp": {
+              "description": "External MCP server and OAuth token refresh peers reachable from the worker pod only (core V1-14, ADR 0045). Required while worker.mcp.enabled and networkPolicy.enabled are true; must be empty while worker.mcp.enabled is false.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "ports"],
+              "properties": {
+                "to": {"$ref": "#/$defs/networkPolicyPeers"},
+                "ports": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {"type": "integer", "minimum": 1, "maximum": 65535}
+                }
               }
             }
           }
@@ -395,7 +424,30 @@
         "pattern": "^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$"
       },
       "additionalProperties": {"$ref": "#/$defs/gatewayInstance"}
-    }
+    },
+    "vault": {
+      "description": "Opt-in credential vault keyring mounted into openmettle-api and openmettle-worker only via stage-vault-keys (core ADR 0045, V1-28).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "existingSecret", "configKey"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "existingSecret": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "configKey": {"$ref": "#/$defs/nonDotKey"}
+      },
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {
+        "properties": {
+          "existingSecret": {"minLength": 1}
+        }
+      },
+      "else": {
+        "properties": {
+          "existingSecret": {"const": ""}
+        }
+      }
+    },
+    "backup": {"$ref": "#/$defs/backup"}
   },
   "allOf": [
     {
@@ -446,6 +498,87 @@
           "database": {
             "properties": {
               "gateway": {
+                "properties": {
+                  "existingSecret": {"const": ""}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"worker": {"properties": {"mcp": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}, "required": ["mcp"]}}, "required": ["worker"]},
+      "then": {
+        "properties": {
+          "worker": {
+            "required": ["inference"],
+            "properties": {
+              "inference": {
+                "required": ["enabled"],
+                "properties": {"enabled": {"const": true}}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"backup": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}, "required": ["backup"]},
+      "then": {
+        "properties": {
+          "images": {
+            "required": ["admin", "postgresClient"],
+            "properties": {
+              "admin": {
+                "properties": {
+                  "repository": {"minLength": 1},
+                  "digest": {"minLength": 1}
+                }
+              },
+              "postgresClient": {
+                "properties": {
+                  "repository": {"minLength": 1},
+                  "digest": {"minLength": 1}
+                }
+              }
+            }
+          },
+          "database": {
+            "required": ["backup"],
+            "properties": {
+              "backup": {
+                "properties": {
+                  "existingSecret": {"minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "images": {
+            "properties": {
+              "admin": {
+                "properties": {
+                  "registry": {"const": ""},
+                  "repository": {"const": ""},
+                  "digest": {"const": ""}
+                }
+              },
+              "postgresClient": {
+                "properties": {
+                  "registry": {"const": ""},
+                  "repository": {"const": ""},
+                  "digest": {"const": ""}
+                }
+              }
+            }
+          },
+          "database": {
+            "properties": {
+              "backup": {
                 "properties": {
                   "existingSecret": {"const": ""}
                 }
@@ -822,6 +955,299 @@
         "nodeSelector": {"$ref": "#/$defs/stringMap"},
         "tolerations": {"$ref": "#/$defs/tolerations"},
         "affinity": {"$ref": "#/$defs/affinity"}
+      }
+    },
+    "nonDotKey": {
+      "description": "A non-dotfile Secret or ConfigMap key starting with an ASCII letter or digit.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$"
+    },
+    "optionalRelativePath": {
+      "description": "Empty string or safe relative path without leading slash, whitespace, or '.'/'..' segments.",
+      "anyOf": [
+        {"const": ""},
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$",
+          "not": {"pattern": "(^|/)\\.\\.?(/|$)"}
+        }
+      ]
+    },
+    "optionalUuid": {
+      "anyOf": [
+        {"const": ""},
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      ]
+    },
+    "workerMcp": {
+      "description": "Optional external MCP server and OAuth refresh CA/egress toggle for worker only (core V1-14, ADR 0045).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "caBundle"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "caBundle": {
+          "description": "Existing ConfigMap key mounted read-only at /etc/openmettle/mcp-ca/ca.crt in the worker pod only.",
+          "$ref": "#/$defs/caBundle"
+        }
+      },
+      "if": {"properties": {"enabled": {"const": false}}, "required": ["enabled"]},
+      "then": {
+        "properties": {
+          "caBundle": {
+            "properties": {
+              "enabled": {"const": false}
+            }
+          }
+        }
+      }
+    },
+    "backup": {
+      "description": "Opt-in coordinated maintenance-window backup CronJob (core ADR 0046, V1-30).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled", "schedule", "suspend", "startingDeadlineSeconds", "activeDeadlineSeconds",
+        "successfulJobsHistoryLimit", "failedJobsHistoryLimit", "existingKeysSecret", "keysConfigKey",
+        "destination", "operatorId", "reason", "drainTimeoutSecs", "releaseOnSuccess", "retention",
+        "graphiti", "chroma", "configBundle", "resources", "serviceAccount", "podAnnotations",
+        "nodeSelector", "tolerations", "affinity"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "schedule": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "not": {"pattern": "[\\x00-\\x1f\\x7f]"}
+        },
+        "timeZone": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[A-Za-z0-9_./+-]{1,64}$"}
+          ]
+        },
+        "suspend": {"type": "boolean"},
+        "startingDeadlineSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "activeDeadlineSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+        "successfulJobsHistoryLimit": {"type": "integer", "minimum": 0, "maximum": 100},
+        "failedJobsHistoryLimit": {"type": "integer", "minimum": 0, "maximum": 100},
+        "existingKeysSecret": {"$ref": "#/$defs/optionalDnsSubdomain"},
+        "keysConfigKey": {"$ref": "#/$defs/nonDotKey"},
+        "destination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["existingClaim", "subPath", "domain", "requireSeparateDevice"],
+          "properties": {
+            "existingClaim": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "subPath": {"$ref": "#/$defs/optionalRelativePath"},
+            "domain": {
+              "anyOf": [
+                {"const": ""},
+                {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,128}$"}
+              ]
+            },
+            "requireSeparateDevice": {"type": "boolean"}
+          }
+        },
+        "operatorId": {"$ref": "#/$defs/optionalUuid"},
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "not": {"pattern": "(^\\s|\\s$|[\\x00-\\x1f\\x7f])"}
+        },
+        "drainTimeoutSecs": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "releaseOnSuccess": {"type": "boolean"},
+        "retention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["prune", "daily", "weekly", "monthly"],
+          "properties": {
+            "prune": {"type": "boolean"},
+            "daily": {"type": "integer", "minimum": 1, "maximum": 3650},
+            "weekly": {"type": "integer", "minimum": 1, "maximum": 520},
+            "monthly": {"type": "integer", "minimum": 1, "maximum": 120}
+          }
+        },
+        "graphiti": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "existingClaim", "dumpPath"],
+          "properties": {
+            "mode": {"enum": ["not-provisioned", "offline-dump"]},
+            "existingClaim": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "dumpPath": {"$ref": "#/$defs/optionalRelativePath"}
+          },
+          "if": {"properties": {"mode": {"const": "offline-dump"}}, "required": ["mode"]},
+          "then": {
+            "properties": {
+              "existingClaim": {"minLength": 1},
+              "dumpPath": {"minLength": 1}
+            }
+          },
+          "else": {
+            "properties": {
+              "existingClaim": {"const": ""},
+              "dumpPath": {"const": ""}
+            }
+          }
+        },
+        "chroma": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "existingClaim", "archivePath", "qualificationRef"],
+          "properties": {
+            "mode": {"enum": ["not-provisioned", "archive", "qualified-rebuild"]},
+            "existingClaim": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "archivePath": {"$ref": "#/$defs/optionalRelativePath"},
+            "qualificationRef": {
+              "anyOf": [
+                {"const": ""},
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256,
+                  "pattern": "^[\\x20-\\x7e]+$",
+                  "not": {"pattern": "(^\\s|\\s$)"}
+                }
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"mode": {"const": "not-provisioned"}}, "required": ["mode"]},
+              "then": {
+                "properties": {
+                  "existingClaim": {"const": ""},
+                  "archivePath": {"const": ""},
+                  "qualificationRef": {"const": ""}
+                }
+              }
+            },
+            {
+              "if": {"properties": {"mode": {"const": "archive"}}, "required": ["mode"]},
+              "then": {
+                "properties": {
+                  "existingClaim": {"minLength": 1},
+                  "archivePath": {"minLength": 1},
+                  "qualificationRef": {"const": ""}
+                }
+              }
+            },
+            {
+              "if": {"properties": {"mode": {"const": "qualified-rebuild"}}, "required": ["mode"]},
+              "then": {
+                "properties": {
+                  "existingClaim": {"const": ""},
+                  "archivePath": {"const": ""},
+                  "qualificationRef": {"minLength": 1}
+                }
+              }
+            }
+          ]
+        },
+        "configBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "configMapName", "files"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "configMapName": {"$ref": "#/$defs/optionalDnsSubdomain"},
+            "files": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "key"],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+                  },
+                  "key": {"$ref": "#/$defs/configMapKey"}
+                }
+              }
+            }
+          },
+          "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+          "then": {
+            "properties": {
+              "configMapName": {"minLength": 1},
+              "files": {"minItems": 1}
+            }
+          },
+          "else": {
+            "properties": {
+              "configMapName": {"const": ""},
+              "files": {"maxItems": 0}
+            }
+          }
+        },
+        "resources": {"$ref": "#/$defs/resources"},
+        "serviceAccount": {"$ref": "#/$defs/serviceAccount"},
+        "podAnnotations": {"$ref": "#/$defs/stringMap"},
+        "nodeSelector": {"$ref": "#/$defs/stringMap"},
+        "tolerations": {"$ref": "#/$defs/tolerations"},
+        "affinity": {"$ref": "#/$defs/affinity"}
+      },
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {
+        "properties": {
+          "existingKeysSecret": {"minLength": 1},
+          "destination": {
+            "properties": {
+              "existingClaim": {"minLength": 1},
+              "domain": {"minLength": 1}
+            }
+          },
+          "operatorId": {"minLength": 1}
+        }
+      },
+      "else": {
+        "properties": {
+          "existingKeysSecret": {"const": ""},
+          "destination": {
+            "properties": {
+              "existingClaim": {"const": ""},
+              "subPath": {"const": ""},
+              "domain": {"const": ""}
+            }
+          },
+          "operatorId": {"const": ""},
+          "graphiti": {
+            "properties": {
+              "mode": {"const": "not-provisioned"},
+              "existingClaim": {"const": ""},
+              "dumpPath": {"const": ""}
+            }
+          },
+          "chroma": {
+            "properties": {
+              "mode": {"const": "not-provisioned"},
+              "existingClaim": {"const": ""},
+              "archivePath": {"const": ""},
+              "qualificationRef": {"const": ""}
+            }
+          },
+          "configBundle": {
+            "properties": {
+              "enabled": {"const": false},
+              "configMapName": {"const": ""},
+              "files": {"maxItems": 0}
+            }
+          }
+        }
       }
     }
   }

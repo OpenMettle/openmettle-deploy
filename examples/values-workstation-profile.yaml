@@ -146,3 +146,9 @@ telemetry:
       enabled: true
       configMapName: workstation-openmettle-otlp-ca
       key: ca.crt
+
+# Opt-in credential vault (V1-28), worker MCP/OAuth egress (V1-14) and coordinated backup CronJob
+# (V1-30) stay off by default in the base workstation profile; layer them in config/<site>.local.yaml
+# with digest-pinned images.admin + images.postgresClient, an openmettle_owner database.backup Secret,
+# distinct vault/backup key Secrets and an off-host backup.destination.existingClaim (see
+# charts/openmettle-core/README.md).

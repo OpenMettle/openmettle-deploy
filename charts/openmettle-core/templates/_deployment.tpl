@@ -16,6 +16,10 @@ Arguments: dict "root" $ "component" "api|worker|gateway-<name>" "port" <contain
 {{- $artifacts := and (ne $role "gateway") $root.Values.storage.artifacts.enabled -}}
 {{- $auth := and (eq $role "api") $root.Values.auth.enabled -}}
 {{- $inference := and (eq $role "worker") (default false (get (default dict $root.Values.worker.inference) "enabled")) -}}
+{{- $mcp := and (eq $role "worker") (default false (get (default dict $root.Values.worker.mcp) "enabled")) -}}
+{{- $vaultCfg := default dict $root.Values.vault -}}
+{{- $vault := and (ne $role "gateway") (default false (get $vaultCfg "enabled")) -}}
+{{- $vaultConfigKey := default "keyring.json" (get $vaultCfg "configKey") -}}
 {{- $logging := $root.Values.telemetry.logging -}}
 {{- $otlp := $root.Values.telemetry.otlp -}}
 apiVersion: apps/v1
@@ -48,13 +52,50 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ int64 $values.terminationGracePeriodSeconds }}
-      {{- $volumes := dict "root" $root "artifacts" $artifacts "auth" $auth "otlp" $otlp.enabled "inference" $inference }}
-      {{- include "openmettle-core.podSecurityContext" (dict "storage" $artifacts "auth" $auth) | nindent 6 }}
+      {{- $volumes := dict "root" $root "artifacts" $artifacts "auth" $auth "otlp" $otlp.enabled "inference" $inference "mcp" $mcp "vault" $vault }}
+      {{- include "openmettle-core.podSecurityContext" (dict "storage" $artifacts "auth" $auth "vault" $vault) | nindent 6 }}
       {{- with $root.Values.images.pullSecrets }}
       imagePullSecrets:
         {{- range . }}
         - name: {{ . | quote }}
         {{- end }}
+      {{- end }}
+      {{- if $vault }}
+      initContainers:
+        - name: stage-vault-keys
+          image: {{ include "openmettle-core.image" (dict "name" $role "image" (index $root.Values.images $role)) | quote }}
+          imagePullPolicy: {{ $root.Values.images.pullPolicy | quote }}
+          command:
+            - /bin/sh
+            - -eu
+            - -c
+            - |
+              umask 077
+              stage=/run/openmettle-vault-stage/keys
+              if [ -d "$stage" ]; then
+                chmod -R u+w -- "$stage"
+                rm -rf -- "$stage"
+              fi
+              mkdir -p -- "$stage"
+              chmod 0700 -- "$stage"
+              for src in /run/openmettle-vault-src/*; do
+                [ -f "$src" ] || continue
+                dst="$stage/${src##*/}"
+                cp -L -- "$src" "$dst"
+                chmod 0400 -- "$dst"
+              done
+              [ -f "$stage/{{ $vaultConfigKey }}" ] || { echo "missing vault keyring config" >&2; exit 78; }
+          {{- with $values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- include "openmettle-core.containerSecurityContext" $root | nindent 10 }}
+          volumeMounts:
+            - name: vault-keys-secret
+              mountPath: /run/openmettle-vault-src
+              readOnly: true
+            - name: vault-keys
+              mountPath: /run/openmettle-vault-stage
       {{- end }}
       containers:
         - name: {{ $role }}
@@ -139,6 +180,10 @@ spec:
             {{- if $artifacts }}
             - name: {{ $prefix }}ARTIFACTS_DIR
               value: {{ include "openmettle-core.artifactsMountPath" $root | quote }}
+            {{- end }}
+            {{- if $vault }}
+            - name: {{ $prefix }}VAULT_KEYS_CONFIG
+              value: {{ printf "%s/%s" (include "openmettle-core.vaultKeysDirectory" $root) $vaultConfigKey | quote }}
             {{- end }}
             {{- if $auth }}
             - name: OPENMETTLE_API_AUTH_CONFIG

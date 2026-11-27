@@ -1,0 +1,46 @@
+# Synthetic overlay on minimal.yaml: opt-in credential vault (ADR 0045), worker external MCP/OAuth
+# egress (V1-14) and coordinated maintenance-window backup CronJob (ADR 0046) with NetworkPolicies on.
+images:
+  admin:
+    registry: registry.example.test
+    repository: openmettle/admin
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  postgresClient:
+    registry: registry.example.test
+    repository: library/postgres
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+database:
+  # Reuses the openmettle_owner Secret shared with database.migrate.
+  backup:
+    existingSecret: openmettle-owner-database
+    key: url
+storage:
+  artifacts:
+    enabled: true
+    existingClaim: example-artifacts
+worker:
+  inference:
+    enabled: true
+    configMapName: example-worker-inference
+  mcp:
+    enabled: true
+networkPolicy:
+  worker:
+    inference:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.40/32
+    mcp:
+      to:
+        - ipBlock:
+            cidr: 192.0.2.50/32
+vault:
+  enabled: true
+  existingSecret: example-vault-keys
+backup:
+  enabled: true
+  existingKeysSecret: example-backup-keys
+  destination:
+    existingClaim: example-backup-destination
+    domain: nas.example.test/openmettle
+  operatorId: 00000000-0000-4000-8000-000000000001

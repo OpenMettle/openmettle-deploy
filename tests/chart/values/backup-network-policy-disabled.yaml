@@ -1,0 +1,36 @@
+# Synthetic overlay on minimal.yaml: vault and backup CronJob enabled while networkPolicy.enabled is
+# false, exercising qualified-rebuild Chroma mode and --no-prune.
+images:
+  admin:
+    registry: registry.example.test
+    repository: openmettle/admin
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  postgresClient:
+    registry: registry.example.test
+    repository: library/postgres
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+database:
+  backup:
+    existingSecret: openmettle-backup-database
+networkPolicy:
+  enabled: false
+vault:
+  enabled: true
+  existingSecret: example-vault-keys
+backup:
+  enabled: true
+  existingKeysSecret: example-backup-keys
+  destination:
+    existingClaim: example-backup-destination
+    domain: nas.example.test/openmettle
+    requireSeparateDevice: false
+  operatorId: 00000000-0000-4000-8000-000000000001
+  releaseOnSuccess: false
+  retention:
+    prune: false
+    daily: 7
+    weekly: 4
+    monthly: 3
+  chroma:
+    mode: qualified-rebuild
+    qualificationRef: qual-2026-11-27-chroma-rebuild
