@@ -499,7 +499,7 @@ UPDATE openmettle.login_providers p
   ) target
  WHERE r.id = target.id;
 
-DO $$
+DO $restore$
 DECLARE
     rec RECORD;
     seq bigint;
@@ -546,7 +546,7 @@ BEGIN
         );
     END LOOP;
 END
-$$;
+$restore$;
 
 SELECT count(*)
   FROM openmettle.runs
@@ -568,6 +568,40 @@ SELECT openmettle.quota_release_terminal_runs(
     )
 );
 """
+
+
+def build_step5e_script(
+    operator_id: str,
+    restore_run_id: str,
+    *,
+    has_artifacts: bool,
+    artifacts_mount: str = smoke.ARTIFACTS_MOUNT_PATH,
+    unpacked_dir: str = UNPACKED_DIR,
+) -> str:
+    """Build the Step 5e shell script so `unpacked_dir` is scrubbed ONLY after
+    `backup release-maintenance` succeeds, `backup status` reports `"maintenance_active": false`,
+    and `quota verify` reports zero across all seven drift counters."""
+    for label, val in (("operator_id", operator_id), ("restore_run_id", restore_run_id)):
+        if not smoke.UUID.fullmatch(val):
+            raise DrillFailure(f"invalid {label} UUID: {val!r}")
+    qv_cmd = f'openmettle-admin quota verify "{artifacts_mount}"' if has_artifacts else "openmettle-admin quota verify"
+    zero_line = (
+        "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
+        "pending gateway 0, file mismatches 0, quarantined 0, unsettled payloads 0"
+    )
+    return (
+        "set -eu\n"
+        "openmettle-admin backup release-maintenance "
+        f'--operator-id "{operator_id}" --request-key "drill-release-maint-{restore_run_id}" '
+        '--reason "isolated restore pre-worker reconciliation complete" --abort-active-run\n'
+        'status_json="$(openmettle-admin backup status)"\n'
+        'printf "BACKUP_STATUS_BEGIN\\n%s\\nBACKUP_STATUS_END\\n" "$status_json"\n'
+        'printf "%s\\n" "$status_json" | grep -Eq \'"maintenance_active"[[:space:]]*:[[:space:]]*false\'\n'
+        f'quota_out="$({qv_cmd})"\n'
+        'printf "QUOTA_VERIFY_BEGIN\\n%s\\nQUOTA_VERIFY_END\\n" "$quota_out"\n'
+        f'printf "%s\\n" "$quota_out" | grep -Fxq \'{zero_line}\'\n'
+        f'rm -rf "{unpacked_dir}"\n'
+    )
 
 
 def seed_users_sql(
@@ -1917,6 +1951,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             pg_gap_script = (
                 "umask 077\n"
                 "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
+                "trap 'rm -f \"$PGPASSFILE\"' EXIT\n"
                 'owner_pw="${OWNER_DB_URL#*://openmettle_owner:}"\n'
                 'owner_pw="${owner_pw%%@*}"\n'
                 'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
@@ -1925,7 +1960,6 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                 "pg_restore --format=custom --no-owner --exit-on-error "
                 f'--host="{target_pg_host}" --port=5432 --username=openmettle_owner --dbname={GAP_DB_NAME} '
                 f'"{UNPACKED_DIR}/pg.dump"\n'
-                'rm -f "$PGPASSFILE"\n'
                 f'printf "GAP_JOURNAL_BEGIN\\n"; cat "{UNPACKED_DIR}/deletion-journal.bin"; printf "GAP_JOURNAL_END\\n"\n'
             )
             pg_gap_job = {
@@ -2236,6 +2270,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         pg_restore_script = (
             "umask 077\n"
             "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
+            "trap 'rm -f \"$PGPASSFILE\"' EXIT\n"
             'owner_pw="${OWNER_DB_URL#*://openmettle_owner:}"\n'
             'owner_pw="${owner_pw%%@*}"\n'
             'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
@@ -2244,7 +2279,6 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "pg_restore --format=custom --no-owner --exit-on-error "
             f'--host="{target_pg_host}" --port=5432 --username=openmettle_owner --dbname=openmettle '
             f'"{UNPACKED_DIR}/pg.dump"\n'
-            'rm -f "$PGPASSFILE"\n'
             'echo "pg_restore.completed"\n'
         )
         pg_restore_job = {
@@ -2462,6 +2496,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         owner_sql_script = (
             "umask 077\n"
             "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
+            "trap 'rm -f \"$PGPASSFILE\"' EXIT\n"
             'owner_pw="${OWNER_DB_URL#*://openmettle_owner:}"\n'
             'owner_pw="${owner_pw%%@*}"\n'
             'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
@@ -2471,7 +2506,6 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f'-h "{target_pg_host}" -p 5432 -U openmettle_owner -d openmettle <<\'EOSQL\'\n'
             f"{sql_text}\n"
             "EOSQL\n"
-            'rm -f "$PGPASSFILE"\n'
         )
         owner_sql_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -2506,6 +2540,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         worker_sql_script = (
             "umask 077\n"
             "export PGPASSFILE=/tmp/pgpass PGSSLMODE=disable PGGSSENCMODE=disable\n"
+            "trap 'rm -f \"$PGPASSFILE\"' EXIT\n"
             'worker_pw="${WORKER_DB_URL#*://openmettle_worker:}"\n'
             'worker_pw="${worker_pw%%@*}"\n'
             'esc() { printf "%s" "$1" | sed \'s/[\\\\:]/\\\\&/g\'; }\n'
@@ -2515,7 +2550,6 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f'-h "{target_pg_host}" -p 5432 -U openmettle_worker -d openmettle <<\'EOSQL\'\n'
             f"{worker_sql_text}\n"
             "EOSQL\n"
-            'rm -f "$PGPASSFILE"\n'
         )
         worker_sql_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -2546,15 +2580,10 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
                     f"expected 1 eligible terminal-run quota reservation released by worker, got {w_sql_out!r}")
 
         # Step 5e (LAST before starting workloads): release snapshot maintenance using restore_run_id-bound
-        # request key, verify `backup status` reports `maintenance_active: false`, re-verify zero drift, scrub unpacked dir.
-        qv_arg = f' "{smoke.ARTIFACTS_MOUNT_PATH}"' if has_artifacts else ""
-        step5e_script = (
-            "openmettle-admin backup release-maintenance "
-            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-release-maint-{restore_run_id}" '
-            '--reason "isolated restore pre-worker reconciliation complete" --abort-active-run\n'
-            'printf "BACKUP_STATUS_BEGIN\\n"; openmettle-admin backup status; printf "BACKUP_STATUS_END\\n"\n'
-            f'printf "QUOTA_VERIFY_BEGIN\\n"; openmettle-admin quota verify{qv_arg}; printf "QUOTA_VERIFY_END\\n"\n'
-            f'rm -rf "{UNPACKED_DIR}"\n'
+        # request key, verify `backup status` reports `maintenance_active: false` and all 7 `quota verify`
+        # drift counters equal `0` BEFORE scrubbing unpacked dir.
+        step5e_script = build_step5e_script(
+            DRILL_OPERATOR_ID, restore_run_id, has_artifacts=has_artifacts
         )
         step5e_job = {
             "apiVersion": "batch/v1", "kind": "Job",

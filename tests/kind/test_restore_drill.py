@@ -197,14 +197,115 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         self.assertIn("SET last_event_sequence = last_event_sequence + 1", owner_sql)
         self.assertIn("access_generation = access_generation + 1", owner_sql)
         self.assertNotIn("quota_release_terminal_runs", owner_sql)
+        self.assertIn("DO $restore$", owner_sql)
+        self.assertIn("$restore$;", owner_sql)
+        self.assertNotIn("$$", owner_sql)
 
         worker_sql = restore_drill.worker_quota_release_sql()
         self.assertIn("openmettle.quota_release_terminal_runs", worker_sql)
+        self.assertNotIn("$$", worker_sql)
 
         sess_sql = restore_drill.fresh_post_restore_session_sql(
             restore_drill.USER_A_IDS, "A" * 43, "B" * 43, "a" * 64, "target-a"
         )
         self.assertIn("SELECT access_generation FROM openmettle.local_identity_approvals", sess_sql)
+
+    def test_step5e_script_preserves_staging_on_nonzero_drift_or_active_maintenance(self):
+        run_id = "77777777-7777-4777-8777-777777777777"
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        admin_stub = bin_dir / "openmettle-admin"
+        env_base = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+
+        def write_stub(maint_active: str, quota_line: str) -> None:
+            admin_stub.write_text(
+                "#!/bin/sh\n"
+                'case "$1 $2" in\n'
+                '  "backup release-maintenance") exit 0 ;;\n'
+                f'  "backup status") printf \'{{"maintenance_active": {maint_active}}}\\n\' ;;\n'
+                '  "quota verify")\n'
+                '    printf "%s\\n" "$*" > "' + str(tmp / "qv-args") + '"\n'
+                f'    printf "{quota_line}\\n"\n'
+                "    exit 0\n"
+                "    ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            admin_stub.chmod(0o755)
+
+        unpacked = tmp / "unpacked"
+        unpacked.mkdir()
+        (unpacked / "manifest.json").write_text("{}", encoding="utf-8")
+        script_pinned = restore_drill.build_step5e_script(
+            restore_drill.DRILL_OPERATOR_ID, run_id, has_artifacts=True, unpacked_dir=str(unpacked)
+        )
+
+        # Case 1: quota verify exits 0 with pending gateway 1 -> Job MUST fail and preserve unpacked!
+        write_stub(
+            "false",
+            "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
+            "pending gateway 1, file mismatches 0, quarantined 0, unsettled payloads 0",
+        )
+        res_drift = subprocess.run(["/bin/sh", "-c", script_pinned], env=env_base, capture_output=True, text=True)
+        self.assertNotEqual(res_drift.returncode, 0)
+        self.assertTrue((unpacked / "manifest.json").exists(), "staging prematurely scrubbed despite pending gateway 1")
+
+        # Case 2: maintenance_active still true -> Job MUST fail and preserve unpacked!
+        write_stub(
+            "true",
+            "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
+            "pending gateway 0, file mismatches 0, quarantined 0, unsettled payloads 0",
+        )
+        res_maint = subprocess.run(["/bin/sh", "-c", script_pinned], env=env_base, capture_output=True, text=True)
+        self.assertNotEqual(res_maint.returncode, 0)
+        self.assertTrue((unpacked / "manifest.json").exists(), "staging prematurely scrubbed despite maintenance_active=true")
+
+        # Case 3: maintenance_active=false and all 7 counters=0 -> Job exits 0 and scrubs unpacked!
+        write_stub(
+            "false",
+            "storage mismatches 0, budget mismatches 0, settlement mismatches 0, "
+            "pending gateway 0, file mismatches 0, quarantined 0, unsettled payloads 0",
+        )
+        res_ok = subprocess.run(["/bin/sh", "-c", script_pinned], env=env_base, capture_output=True, text=True)
+        self.assertEqual(res_ok.returncode, 0, res_ok.stderr)
+        self.assertFalse(unpacked.exists(), "staging was not scrubbed after clean release and zero drift")
+        self.assertIn(smoke.ARTIFACTS_MOUNT_PATH, (tmp / "qv-args").read_text(encoding="utf-8"))
+
+        # Case 4: storage-disabled (has_artifacts=False) omits root path argument!
+        unpacked.mkdir()
+        script_no_art = restore_drill.build_step5e_script(
+            restore_drill.DRILL_OPERATOR_ID, run_id, has_artifacts=False, unpacked_dir=str(unpacked)
+        )
+        res_no_art = subprocess.run(["/bin/sh", "-c", script_no_art], env=env_base, capture_output=True, text=True)
+        self.assertEqual(res_no_art.returncode, 0, res_no_art.stderr)
+        self.assertEqual((tmp / "qv-args").read_text(encoding="utf-8").strip(), "quota verify")
+
+    def test_runbook_step3_pg_restore_failure_is_not_masked_and_cleans_pgpassfile(self):
+        runbook = (smoke.ROOT / "docs" / "restore-drill.md").read_text(encoding="utf-8")
+        step3_section = runbook.split("## Step 3", 1)[1].split("## Step 4", 1)[0]
+        step3_sh = step3_section.split("```sh\n", 1)[1].split("\n```", 1)[0]
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        pgpass = tmp / "pgpass"
+        pg_restore_stub = bin_dir / "pg_restore"
+        pg_restore_stub.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        pg_restore_stub.chmod(0o755)
+        adapted = step3_sh.replace("export PGPASSFILE=/tmp/pgpass", f'export PGPASSFILE="{pgpass}"')
+        env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            "PGHOST": "postgres.example.test",
+            "OWNER_PASSWORD": "sec:ret\\pw",
+        }
+        res = subprocess.run(["/bin/sh", "-c", adapted], env=env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1, "Step 3 masked pg_restore failure")
+        self.assertFalse(pgpass.exists(), "EXIT trap did not remove PGPASSFILE after pg_restore failure")
 
 
 class ChartAndManifestValuesTest(unittest.TestCase):
@@ -805,13 +906,75 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.assertTrue(any(i["kind"] == "Deployment" for i in self.applied_manifests[1]["items"]))
         # Shared project artifact must be downloaded and verified by BOTH owner (cookie_a2) and Viewer (cookie_b2):
         self.assertEqual(self.shared_artifact_readers, [self._cookie_a2, self._cookie_b2])
-        # Runbook invariants: recoverable payload check before declare-lost, OPENMETTLE_ADMIN_DATABASE_URL,
-        # PGSSLMODE=verify-full + PGSSLROOTCERT + PGGSSENCMODE=disable, and Step 5e set -eu + maintenance_active==false gate.
+        # Simulate Kubernetes kubelet ExpandContainerCommandOnlyStatic across EVERY container and initContainer
+        # command/args in every applied manifest so `$$` -> `$` or `$(ENV_VAR)` can never silently mutate scripts/SQL.
+        def k8s_expand(arg: str, env_names: set[str]) -> str:
+            out: list[str] = []
+            i = 0
+            while i < len(arg):
+                if arg[i] == "$" and i + 1 < len(arg):
+                    if arg[i + 1] == "$":
+                        out.append("$")
+                        i += 2
+                        continue
+                    if arg[i + 1] == "(":
+                        end = arg.find(")", i + 2)
+                        if end != -1:
+                            var_name = arg[i + 2:end]
+                            if var_name in env_names:
+                                out.append(f"<expanded:{var_name}>")
+                                i = end + 1
+                                continue
+                out.append(arg[i])
+                i += 1
+            return "".join(out)
+
+        def iter_pod_specs(doc: dict):
+            kind = doc.get("kind")
+            if kind == "List":
+                for item in doc.get("items", ()):
+                    yield from iter_pod_specs(item)
+            elif kind == "Pod":
+                yield doc["metadata"]["name"], doc["spec"]
+            elif kind in ("Deployment", "Job"):
+                yield doc["metadata"]["name"], doc["spec"]["template"]["spec"]
+
+        pre_worker_delivered_sql = None
+        for manifest in self.applied_manifests:
+            for owner_name, pod_spec in iter_pod_specs(manifest):
+                for c in (*pod_spec.get("initContainers", ()), *pod_spec.get("containers", ())):
+                    env_names = {e["name"] for e in c.get("env", ())}
+                    for field in ("command", "args"):
+                        for raw_arg in c.get(field, ()):
+                            expanded = k8s_expand(raw_arg, env_names)
+                            self.assertEqual(
+                                expanded, raw_arg,
+                                f"Kubernetes command expansion mutated {owner_name}/{c['name']} {field}",
+                            )
+                            if owner_name == "openmettle-drill-pre-worker-sql" and "EOSQL" in expanded:
+                                pre_worker_delivered_sql = expanded.split("<<'EOSQL'\n", 1)[1].rsplit("\nEOSQL\n", 1)[0]
+        self.assertIsNotNone(pre_worker_delivered_sql)
+        self.assertIn("DO $restore$", pre_worker_delivered_sql)
+        self.assertIn("$restore$;", pre_worker_delivered_sql)
+        self.assertNotIn("DO $\n", pre_worker_delivered_sql)
+
+        # Runbook invariants: recoverable payload check before declare-lost, OPENMETTLE_ADMIN_DATABASE_URL bound via
+        # database.migrate.existingSecret + database.migrate.key, /etc/openmettle/db-ca/ca.crt with O_NOFOLLOW staging,
+        # tagged $restore$ SQL delimiter, and Step 5e storage-disabled branch + set -eu + maintenance_active==false gate.
         runbook = (smoke.ROOT / "docs" / "restore-drill.md").read_text(encoding="utf-8")
         self.assertIn("OPENMETTLE_ADMIN_DATABASE_URL", runbook)
+        self.assertIn("database.migrate.key", runbook)
+        self.assertNotIn("(key: url)", runbook)
+        self.assertNotIn("database.migrate.existingSecret, key `url`", runbook)
+        self.assertIn("/etc/openmettle/db-ca/ca.crt", runbook)
+        self.assertNotIn("/etc/openmettle/pg-ca", runbook)
+        self.assertIn("O_NOFOLLOW", runbook)
         self.assertIn("PGSSLMODE=verify-full", runbook)
         self.assertIn("PGSSLROOTCERT=", runbook)
         self.assertIn("PGGSSENCMODE=disable", runbook)
+        self.assertIn("DO $restore$", runbook)
+        self.assertNotIn("DO $$", runbook)
+        self.assertIn("ARTIFACT_VOLUME_ID", runbook)
         self.assertIn("sha256sum", runbook)
         self.assertIn('"maintenance_active"[[:space:]]*:[[:space:]]*false', runbook)
         # Verify uncertified coverage-gap scenario was also exercised:

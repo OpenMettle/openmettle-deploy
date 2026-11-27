@@ -19,6 +19,7 @@ This runbook defines the repeatable Kubernetes recovery and isolated-target rest
 Stage **both** the backup keyring (`/etc/openmettle/backup-keys`) and the target vault keyring (`/etc/openmettle/vault-keys`) via `Memory` `emptyDir` `initContainer`s writing `0400` files owned by UID `65532` and mounted `readOnly: true` with `subPath: keys`, mount the backup destination PVC `readOnly: true`, mount an isolated scratch PVC at `/var/recovery`, and export `OPENMETTLE_API_VAULT_KEYS_CONFIG` so `BackupKeyRing::load_from_config` enforces backup/vault key separation during preflight:
 
 ```sh
+set -eu
 export OPENMETTLE_API_VAULT_KEYS_CONFIG=/etc/openmettle/vault-keys/keyring.json
 
 # 1. Verify backup-meta.json, backup/vault key separation, encrypted manifest, and AEAD stream tags.
@@ -67,14 +68,16 @@ REVOKE ALL ON SCHEMA public FROM PUBLIC;
 
 ## Step 3 — Restore PostgreSQL dump and run `openmettle-migrate`
 
-1. Restore `/var/recovery/unpacked/pg.dump` as `openmettle_owner` using PostgreSQL 18 `pg_restore` from the publisher-pinned `postgresClient` image. Mount the isolated target PostgreSQL CA bundle (`database.caBundle`, e.g. `/etc/openmettle/pg-ca/ca.crt`), enforce server identity verification (`PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/pg-ca/ca.crt`, `PGGSSENCMODE=disable`; `PGSSLMODE=disable` is confined strictly to the synthetic `dev`-classified `kind` fixture), and supply credentials exclusively through a `0600` `PGPASSFILE` on a `Memory` `emptyDir` with libpq `\` and `:` escaping — never on the command line:
+1. Restore `/var/recovery/unpacked/pg.dump` as `openmettle_owner` using PostgreSQL 18 `pg_restore` from the publisher-pinned `postgresClient` image. Stage the isolated target PostgreSQL CA bundle (`database.caBundle.configMapName` / `database.caBundle.key`) via an `initContainer` (`cp -L /run/openmettle-db-ca-src/ca.crt /run/openmettle-db-ca-stage/ca.crt && chmod 0444 /run/openmettle-db-ca-stage/ca.crt` into a `Memory` `emptyDir`, matching `templates/backup-cronjob.yaml`) mounted `readOnly: true` at the exact `sslrootcert` path referenced by the target owner URL (`/etc/openmettle/db-ca/ca.crt` when rendered by `database.caBundle`; `openmettle-admin backup status` and `backup release-maintenance` open `sslrootcert` with `O_NOFOLLOW` and refuse `ConfigMap` symlinks). Enforce server identity verification (`PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/db-ca/ca.crt` matching that `sslrootcert` path, `PGGSSENCMODE=disable`; `PGSSLMODE=disable` is confined strictly to the synthetic `dev`-classified `kind` fixture), supply credentials exclusively through a `0600` `PGPASSFILE` on a `Memory` `emptyDir` with libpq `\` and `:` escaping — never on the command line — and clean up `PGPASSFILE` via an `EXIT` trap under `set -eu` so a `pg_restore` failure is never masked:
 
 ```sh
+set -eu
 umask 077
 export PGPASSFILE=/tmp/pgpass
 export PGSSLMODE=verify-full
-export PGSSLROOTCERT=/etc/openmettle/pg-ca/ca.crt
+export PGSSLROOTCERT="${PGSSLROOTCERT:-/etc/openmettle/db-ca/ca.crt}"
 export PGGSSENCMODE=disable
+trap 'rm -f "$PGPASSFILE"' EXIT
 esc() { printf '%s' "$1" | sed 's/[\\:]/\\&/g'; }
 printf '%s:%s:openmettle:openmettle_owner:%s\n' \
   "$(esc "$PGHOST")" "$(esc "${PGPORT:-5432}")" "$(esc "$OWNER_PASSWORD")" > "$PGPASSFILE"
@@ -89,7 +92,6 @@ pg_restore \
   --username=openmettle_owner \
   --dbname=openmettle \
   /var/recovery/unpacked/pg.dump
-rm -f "$PGPASSFILE"
 ```
 
 2. Run `openmettle-migrate` (`OPENMETTLE_MIGRATE_DATABASE_URL` = target `openmettle_owner` URL) so any forward migrations between `manifest.json`'s `schema_version` and `CORE_COMMIT` apply cleanly, role boundaries (`src/boundaries.sql`) are verified, and global/schema owner default-ACL revocations (`pg_default_acl` `defaclnamespace = 0`) are re-established.
@@ -101,13 +103,13 @@ rm -f "$PGPASSFILE"
 
 ### 4a. Bind `OPENMETTLE_ADMIN_DATABASE_URL`, choose `SELECTED_JOURNAL`, and lock `restore_reconciliation_gate`
 
-`openmettle-admin` database subcommands read `OPENMETTLE_ADMIN_DATABASE_URL` (separate from `OPENMETTLE_MIGRATE_DATABASE_URL`). Bind `OPENMETTLE_ADMIN_DATABASE_URL` in the recovery Job from the isolated target's `openmettle_owner` Secret (`database.migrate.existingSecret`, key `url`) for Steps 4a–4d, 5c, 5e, and 6, and carry a single verified journal export file (`SELECTED_JOURNAL` — either a newer off-host `openmettle-admin journal export` file from the same installation `origin`, or `/var/recovery/unpacked/deletion-journal.bin`) through both `restore lock` and `restore replay`:
+`openmettle-admin` database subcommands read `OPENMETTLE_ADMIN_DATABASE_URL` (separate from `OPENMETTLE_MIGRATE_DATABASE_URL`). Bind `OPENMETTLE_ADMIN_DATABASE_URL` in the recovery Job via `secretKeyRef` from **both** `database.migrate.existingSecret` and `database.migrate.key` (default `url`; or `database.backup.existingSecret` / `database.backup.key`), stage `database.caBundle` as a regular `0444` file at the owner URL's `sslrootcert` path (`/etc/openmettle/db-ca/ca.crt` when `database.caBundle.enabled` is `true`, required for `O_NOFOLLOW` TLS verification in `backup status` and `backup release-maintenance`), for Steps 4a–4d, 5c, 5e, and 6, and carry a single verified journal export file (`SELECTED_JOURNAL` — either a newer off-host `openmettle-admin journal export` file from the same installation `origin`, or `/var/recovery/unpacked/deletion-journal.bin`) through both `restore lock` and `restore replay`:
 
 - **When to pass `--export-complete`:** Pass `--export-complete` on `restore lock` **only** when `SELECTED_JOURNAL`'s `(seq, digest)` matches an independently recorded final `(journal_seq, chain_digest)` watermark captured *after* all primary writes, purges, and external-connection revocations stopped (for example, a clean maintenance-window backup with zero post-backup primary writes before loss, or a fresh `openmettle-admin journal export` taken from an intact stopped/fenced primary). Never pass `--export-complete` merely because an external export has a higher `seq` than the backup.
 - **When post-export primary activity cannot be ruled out:** Whenever writes, purges, or connection revocations could have occurred on primary *after* `SELECTED_JOURNAL` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock`, record the printed `restore_run <RESTORE_RUN_UUID>`, and run audited break-glass acceptance before opening the gate (per `ADR 0045`, `restore accept-coverage-gap` also conservatively transitions `authorized` external connections to `reauth_required`, clears encrypted tokens, and deactivates active connection shares):
 
 ```sh
-# OPENMETTLE_ADMIN_DATABASE_URL bound from isolated target database.migrate.existingSecret (key: url)
+# OPENMETTLE_ADMIN_DATABASE_URL bound via secretKeyRef {name: database.migrate.existingSecret, key: database.migrate.key}
 openmettle-admin restore accept-coverage-gap \
   --restore-run "$RESTORE_RUN_UUID" \
   --operator-id "$OPERATOR_UUID" \
@@ -118,7 +120,7 @@ openmettle-admin restore accept-coverage-gap \
 Read the header and footer lines of `SELECTED_JOURNAL` (`origin <ORIGIN_US>`, optional paired `lifecycle_origin <LC_US>` + `lifecycle_baseline <LB_HEX>`, optional `connection_origin <CO_US>`, and `watermark <ORIGIN_US> <REQUIRED_SEQ> <REQUIRED_DIGEST_HEX> <EXPORTED_US>`), lock the gate, and record the printed `restore_run <RESTORE_RUN_UUID>` (also used in Step 5e):
 
 ```sh
-# OPENMETTLE_ADMIN_DATABASE_URL bound from isolated target database.migrate.existingSecret (key: url).
+# OPENMETTLE_ADMIN_DATABASE_URL bound via secretKeyRef {name: database.migrate.existingSecret, key: database.migrate.key}.
 # Include --export-complete ONLY when (REQUIRED_SEQ, REQUIRED_DIGEST_HEX) is certified complete after primary quiescence.
 openmettle-admin restore lock \
   --required-origin "$ORIGIN_US" \
@@ -135,6 +137,7 @@ openmettle-admin restore lock \
 - **Pinned artifact volume (`manifest.artifact_volume.volume_id` is non-null):** copy the entries inside `/var/recovery/unpacked/artifacts/` onto the empty target artifact PVC (`/var/lib/openmettle/artifacts`, owned by UID/GID `65532`) and run `storage rebind` (`ADR 0040`):
 
 ```sh
+set -eu
 for entry in /var/recovery/unpacked/artifacts/* /var/recovery/unpacked/artifacts/.[!.]*; do
   [ -e "$entry" ] || continue
   cp -a -- "$entry" /var/lib/openmettle/artifacts/
@@ -206,6 +209,7 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
 - **Pinned artifact volume (`manifest.artifact_volume.volume_id` is non-null):**
 
 ```sh
+set -eu
 openmettle-admin restore replay "$SELECTED_JOURNAL" /var/lib/openmettle/artifacts
 openmettle-admin quota verify /var/lib/openmettle/artifacts
 ```
@@ -213,6 +217,7 @@ openmettle-admin quota verify /var/lib/openmettle/artifacts
 - **Storage-disabled deployment (`manifest.artifact_volume.volume_id` is `null`):**
 
 ```sh
+set -eu
 openmettle-admin restore replay "$SELECTED_JOURNAL"
 openmettle-admin quota verify
 ```
@@ -228,7 +233,7 @@ Complete every item below **before** releasing maintenance, starting `openmettle
 
 ### 5a. Invalidate all restored sessions and pending OIDC logins (`ADR 0013`)
 
-Enumerate **every** provider in `openmettle.login_providers` (not only those in the current `auth.json`). Preserve retired providers (`latest revision IS NULL`), reapply any post-backup provider retirements via `ADR 0013`'s `retire` protocol (`access_generation + 1` and a `NULL` revision tombstone epoch), and for every remaining active provider append a fresh non-retirement epoch and advance `access_generation` in one `openmettle_owner` transaction (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT`, and `PGGSSENCMODE=disable`):
+Enumerate **every** provider in `openmettle.login_providers` (not only those in the current `auth.json`). Preserve retired providers (`latest revision IS NULL`), reapply any post-backup provider retirements via `ADR 0013`'s `retire` protocol (`access_generation + 1` and a `NULL` revision tombstone epoch), and for every remaining active provider append a fresh non-retirement epoch and advance `access_generation` in one `openmettle_owner` transaction (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE` under an `EXIT` trap, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/db-ca/ca.crt` matching the owner URL's `sslrootcert`, and `PGGSSENCMODE=disable`):
 
 ```sql
 BEGIN;
@@ -292,7 +297,7 @@ openmettle-admin vault rotate \
 
 Coordinated backup capture drains `executing` worker leases before `pg_dump`, while runs parked in `waiting` (such as pending human approvals in `openmettle.run_approvals` or revision-`0` two-phase external write `intent` rows in `openmettle.operations`) and `queued` runs remain non-terminal in the snapshot.
 
-1. **As `openmettle_owner`** (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT`, and `PGGSSENCMODE=disable`), cancel non-terminal runs first (which fires `AFTER UPDATE OF state` trigger `openmettle.resolve_terminal_write_intents()`, transitioning every revision-`0` write `intent` to `outcome = 'outcome_unknown', revision = 1` and allocating `unresolved-write:<operation_id>` via `runs.last_event_sequence`), and then in a second statement allocate contiguous `run-terminal` events through `runs.last_event_sequence`:
+1. **As `openmettle_owner`** (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE` under an `EXIT` trap, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/db-ca/ca.crt` matching the owner URL's `sslrootcert`, and `PGGSSENCMODE=disable`), cancel non-terminal runs first (which fires `AFTER UPDATE OF state` trigger `openmettle.resolve_terminal_write_intents()`, transitioning every revision-`0` write `intent` to `outcome = 'outcome_unknown', revision = 1` and allocating `unresolved-write:<operation_id>` via `runs.last_event_sequence`), and then in a second statement allocate contiguous `run-terminal` events through `runs.last_event_sequence` (using a tagged `$restore$` delimiter so Kubernetes container `command`/`args` `$$` expansion cannot corrupt the block):
 
 ```sql
 BEGIN;
@@ -313,7 +318,7 @@ UPDATE openmettle.runs r
   ) target
  WHERE r.id = target.id;
 
-DO $$
+DO $restore$
 DECLARE
     rec RECORD;
     seq bigint;
@@ -360,11 +365,11 @@ BEGIN
         );
     END LOOP;
 END
-$$;
+$restore$;
 COMMIT;
 ```
 
-2. **As `openmettle_worker`** (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT`, and `PGGSSENCMODE=disable`; `openmettle.quota_release_terminal_runs(uuid[])` enforces `session_user` membership in `openmettle_api` or `openmettle_worker` and automatically retains holds on runs with `intent` / `outcome_unknown` operations), unwind held run-level quota reservations on eligible terminal runs:
+2. **As `openmettle_worker`** (`psql -X -w -v ON_ERROR_STOP=1` with `PGPASSFILE` under an `EXIT` trap, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/openmettle/db-ca/ca.crt` matching `database.worker`'s `sslrootcert`, and `PGGSSENCMODE=disable`; `openmettle.quota_release_terminal_runs(uuid[])` enforces `session_user` membership in `openmettle_api` or `openmettle_worker` and automatically retains holds on runs with `intent` / `outcome_unknown` operations), unwind held run-level quota reservations on eligible terminal runs:
 
 ```sql
 SELECT openmettle.quota_release_terminal_runs(
@@ -379,7 +384,7 @@ SELECT openmettle.quota_release_terminal_runs(
 
 ### 5e. Release snapshot maintenance gate, assert `maintenance_active == false` and zero drift, then scrub staging
 
-Run `backup release-maintenance` **last** (after Steps 5a–5d complete), binding `--request-key` to `RESTORE_RUN_UUID` so a repeated recovery against a backup carrying an earlier recovery's `authorization_audit` row never short-circuits as an idempotent replay. Do **not** scrub `/var/recovery/unpacked` or proceed to Step 6 workload startup unless `backup release-maintenance` exits `0`, `openmettle-admin backup status` literally reports `"maintenance_active": false`, and `openmettle-admin quota verify` exits `0` with all seven mismatch counters equal to `0`:
+Run `backup release-maintenance` **last** (after Steps 5a–5d complete, with `database.caBundle` staged as a regular file at the owner URL's `sslrootcert` path when TLS CA verification is enabled), binding `--request-key` to `RESTORE_RUN_UUID` so a repeated recovery against a backup carrying an earlier recovery's `authorization_audit` row never short-circuits as an idempotent replay. Do **not** scrub `/var/recovery/unpacked` or proceed to Step 6 workload startup unless `backup release-maintenance` exits `0`, `openmettle-admin backup status` literally reports `"maintenance_active": false`, and `openmettle-admin quota verify` (passing `/var/lib/openmettle/artifacts` when `manifest.artifact_volume.volume_id` is non-null, or omitting the root argument on storage-disabled deployments where `manifest.artifact_volume.volume_id` is `null`) exits `0` with all seven mismatch counters equal to `0`:
 
 ```sh
 set -eu
@@ -393,8 +398,12 @@ status_json="$(openmettle-admin backup status)"
 printf '%s\n' "$status_json"
 printf '%s\n' "$status_json" | grep -Eq '"maintenance_active"[[:space:]]*:[[:space:]]*false'
 
-# Include /var/lib/openmettle/artifacts when manifest.artifact_volume.volume_id is non-null:
-quota_out="$(openmettle-admin quota verify /var/lib/openmettle/artifacts)"
+# ARTIFACT_VOLUME_ID from Step 1 (manifest.artifact_volume.volume_id; empty or "null" when storage is disabled):
+if [ -n "${ARTIFACT_VOLUME_ID:-}" ] && [ "$ARTIFACT_VOLUME_ID" != "null" ]; then
+  quota_out="$(openmettle-admin quota verify /var/lib/openmettle/artifacts)"
+else
+  quota_out="$(openmettle-admin quota verify)"
+fi
 printf '%s\n' "$quota_out"
 printf '%s\n' "$quota_out" | grep -Fxq \
   'storage mismatches 0, budget mismatches 0, settlement mismatches 0, pending gateway 0, file mismatches 0, quarantined 0, unsettled payloads 0'
