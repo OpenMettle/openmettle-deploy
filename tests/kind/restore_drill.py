@@ -1366,6 +1366,10 @@ def target_isolation_probe_plan() -> list[dict]:
             "target worker denied egress to primary gateway on 8082",
             TARGET_APP_NS, f"{FULLNAME}-worker", "worker", gw_readyz, "deny", primary_gw_ctrl, is_http=True,
         ),
+        probe(
+            "target db pod denied egress to primary gateway on 8082",
+            TARGET_DB_NS, "postgres", "postgres", gw_readyz, "deny", primary_gw_ctrl, is_http=True,
+        ),
     ]
 
 
@@ -3056,7 +3060,17 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             self.expect(json.loads(stale_decision).get("code") == "conflict",
                         f"stale approval decision did not fail with 409 conflict: {stale_decision!r}")
 
-            # 8. Execute one fresh post-restore inference turn on target to prove live runtime health.
+            # 8. Verify the pre-backup completed run's 18-token settlement survived restore on target,
+            #    then execute one fresh post-restore inference turn to prove live runtime health.
+            restored_settlement = smoke.evaluate_settled_round(
+                self.psql_superuser(TARGET_DB_NS, smoke.settled_round_sql(primary_state["completed_run_id"]))
+            )
+            self.expect(
+                restored_settlement is not None
+                and restored_settlement.get("settled_units") == smoke.STANDIN_EXPECTED_SETTLED_UNITS,
+                f"restored completed run settlement missing or mismatched on target: {restored_settlement!r}",
+            )
+
             post_conv = self.api_json(fwd.port, cookie_a2, "POST", "/v1/conversations", 201,
                                       key="drill-post-restore-conv", json_body={})
             post_run = self.api_json(fwd.port, cookie_a2, "POST", "/v1/runs", 201,

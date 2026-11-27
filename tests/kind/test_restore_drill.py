@@ -628,6 +628,27 @@ class ChartAndManifestValuesTest(unittest.TestCase):
                 mock.patch("sys.stderr"):
             self.assertEqual(restore_drill.main(["--core-dir", str(tmp)]), 3)
 
+    def test_isolation_probe_plan_denies_both_target_namespaces_to_both_primary_endpoints(self):
+        plan = restore_drill.target_isolation_probe_plan()
+        controls = {p["name"]: p for p in plan if p["expect"] == "connect"}
+        db_ctrl = next(n for n in controls if "PostgreSQL" in n)
+        gw_ctrl = next(n for n in controls if "gateway" in n)
+        denies = {(p["namespace"], p["workload"], p["control"]): p for p in plan if p["expect"] == "deny"}
+        self.assertEqual(controls[db_ctrl]["namespace"], restore_drill.PRIMARY_DB_NS)
+        self.assertEqual(controls[gw_ctrl]["namespace"], restore_drill.PRIMARY_APP_NS)
+        self.assertTrue(controls[gw_ctrl]["http"])
+
+        # Both target namespaces (`openmettle-restore-target` and `openmettle-restore-target-db`)
+        # MUST be denied access to BOTH primary PostgreSQL (5432) and primary gateway (8082).
+        for ns, workload in (
+            (restore_drill.TARGET_DB_NS, "postgres"),
+            (restore_drill.TARGET_APP_NS, f"{restore_drill.FULLNAME}-worker"),
+        ):
+            self.assertIn((ns, workload, db_ctrl), denies)
+            self.assertIn((ns, workload, gw_ctrl), denies)
+            self.assertTrue(denies[(ns, workload, gw_ctrl)]["http"])
+        self.assertIn((restore_drill.TARGET_APP_NS, f"{restore_drill.FULLNAME}-api", db_ctrl), denies)
+
 
 class CallableOnlyRunner:
     """Mimics pinned core `Runner`: callable via `__call__` only, with NO `.run` attribute."""
@@ -654,9 +675,11 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.applied_manifests: list[dict] = []
         self.live_objects: set[tuple[str, str, str]] = set()
         self.media_lifecycle: list[str] = []
+        self.target_settlement_events: list[str] = []
         self.fail_on_target_migrate = False
         self.job_failed_on_pre_worker_sql = False
         self.transport_fail_on_epoch_probe = False
+        self.missing_restored_settlement_on_target = False
         self.shared_artifact_readers: list[str] = []
 
     def _make_core(self):
@@ -962,6 +985,14 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if restore_drill.GAP_DB_NAME in argv:
                 return self._res(0, "2|0|0|0|t|1\n")
             if "gateway_requests" in stdin_text:
+                ns = argv[argv.index("--namespace") + 1]
+                if ns == restore_drill.TARGET_DB_NS:
+                    if "bbbb0000-0000-4000-8000-000000000010" in stdin_text:
+                        self.target_settlement_events.append("psql:bbbb0000-0000-4000-8000-000000000010")
+                        if self.missing_restored_settlement_on_target:
+                            return self._res(0, "")
+                    elif "bbbb0000-0000-4000-8000-000000000020" in stdin_text:
+                        self.target_settlement_events.append("psql:bbbb0000-0000-4000-8000-000000000020")
                 return self._res(0, "11111111-1111-4111-8111-111111111111|handed_off|t|t|1|11|7|t|settled|0|18\n")
             if "JOIN openmettle.quota_reservations qr" in stdin_text and "last_event_sequence" in stdin_text:
                 # Realistic pre-backup sequences: waiting_run=4, intent_run=5, each holding 25 usage_tokens.
@@ -1039,7 +1070,12 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "branch_id": "bbbb0000-0000-4000-8000-000000000002",
             }).encode()
         if path == "/v1/runs" and method == "POST":
-            rid = "bbbb0000-0000-4000-8000-000000000010"
+            key = headers.get("Idempotency-Key", "")
+            if key == "drill-post-restore-run":
+                rid = "bbbb0000-0000-4000-8000-000000000020"
+                self.target_settlement_events.append("http:post-restore-run")
+            else:
+                rid = "bbbb0000-0000-4000-8000-000000000010"
             self._post_restore_runs = getattr(self, "_post_restore_runs", 0) + 1
             return 201, v1_hdrs, json.dumps({"run_id": rid, "state": "queued"}).encode()
         if path.startswith("/v1/runs/") and method == "GET":
@@ -1140,6 +1176,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self._leak_secret = "not-yet-set"
         self.live_objects.clear()
         self.media_lifecycle.clear()
+        self.target_settlement_events.clear()
         outer = self
 
         class FakePF:
@@ -1286,6 +1323,22 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             restore_drill.RETAINED_JOURNAL_PATH,
             reconcile_pod["containers"][0]["command"][-1],
         )
+        self.assertEqual(
+            self.target_settlement_events,
+            [
+                "psql:bbbb0000-0000-4000-8000-000000000010",
+                "http:post-restore-run",
+                "psql:bbbb0000-0000-4000-8000-000000000020",
+            ],
+        )
+
+    def test_missing_restored_prebackup_settlement_on_target_fails_before_new_turn(self):
+        self.missing_restored_settlement_on_target = True
+        rc, summary = self._run_drill()
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["result"], "failed")
+        self.assertIn("restored completed run settlement missing", summary["error"])
+        self.assertNotIn("http:post-restore-run", self.target_settlement_events)
 
     def test_trailing_epoch_probe_rejects_unrelated_transport_failure(self):
         self.transport_fail_on_epoch_probe = True
