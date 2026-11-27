@@ -373,33 +373,130 @@ class QuotaVaultManifestAndRpoRtoTest(unittest.TestCase):
         finally:
             sha_stub.unlink()
 
-        # Negative test 3: if any encrypted backup archive copy remains reachable under `recovery_media_dir`,
-        # `storage declare-lost` MUST be refused before executing.
+        # Negative test 3: if the staging revisions directory itself lacks read/search permission
+        # as non-root, directory checks MUST fail closed rather than letting `[ -e "$cand" ]` return
+        # false on an intact file and invoke `storage declare-lost`.
+        rev_dir = unpacked / "artifacts" / "revisions"
+        if os.geteuid() != 0:
+            (artifacts / "revisions" / rec_res).unlink(missing_ok=True)
+            log_file.write_text("", encoding="utf-8")
+            rev_dir.chmod(0o000)
+            try:
+                res_dir_unreadable = subprocess.run(
+                    ["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True
+                )
+            finally:
+                rev_dir.chmod(0o700)
+            self.assertNotEqual(res_dir_unreadable.returncode, 0)
+            self.assertIn("staging revisions directory", res_dir_unreadable.stderr)
+            self.assertIn("inaccessible", res_dir_unreadable.stderr)
+            self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
+
+        # Negative test 4: if any encrypted backup archive copy remains reachable under `recovery_media_dir`,
+        # OR `recovery_media_dir` itself exists but is inaccessible as non-root, `storage declare-lost`
+        # MUST be refused before executing.
         (artifacts / "revisions" / rec_res).unlink(missing_ok=True)
         log_file.write_text("", encoding="utf-8")
         (media / "backup-20261127T090000Z-66666666-6666-4666-8666-666666666666").mkdir(parents=True)
+        if os.geteuid() != 0:
+            log_file.write_text("", encoding="utf-8")
+            media.chmod(0o000)
+            try:
+                res_media_unreadable = subprocess.run(
+                    ["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True
+                )
+            finally:
+                media.chmod(0o700)
+            self.assertNotEqual(res_media_unreadable.returncode, 0)
+            self.assertIn("recovery media directory", res_media_unreadable.stderr)
+            self.assertIn("inaccessible", res_media_unreadable.stderr)
+            self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
         res_avail = subprocess.run(["/bin/sh", "-eu", "-c", script], env=env, capture_output=True, text=True)
         self.assertNotEqual(res_avail.returncode, 0)
         self.assertIn("remains available", res_avail.stderr)
         self.assertNotIn("storage declare-lost", log_file.read_text(encoding="utf-8"))
 
     def test_family_policy_reconcile_lines_validates_and_renders_cli_commands(self):
+        import re as _re
+        import shlex
         run_id = "77777777-7777-4777-8777-777777777777"
-        lines = restore_drill.build_family_policy_reconcile_lines(
+        uid = restore_drill.USER_D_IDS["user"]
+
+        # Model-only post-backup change on an already-restored policy emits ONLY set-model so
+        # existing quiet/study/override schedule fields are preserved untouched.
+        model_only = restore_drill.build_family_policy_reconcile_lines(
             restore_drill.DRILL_OPERATOR_ID,
             run_id,
-            [(restore_drill.USER_D_IDS["user"], "UTC", "a")],
+            [{"user_id": uid, "policy": None, "models": [("disabled", "a", True)]}],
         )
-        self.assertIn(f'openmettle-admin family set-policy --user "{restore_drill.USER_D_IDS["user"]}" --zone "UTC"', lines)
-        self.assertIn('openmettle-admin family set-model --user', lines)
-        self.assertIn('--kind disabled --model "a" --enable', lines)
-        with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy model name"):
-            restore_drill.build_family_policy_reconcile_lines(
-                restore_drill.DRILL_OPERATOR_ID, run_id, [(restore_drill.USER_D_IDS["user"], "UTC", "bad model")]
+        self.assertNotIn("family set-policy", model_only)
+        self.assertIn("openmettle-admin family set-model --user", model_only)
+        self.assertIn("--kind disabled --model 'a' --enable", model_only)
+
+        # Policy + model change passes the complete recorded schedule (--zone, --quiet, --study,
+        # --override-group-schedules) before set-model.
+        full_policy = restore_drill.build_family_policy_reconcile_lines(
+            restore_drill.DRILL_OPERATOR_ID,
+            run_id,
+            [{
+                "user_id": uid,
+                "policy": {
+                    "zone": "Europe/London",
+                    "quiet": "22:00-07:00",
+                    "study": "16:00-18:00",
+                    "override_group_schedules": True,
+                },
+                "models": [("disabled", "a", True)],
+            }],
+        )
+        self.assertIn(
+            f'openmettle-admin family set-policy --user "{uid}" --zone "Europe/London" '
+            '--quiet "22:00-07:00" --study "16:00-18:00" --override-group-schedules',
+            full_policy,
+        )
+        self.assertLess(full_policy.index("family set-policy"), full_policy.index("family set-model"))
+
+        # Boundary tests: valid model names of 31, 32, and 256 UTF-8 bytes (and spaces/quotes) MUST
+        # stay <= 128 bytes for --request-key, remain deterministic per (run, user, kind, model, bit),
+        # and safely round-trip through shlex.split.
+        for model_name in ("m" * 31, "m" * 32, "m" * 256, " padded'model "):
+            cmd_line = restore_drill.build_family_policy_reconcile_lines(
+                restore_drill.DRILL_OPERATOR_ID,
+                run_id,
+                [{"user_id": uid, "policy": None, "models": [("disabled", model_name, True)]}],
             )
+            tokens = shlex.split(cmd_line.strip())
+            self.assertEqual(tokens[tokens.index("--model") + 1], model_name)
+            rkey = tokens[tokens.index("--request-key") + 1]
+            self.assertLessEqual(len(rkey.encode("utf-8")), 128)
+            self.assertRegex(rkey, _re.compile(r"^restore-fm-" + _re.escape(run_id) + r"-[0-9a-f]{32}$"))
+            self.assertEqual(
+                cmd_line,
+                restore_drill.build_family_policy_reconcile_lines(
+                    restore_drill.DRILL_OPERATOR_ID,
+                    run_id,
+                    [{"user_id": uid, "policy": None, "models": [("disabled", model_name, True)]}],
+                ),
+            )
+
+        for bad_model in ("", "m" * 257, "bad\nmodel", "bad\x00model"):
+            with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy model name"):
+                restore_drill.build_family_policy_reconcile_lines(
+                    restore_drill.DRILL_OPERATOR_ID,
+                    run_id,
+                    [{"user_id": uid, "policy": None, "models": [("disabled", bad_model, True)]}],
+                )
         with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy timezone"):
             restore_drill.build_family_policy_reconcile_lines(
-                restore_drill.DRILL_OPERATOR_ID, run_id, [(restore_drill.USER_D_IDS["user"], "UTC;id", "a")]
+                restore_drill.DRILL_OPERATOR_ID,
+                run_id,
+                [{"user_id": uid, "policy": {"zone": "UTC;id"}, "models": []}],
+            )
+        with self.assertRaisesRegex(restore_drill.DrillFailure, "invalid family policy quiet window"):
+            restore_drill.build_family_policy_reconcile_lines(
+                restore_drill.DRILL_OPERATOR_ID,
+                run_id,
+                [{"user_id": uid, "policy": {"zone": "UTC", "quiet": "22:00-22:00"}, "models": []}],
             )
 
     def test_mcp_post_probe_command_shapes_http_post(self):
@@ -757,6 +854,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self.shared_artifact_readers: list[str] = []
         self.mcp_standin_records: list[dict] = []
         self.denied_model_requests: list[str] = []
+        self.forced_run_poll_state: str | None = None
+        self.forced_run_diag_row: str = "failed|||1:run.failed:openmettle.run-failed:{\"reason\":\"test-upstream-timeout\"}"
 
     def _make_core(self):
         outer = self
@@ -1026,8 +1125,10 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             return self._res(0, "100\ncancelled_runs=2\n")
         if name == "openmettle-drill-worker-quota-release":
             return self._res(0, "1\n")
+        if name == "openmettle-drill-primary-family-pre":
+            return self._res(0, "applied family_policy.set\napplied family_policy.model_study_allow\n")
         if name == "openmettle-drill-primary-family-restrict":
-            return self._res(0, "family.set_policy\nfamily.model_disable\n")
+            return self._res(0, "applied family_policy.model_disable\n")
         if name == "openmettle-drill-release-maintenance":
             bs = json.dumps({"maintenance_active": False})
             return self._res(
@@ -1099,10 +1200,24 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 return self._res(0, f"{restore_drill.USER_D_IDS['user']}|{smoke.CATALOG_MODEL}\n")
             if "EXISTS (SELECT 1 FROM openmettle.login_provider_revisions WHERE epoch = 41)" in stdin_text:
                 return self._res(0, "100|0|f\n")
+            if "family_policy_permits(" in stdin_text:
+                return self._res(0, "t\n")
+            if "FROM openmettle.runs r WHERE r.id =" in stdin_text and "openmettle.run_events" in stdin_text:
+                return self._res(0, self.forced_run_diag_row + "\n")
             if "openmettle.operations" in stdin_text:
+                import re as _re
+                pre_job = next(
+                    d for d in self.applied_manifests
+                    if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-primary-family-pre"
+                )
+                pre_cmd = pre_job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+                qm = _re.search(r'--quiet "(\d{2}):(\d{2})-(\d{2}):(\d{2})"', pre_cmd)
+                self.assertIsNotNone(qm)
+                q_start = int(qm.group(1)) * 60 + int(qm.group(2))
+                q_end = int(qm.group(3)) * 60 + int(qm.group(4))
                 return self._res(
                     0,
-                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|t|t|1800000000000000|purged|t|f|"
+                    f"outcome_unknown:1|{restore_drill.target_mcp_url()}|Europe/London:{q_start}:{q_end}:960:1080:t:2|t|1800000000000000|purged|t|f|"
                     "5:5:1:5|run-terminal:openmettle.run-cancelled|"
                     "7:7:1:7|unresolved-write:aaaa0000-0000-4000-8000-000000000005|"
                     "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1\n",
@@ -1126,7 +1241,7 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 self.mcp_standin_records.append({"body": json.loads(argv[-1])})
                 return self._res(0, "HTTP/1.1 200 OK\r\n", "")
             target_host = argv[-2] if argv[-1].isdigit() else argv[-3]
-            is_http = "/readyz" in argv
+            is_http = "/readyz" in argv or "/healthz" in argv
             if ns in (restore_drill.TARGET_APP_NS, restore_drill.TARGET_DB_NS) and (
                 restore_drill.PRIMARY_DB_NS in target_host or restore_drill.PRIMARY_APP_NS in target_host
             ):
@@ -1178,7 +1293,12 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             if path.endswith("/approvals"):
                 return 200, v1_hdrs, json.dumps({"items": []}).encode()
             run_id = path.rsplit("/", 1)[1]
-            state = "cancelled" if run_id.startswith("aaaa0000") else "succeeded"
+            if self.forced_run_poll_state is not None and not run_id.startswith("aaaa0000"):
+                state = self.forced_run_poll_state
+                if hasattr(self, "_fake_clock"):
+                    self._fake_clock["t"] += 25.0
+            else:
+                state = "cancelled" if run_id.startswith("aaaa0000") else "succeeded"
             return 200, v1_hdrs, json.dumps({"run_id": run_id, "state": state}).encode()
         if path.endswith("/decision") and method == "POST":
             body = json.loads(payload)
@@ -1275,6 +1395,8 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
         self._cookie_b2 = None
         self._cookie_d2 = None
         self._post_restore_runs = 0
+        self.commands.clear()
+        self.applied_manifests.clear()
         self.live_objects.clear()
         self.media_lifecycle.clear()
         self.target_settlement_events.clear()
@@ -1437,7 +1559,26 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
             restore_drill.RETAINED_JOURNAL_PATH,
             reconcile_pod["containers"][0]["command"][-1],
         )
-        self.assertIn("family set-policy", reconcile_pod["containers"][0]["command"][-1])
+        pre_family_job = next(
+            d for d in self.applied_manifests
+            if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-primary-family-pre"
+        )
+        pre_family_cmd = pre_family_job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+        self.assertIn('--zone "Europe/London"', pre_family_cmd)
+        self.assertIn("--quiet", pre_family_cmd)
+        self.assertIn('--study "16:00-18:00"', pre_family_cmd)
+        self.assertIn("--override-group-schedules", pre_family_cmd)
+        self.assertIn("--kind study_allow", pre_family_cmd)
+
+        post_restrict_job = next(
+            d for d in self.applied_manifests
+            if d.get("kind") == "Job" and d["metadata"]["name"] == "openmettle-drill-primary-family-restrict"
+        )
+        post_restrict_cmd = post_restrict_job["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+        self.assertNotIn("family set-policy", post_restrict_cmd)
+        self.assertIn("family set-model", post_restrict_cmd)
+
+        self.assertNotIn("family set-policy", reconcile_pod["containers"][0]["command"][-1])
         self.assertIn("family set-model", reconcile_pod["containers"][0]["command"][-1])
         self.assertEqual(
             self.target_settlement_events,
@@ -1447,6 +1588,23 @@ class FakeDrillOrchestrationTest(unittest.TestCase):
                 "psql:bbbb0000-0000-4000-8000-000000000020",
             ],
         )
+
+    def test_terminal_and_timed_out_run_polling_report_last_state_and_diagnostics(self):
+        self.forced_run_poll_state = "failed"
+        rc_fail, sum_fail = self._run_drill()
+        self.assertEqual(rc_fail, 1)
+        self.assertIn("entered terminal state 'failed'", sum_fail["error"])
+        self.assertIn("test-upstream-timeout", sum_fail["error"])
+
+        self._fake_clock = {"t": 1000.0}
+        self.forced_run_poll_state = "queued"
+        self.forced_run_diag_row = "queued|||1:run.created:openmettle.run-created:{}"
+        with mock.patch.object(restore_drill.time, "monotonic", side_effect=lambda: self._fake_clock["t"]):
+            rc_to, sum_to = self._run_drill()
+        self.assertEqual(rc_to, 1)
+        self.assertIn("timed out waiting for primary gateway inference turn to succeed", sum_to["error"])
+        self.assertIn("last_state='queued'", sum_to["error"])
+        self.assertIn("openmettle.run-created", sum_to["error"])
 
     def test_unsolicited_mcp_write_replay_on_startup_fails_drill(self):
         self.unsolicited_mcp_on_startup = True

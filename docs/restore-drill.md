@@ -185,11 +185,17 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
 
    If `already_purged = true`, **do not** run `storage declare-lost` — step 4 below (`storage rebind --replace-adoption-run "$BARRIER_UUID"`) completes that already-journaled purge cleanly.
 
-2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. Require `$cand` to be a readable regular non-symlink file and verify its byte length and SHA-256 against `(size_bytes, sha256)` from step 1 without masking exit status behind pipelines; any read, stat, or digest failure **must stop reconciliation immediately** rather than falling through to `storage declare-lost`. If verified intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
+2. **Check verified recovery staging and other backups from the recovery point before declaring loss.** A partial or interrupted copy onto `/var/lib/openmettle/artifacts` can leave `/var/recovery/unpacked/artifacts/revisions/<RESERVATION_UUID>` (or another backup archive from the same recovery point) completely intact. First verify `/var/recovery/unpacked/artifacts/revisions` itself is a readable, searchable, listable non-symlink directory (so missing directory permissions cannot make `-e "$cand"` return false on an intact file); similarly inspect `/var/backups/openmettle` if present before treating a `backup-*` glob as empty. Then require `$cand` to be a readable regular non-symlink file and verify its byte length and SHA-256 against `(size_bytes, sha256)` from step 1 without masking exit status behind pipelines; any directory-inspection, read, stat, or digest failure **must stop reconciliation immediately** rather than falling through to `storage declare-lost`. If verified intact, restore it into `/var/lib/openmettle/artifacts/revisions/<RESERVATION_UUID>` (`chmod 0600`, UID/GID `65532`) and skip step 3 for that revision:
 
    ```sh
    set -eu
-   cand="/var/recovery/unpacked/artifacts/revisions/$RESERVATION_UUID"
+   rev_dir="/var/recovery/unpacked/artifacts/revisions"
+   if [ -L "$rev_dir" ] || [ ! -d "$rev_dir" ] || [ ! -r "$rev_dir" ] || [ ! -x "$rev_dir" ] || ! ls -A -- "$rev_dir" >/dev/null; then
+     echo "ERROR: staging revisions directory $rev_dir is missing or inaccessible; refusing storage declare-lost" >&2
+     exit 1
+   fi
+   cand="$rev_dir/$RESERVATION_UUID"
+   recovered=0
    if [ -e "$cand" ] || [ -L "$cand" ]; then
      if [ -L "$cand" ] || [ ! -f "$cand" ] || [ ! -r "$cand" ]; then
        echo "ERROR: staging candidate $cand is unreadable or not a regular file; refusing storage declare-lost" >&2
@@ -202,7 +208,23 @@ openmettle-admin storage rebind /var/lib/openmettle/artifacts
      if [ "${#cand_sha}" -eq 64 ] && [ "$cand_bytes" -eq "$EXPECTED_SIZE_BYTES" ] && [ "$cand_sha" = "$EXPECTED_SHA256" ]; then
        cp -a -- "$cand" "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
        chmod 0600 "/var/lib/openmettle/artifacts/revisions/$RESERVATION_UUID"
+       recovered=1
      fi
+   fi
+   if [ "$recovered" -eq 0 ]; then
+     media_dir="/var/backups/openmettle"
+     if [ -e "$media_dir" ] || [ -L "$media_dir" ]; then
+       if [ -L "$media_dir" ] || [ ! -d "$media_dir" ] || [ ! -r "$media_dir" ] || [ ! -x "$media_dir" ] || ! ls -A -- "$media_dir" >/dev/null; then
+         echo "ERROR: recovery media directory $media_dir is inaccessible; refusing storage declare-lost" >&2
+         exit 1
+       fi
+     fi
+     for archive_cand in "$media_dir"/backup-*; do
+       if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then
+         echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2
+         exit 1
+       fi
+     done
    fi
    ```
 
@@ -321,25 +343,38 @@ Deploy the target release with freshly generated 32-byte `active.key` and `curso
 
 Bumping provider generation fences pre-restore cookies/bearers and pending logins, **not** fresh sign-ins by accounts whose authority was reduced after the backup. Before reopening authentication (`auth.enabled: true` / ingress):
 
-- Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), family-policy schedules and model rules (`openmettle.family_policies`, `openmettle.family_policy_models` `rule_kind IN ('disabled', 'study_allow')`, audited under `family_policy.*` in `openmettle.authorization_audit`, `ADR 0044`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records:
+- Reconcile post-backup user disablements (`openmettle.users.disabled_at`, `session_generation = session_generation + 1`), identity approval withdrawals (`openmettle.local_identity_approvals.active = false`, `access_generation = access_generation + 1`), administrator demotions (`openmettle.account_admins.active = false`), local group disablements/removals (`openmettle.local_groups.disabled_at`, `openmettle.local_group_memberships.active`), project archives/deletions (`openmettle.project_settings.archived_at`, `deleted_at`), capability grant revocations/denies (`openmettle.user_capability_grants`, `user_capability_denies`, `platform_capability_denies`), family-policy schedules and model rules (`openmettle.family_policies`, `openmettle.family_policy_models` `rule_kind IN ('disabled', 'study_allow')`, audited under `family_policy.*` in `openmettle.authorization_audit`, `ADR 0044`), pending home-invitation withdrawals, and project membership/resource-share revocations (`openmettle.grant_assignments`, `openmettle.grant_changes`) against post-backup `authorization_audit` exports or operator change records.
+  - Because `openmettle-admin family set-policy` replaces `zone`, `quiet`, `study`, and `override_group_schedules` (`ADR 0044`), run **`openmettle-admin family set-model` directly** when an active `openmettle.family_policies` row already exists in the restored snapshot and only model rules (`family_policy.model_*`) changed post-backup (preserving existing schedules). Run `openmettle-admin family set-policy` **with the complete audited schedule** (`--zone`, plus `--quiet`, `--study`, and `--override-group-schedules` whenever set in `authorization_audit.details`) only when `family_policy.set` occurred post-backup (or `family clear-policy` for `family_policy.clear`).
+  - Always derive `--request-key` from a fixed-width SHA-256 hash (`restore-fp-$RESTORE_RUN_UUID-<hash>` / `restore-fm-$RESTORE_RUN_UUID-<hash>`, 112 bytes <= the CLI's 128-byte limit) so valid model identifiers up to 256 UTF-8 bytes remain recoverable:
 
   ```sh
-  # Reconcile post-backup disabled model restrictions before reopening inference (`ADR 0044`):
-  openmettle-admin family set-policy \
-    --user "$RESTRICTED_USER_UUID" \
-    --zone "$POLICY_TZ" \
-    --operator-id "$OPERATOR_UUID" \
-    --request-key "restore-family-policy-$RESTRICTED_USER_UUID-$RESTORE_RUN_UUID" \
-    --reason "reconcile post-backup family policy before reopening inference"
-
+  # Case 1: policy already exists in the restored snapshot; only a model rule changed post-backup
+  # (runs set-model directly so existing quiet, study, and override_group_schedules stay intact):
+  fm_hash="$(printf '%s\0%s\0disabled\0%s\01' "$RESTORE_RUN_UUID" "$RESTRICTED_USER_UUID" "$DISABLED_MODEL" | sha256sum)"
+  fm_key="restore-fm-$RESTORE_RUN_UUID-${fm_hash%% *}"
   openmettle-admin family set-model \
     --user "$RESTRICTED_USER_UUID" \
     --kind disabled \
     --model "$DISABLED_MODEL" \
     --enable \
     --operator-id "$OPERATOR_UUID" \
-    --request-key "restore-family-disable-$RESTRICTED_USER_UUID-$DISABLED_MODEL-$RESTORE_RUN_UUID" \
+    --request-key "$fm_key" \
     --reason "reconcile post-backup disabled model rule before reopening inference"
+
+  # Case 2: family_policy.set also occurred post-backup (supply the complete recorded schedule
+  # before re-applying post-backup model rules; omit --quiet/--study/--override-group-schedules
+  # only when those fields were unset in authorization_audit.details):
+  fp_hash="$(printf '%s\0%s\0set' "$RESTORE_RUN_UUID" "$RESTRICTED_USER_UUID" | sha256sum)"
+  fp_key="restore-fp-$RESTORE_RUN_UUID-${fp_hash%% *}"
+  openmettle-admin family set-policy \
+    --user "$RESTRICTED_USER_UUID" \
+    --zone "$POLICY_TZ" \
+    --quiet "$QUIET_WINDOW" \
+    --study "$STUDY_WINDOW" \
+    --override-group-schedules \
+    --operator-id "$OPERATOR_UUID" \
+    --request-key "$fp_key" \
+    --reason "reconcile post-backup family policy before reopening inference"
   ```
 
 - **Fail-closed rule:** if post-backup identity, capability, or family-policy model restriction evidence is unavailable, **keep authentication and inference closed** (`auth.enabled: false` / ingress blocked) until an operator audits and re-approves principals, grants, and model policies, so a disabled user or model cannot regain access after restore.

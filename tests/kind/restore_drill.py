@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -22,8 +23,9 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import smoke  # noqa: E402
@@ -672,38 +674,121 @@ def _validate_posix_abs_path(label: str, path: str) -> str:
     return path
 
 
+def _sh_quote(value: str) -> str:
+    """Single-quote an arbitrary non-control string safely for POSIX `/bin/sh`."""
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _validate_model_name(model: str) -> str:
+    """Validate `model` against `openmettle-core` `model_config::name` / `family::valid_model`:
+    1..=256 UTF-8 bytes and free of Unicode control characters."""
+    if (
+        not isinstance(model, str)
+        or not model
+        or len(model.encode("utf-8")) > 256
+        or any(ord(c) <= 0x1F or 0x7F <= ord(c) <= 0x9F for c in model)
+    ):
+        raise DrillFailure(f"invalid family policy model name: {model!r}")
+    return model
+
+
+def _validate_hhmm_window(label: str, raw: str) -> str:
+    """Validate an `HH:MM-HH:MM` schedule window matching `openmettle-core` `Hours::parse_window`."""
+    if not isinstance(raw, str):
+        raise DrillFailure(f"invalid family policy {label} window: {raw!r}")
+    match = re.fullmatch(r"([0-9]{2}):([0-9]{2})-([0-9]{2}):([0-9]{2})", raw)
+    if not match:
+        raise DrillFailure(f"invalid family policy {label} window: {raw!r}")
+    h1, m1, h2, m2 = (int(x) for x in match.groups())
+    if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59 or (h1, m1) == (h2, m2):
+        raise DrillFailure(f"invalid family policy {label} window: {raw!r}")
+    return raw
+
+
+def _family_request_key(prefix: str, restore_run_id: str, *parts: str) -> str:
+    """Build a deterministic `<= 128`-byte request key for `openmettle-admin family` retries."""
+    digest = hashlib.sha256("\0".join((restore_run_id, *parts)).encode("utf-8")).hexdigest()[:32]
+    key = f"{prefix}-{restore_run_id}-{digest}"
+    if len(key) > 128:
+        raise DrillFailure(f"generated request_key exceeds 128 chars: {len(key)}")
+    return key
+
+
 def build_family_policy_reconcile_lines(
     operator_id: str,
     restore_run_id: str,
-    disabled_models: list[tuple[str, str, str]] | tuple[tuple[str, str, str], ...],
+    entries: list[dict] | tuple[dict, ...],
 ) -> str:
     """Build `openmettle-admin family` commands reconciling post-backup family policies and
-    disabled model rules (`ADR 0044`) before reopening inference."""
+    model rules (`ADR 0044`) before reopening inference.
+
+    Each entry dict takes:
+      - `user_id`: canonical grantee user UUID
+      - `policy`: `None` when an existing restored `family_policies` row keeps its schedule
+        (only model rules changed post-backup), `"clear"` to deactivate a cleared policy, or a
+        dict `{"zone": str, "quiet": str | None, "study": str | None,
+        "override_group_schedules": bool}` carrying the complete recorded schedule when
+        `family_policy.set` occurred post-backup
+      - `models`: sequence of `(kind, model, enable)` tuples (`kind` in `{"disabled",
+        "study_allow"}`, `enable` bool). Uses SHA-256-bounded request keys (`<= 128` bytes for
+        every valid 1..=256-byte model identifier).
+    """
     for label, val in (("operator_id", operator_id), ("restore_run_id", restore_run_id)):
         if not smoke.UUID.fullmatch(val):
             raise DrillFailure(f"invalid {label} UUID: {val!r}")
     lines: list[str] = []
-    for user_id, zone, model in disabled_models:
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise DrillFailure(f"expected family policy reconcile entry dict, got {entry!r}")
+        user_id = entry.get("user_id", "")
         if not smoke.UUID.fullmatch(user_id):
             raise DrillFailure(f"invalid restricted user UUID: {user_id!r}")
-        if not re.fullmatch(r"[A-Za-z0-9/+_.-]{1,128}", zone):
-            raise DrillFailure(f"invalid family policy timezone: {zone!r}")
-        if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", model):
-            raise DrillFailure(f"invalid family policy model name: {model!r}")
-        policy_key = f"restore-family-policy-{user_id}-{restore_run_id}"
-        model_key = f"restore-family-disable-{user_id}-{model}-{restore_run_id}"
-        if len(policy_key) > 128 or len(model_key) > 128:
-            raise DrillFailure("generated family policy request_key exceeds 128 chars")
-        lines.append(
-            f'openmettle-admin family set-policy --user "{user_id}" --zone "{zone}" '
-            f'--operator-id "{operator_id}" --request-key "{policy_key}" '
-            '--reason "reconcile post-backup family policy before reopening inference"'
-        )
-        lines.append(
-            f'openmettle-admin family set-model --user "{user_id}" --kind disabled --model "{model}" '
-            f'--enable --operator-id "{operator_id}" --request-key "{model_key}" '
-            '--reason "reconcile post-backup disabled model rule before reopening inference"'
-        )
+        policy = entry.get("policy")
+        if policy == "clear":
+            policy_key = _family_request_key("restore-fp", restore_run_id, user_id, "clear")
+            lines.append(
+                f'openmettle-admin family clear-policy --user "{user_id}" '
+                f'--operator-id "{operator_id}" --request-key "{policy_key}" '
+                '--reason "reconcile post-backup family policy clearance before reopening inference"'
+            )
+        elif isinstance(policy, dict):
+            zone = policy.get("zone", "")
+            if not isinstance(zone, str) or not re.fullmatch(r"[A-Za-z0-9/+_.-]{1,128}", zone):
+                raise DrillFailure(f"invalid family policy timezone: {zone!r}")
+            quiet = policy.get("quiet")
+            study = policy.get("study")
+            override = bool(policy.get("override_group_schedules", False))
+            parts = [f'openmettle-admin family set-policy --user "{user_id}" --zone "{zone}"']
+            if quiet is not None:
+                parts.append(f'--quiet "{_validate_hhmm_window("quiet", quiet)}"')
+            if study is not None:
+                parts.append(f'--study "{_validate_hhmm_window("study", study)}"')
+            if override:
+                parts.append("--override-group-schedules")
+            policy_key = _family_request_key("restore-fp", restore_run_id, user_id, "set")
+            parts.append(
+                f'--operator-id "{operator_id}" --request-key "{policy_key}" '
+                '--reason "reconcile post-backup family policy before reopening inference"'
+            )
+            lines.append(" ".join(parts))
+        elif policy is not None:
+            raise DrillFailure(f"invalid family policy directive: {policy!r}")
+
+        for kind, model, enable in entry.get("models", ()):
+            if kind not in ("disabled", "study_allow"):
+                raise DrillFailure(f"invalid family policy rule kind: {kind!r}")
+            if not isinstance(enable, bool):
+                raise DrillFailure(f"invalid family policy enable flag: {enable!r}")
+            _validate_model_name(model)
+            state_bit = "1" if enable else "0"
+            model_key = _family_request_key("restore-fm", restore_run_id, user_id, kind, model, state_bit)
+            flag = "--enable" if enable else "--disable"
+            lines.append(
+                f'openmettle-admin family set-model --user "{user_id}" --kind {kind} '
+                f'--model {_sh_quote(model)} {flag} '
+                f'--operator-id "{operator_id}" --request-key "{model_key}" '
+                '--reason "reconcile post-backup family model rule before reopening inference"'
+            )
     return ("\n".join(lines) + "\n") if lines else ""
 
 
@@ -719,11 +804,14 @@ def build_step4c_reconcile_lines(
 ) -> str:
     """Build Step 4c + 4d commands for pinned artifact volumes:
     1) replay --db-only first,
-    2) verify staging copies as regular readable non-symlink files by byte length + SHA-256 without
-       masking read/stat/digest exit codes (aborting reconciliation rather than falling through to
-       `storage declare-lost` on error), and restore any intact payload (`chmod 0600`),
-    3) verify no archive media remains available and reserve `storage declare-lost` strictly for
-       revisions confirmed absent/corrupt in all recovery copies,
+    2) verify the staging revisions directory is readable, searchable, and listable before
+       evaluating individual candidates, verify staging copies as regular readable non-symlink
+       files by byte length + SHA-256 without masking read/stat/digest exit codes (aborting
+       reconciliation rather than falling through to `storage declare-lost` on error), and
+       restore any intact payload (`chmod 0600`),
+    3) verify recovery_media_dir (when present) is inspectable and contains no remaining backup
+       archive before reserving `storage declare-lost` strictly for revisions confirmed
+       absent/corrupt in all recovery copies,
     4) resume `storage rebind --replace-adoption-run` -> `restore replay` -> `quota verify`."""
     _validate_posix_abs_path("selected_journal", selected_journal)
     _validate_posix_abs_path("artifacts_mount", artifacts_mount)
@@ -732,6 +820,14 @@ def build_step4c_reconcile_lines(
     if not (smoke.UUID.fullmatch(operator_id) and smoke.UUID.fullmatch(barrier_uuid)):
         raise DrillFailure("invalid operator_id or barrier_uuid in build_step4c_reconcile_lines")
     lines = [f'openmettle-admin restore replay --db-only "{selected_journal}"']
+    if failed_revisions:
+        lines.append(
+            f'rev_dir="{unpacked_dir}/artifacts/revisions"\n'
+            'if [ -L "$rev_dir" ] || [ ! -d "$rev_dir" ] || [ ! -r "$rev_dir" ] || [ ! -x "$rev_dir" ] || ! ls -A -- "$rev_dir" >/dev/null; then\n'
+            '  echo "ERROR: staging revisions directory $rev_dir is missing or inaccessible; refusing storage declare-lost" >&2\n'
+            "  exit 1\n"
+            "fi"
+        )
     for rev_id, res_id, size_bytes, expected_sha256 in failed_revisions:
         if not (
             smoke.UUID.fullmatch(rev_id)
@@ -742,7 +838,7 @@ def build_step4c_reconcile_lines(
         ):
             raise DrillFailure(f"invalid Step 4c revision descriptor: {(rev_id, res_id, size_bytes)!r}")
         lines.append(
-            f'cand="{unpacked_dir}/artifacts/revisions/{res_id}"\n'
+            f'cand="$rev_dir/{res_id}"\n'
             f'dst="{artifacts_mount}/revisions/{res_id}"\n'
             "recovered=0\n"
             'if [ -e "$cand" ] || [ -L "$cand" ]; then\n'
@@ -771,6 +867,12 @@ def build_step4c_reconcile_lines(
             "  fi\n"
             "fi\n"
             'if [ "$recovered" -eq 0 ]; then\n'
+            f'  if [ -e "{recovery_media_dir}" ] || [ -L "{recovery_media_dir}" ]; then\n'
+            f'    if [ -L "{recovery_media_dir}" ] || [ ! -d "{recovery_media_dir}" ] || [ ! -r "{recovery_media_dir}" ] || [ ! -x "{recovery_media_dir}" ] || ! ls -A -- "{recovery_media_dir}" >/dev/null; then\n'
+            f'      echo "ERROR: recovery media directory {recovery_media_dir} is inaccessible; refusing storage declare-lost" >&2\n'
+            "      exit 1\n"
+            "    fi\n"
+            "  fi\n"
             f'  for archive_cand in "{recovery_media_dir}"/backup-*; do\n'
             '    if [ -e "$archive_cand" ] || [ -L "$archive_cand" ]; then\n'
             '      echo "ERROR: backup archive $archive_cand remains available; unpack and inspect before storage declare-lost" >&2\n'
@@ -1555,6 +1657,85 @@ class RestoreDrill:
             time.sleep(interval)
         raise DrillFailure(f"timed out waiting for {description}")
 
+    def wait_for_inference_ready(self, app_ns: str, db_ns: str) -> None:
+        """Wait for api/worker/gateway Deployments AND kindnet's NetworkPolicy reconciliation loop
+        for `worker -> gateway-a:8082/readyz` and `gateway-a -> sglang-standin:30000/healthz`."""
+        for dep in (f"{FULLNAME}-api", f"{FULLNAME}-worker", smoke.GATEWAY_WORKLOAD):
+            self.kube("--namespace", app_ns, "rollout", "status", f"deployment/{dep}",
+                      "--timeout=180s", timeout=210)
+        worker_to_gw = smoke.http_command(
+            f"{smoke.GATEWAY_WORKLOAD}.{app_ns}.svc.cluster.local", 8082, "/readyz"
+        )
+        self.wait_for(
+            f"{app_ns} worker -> gateway-a:8082 /readyz via NetworkPolicy",
+            lambda: (
+                lambda res: smoke.probe_outcome(res.returncode, res.stdout, res.stderr, True) == "connected"
+            )(
+                self.kube(
+                    "--namespace", app_ns, "exec", f"deployment/{FULLNAME}-worker",
+                    "--container", "worker", "--", *worker_to_gw,
+                    check=False, timeout=smoke.PROBE_SECONDS + 30,
+                )
+            ),
+            timeout=60, interval=1.0,
+        )
+        gw_to_standin = smoke.http_command(
+            f"{smoke.STANDIN}.{db_ns}.svc.cluster.local", smoke.STANDIN_PORT, "/healthz"
+        )
+        self.wait_for(
+            f"{app_ns} gateway-a -> {db_ns}/{smoke.STANDIN}:{smoke.STANDIN_PORT} /healthz via NetworkPolicy",
+            lambda: (
+                lambda res: smoke.probe_outcome(res.returncode, res.stdout, res.stderr, True) == "connected"
+            )(
+                self.kube(
+                    "--namespace", app_ns, "exec", f"deployment/{smoke.GATEWAY_WORKLOAD}",
+                    "--container", "gateway", "--", *gw_to_standin,
+                    check=False, timeout=smoke.PROBE_SECONDS + 30,
+                )
+            ),
+            timeout=60, interval=1.0,
+        )
+
+    def _run_diagnostics(self, db_ns: str, run_id: str) -> str:
+        if not smoke.UUID.fullmatch(str(run_id)):
+            return f"invalid run_id={run_id!r}"
+        try:
+            out = self.psql_superuser(
+                db_ns,
+                f"SELECT r.state || '|' || coalesce(r.wait_reason, '') || '|' || coalesce(r.cancel_reason, '')"
+                f" || '|' || coalesce((SELECT string_agg(sequence::text || ':' || append_key || ':' || format"
+                f" || ':' || convert_from(payload, 'UTF8'), '; ' ORDER BY sequence)"
+                f" FROM openmettle.run_events WHERE run_id = r.id), '')"
+                f" FROM openmettle.runs r WHERE r.id = '{run_id}'::uuid;",
+            ).strip()
+            return smoke.redact(out or "<no run row>", self.secrets_to_redact)
+        except Exception as exc:
+            return f"<diagnostic query failed: {smoke.redact(str(exc), self.secrets_to_redact)}>"
+
+    def wait_for_run_succeeded(
+        self, port: int, cookie: str, run_id: str, description: str, db_ns: str, *, timeout: int = 60
+    ) -> dict:
+        last_doc: dict | None = None
+        last_state: str | None = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            last_doc = self.api_json(port, cookie, "GET", f"/v1/runs/{run_id}", 200)
+            last_state = last_doc.get("state")
+            if last_state == "succeeded":
+                return last_doc
+            if last_state not in ("queued", "running", "waiting"):
+                diag = self._run_diagnostics(db_ns, run_id)
+                raise DrillFailure(
+                    f"{description}: run {run_id} entered terminal state {last_state!r} "
+                    f"(snapshot={last_doc!r}, db={diag!r})"
+                )
+            time.sleep(0.5)
+        diag = self._run_diagnostics(db_ns, run_id)
+        raise DrillFailure(
+            f"timed out waiting for {description}: run {run_id} last_state={last_state!r} "
+            f"(snapshot={last_doc!r}, db={diag!r})"
+        )
+
     def preflight(self):
         self.core.check_tools(self.run)
         smoke.check_helm_version(self.run(["helm", "version", "--template", "{{ .Version }}"]).stdout)
@@ -1795,8 +1976,10 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.verify_identity()
         self.helm_ns(PRIMARY_APP_NS, "install", RELEASE, str(CHART), "--values", str(primary_vals),
                      "--wait=watcher", "--timeout", smoke.HELM_TIMEOUT)
+        self.wait_for_inference_ready(PRIMARY_APP_NS, PRIMARY_DB_NS)
 
-        # Seed user_a, user_b, user_c (post-backup disabled), and user_d (active non-member).
+        # Seed user_a, user_b, user_c (post-backup disabled), and user_d (pre-backup rich schedule +
+        # post-backup disabled model).
         sid_a, cookie_a, hash_a = smoke.session_credential(secrets.token_bytes(64))
         sid_b, cookie_b, hash_b = smoke.session_credential(secrets.token_bytes(64))
         sid_c, cookie_c, hash_c = smoke.session_credential(secrets.token_bytes(64))
@@ -1820,6 +2003,63 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             ),
         )
 
+        # Seed a pre-backup family policy schedule with zone, quiet, study, and group-schedule
+        # override on user_d (using a 1-minute quiet window 12h away from current Europe/London time
+        # so inference on model `a` stays permitted pre-backup), plus a study_allow rule on model `a`.
+        # Post-backup reconciliation must preserve these schedule fields when re-applying model `a` disable.
+        london_now = datetime.now(ZoneInfo("Europe/London"))
+        q_start = ((london_now.hour * 60 + london_now.minute) + 720) % 1440
+        q_end = (q_start + 1) % 1440
+        pre_quiet_window = f"{q_start // 60:02d}:{q_start % 60:02d}-{q_end // 60:02d}:{q_end % 60:02d}"
+        admin_ref = self.report["images"]["admin"]["reference"]
+        pri_labels = {"openmettle.dev/environment": "dev", RUN_LABEL: self.run_id}
+        pre_family_script = (
+            f'openmettle-admin family set-policy --user "{USER_D_IDS["user"]}" --zone "Europe/London" '
+            f'--quiet "{pre_quiet_window}" --study "16:00-18:00" --override-group-schedules '
+            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-pre-family-policy-d" '
+            '--reason "pre-backup family policy schedule for user_d"\n'
+            f'openmettle-admin family set-model --user "{USER_D_IDS["user"]}" --kind study_allow '
+            f'--model {_sh_quote(smoke.CATALOG_MODEL)} --enable --operator-id "{DRILL_OPERATOR_ID}" '
+            '--request-key "drill-pre-family-study-allow-d" '
+            '--reason "pre-backup study_allow rule for user_d"\n'
+        )
+        pre_family_job = {
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "openmettle-drill-primary-family-pre", "namespace": PRIMARY_APP_NS, "labels": pri_labels},
+            "spec": {
+                "backoffLimit": 0, "activeDeadlineSeconds": 120,
+                "template": {
+                    "metadata": {"labels": {**pri_labels, RECOVERY_DB_CLIENT_LABEL: "true"}},
+                    "spec": {
+                        "restartPolicy": "Never", "automountServiceAccountToken": False, "enableServiceLinks": False,
+                        "securityContext": POD_SEC_CONTEXT,
+                        "containers": [{
+                            "name": "family-pre", "image": admin_ref, "imagePullPolicy": "Never",
+                            "command": ["/bin/sh", "-eu", "-c", pre_family_script],
+                            "env": [{"name": "OPENMETTLE_ADMIN_DATABASE_URL",
+                                     "valueFrom": {"secretKeyRef": {"name": smoke.SECRET["migrate"], "key": "url"}}}],
+                            "securityContext": CONTAINER_SEC_CONTEXT,
+                        }],
+                    },
+                },
+            },
+        }
+        self.run_job(PRIMARY_APP_NS, pre_family_job)
+        pre_permits = self.psql_superuser(
+            PRIMARY_DB_NS,
+            f"SELECT openmettle.family_policy_permits('{USER_D_IDS['user']}'::uuid, "
+            f"'{USER_D_IDS['approval']}'::uuid, '{smoke.CATALOG_MODEL}', now())::text;",
+        ).strip()
+        self.expect(pre_permits == "t", f"expected user_d pre-backup family schedule to permit model, got {pre_permits!r}")
+        pre_family_schedule = {
+            "zone": "Europe/London",
+            "quiet_start": q_start,
+            "quiet_end": q_end,
+            "study_start": 960,
+            "study_end": 1080,
+            "override_group_schedules": True,
+        }
+
         # Populate primary state over live /v1 HTTP routes.
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=PRIMARY_APP_NS)
         try:
@@ -1829,11 +2069,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             admitted = self.api_json(fwd.port, cookie_a, "POST", "/v1/runs", 201,
                                      key="drill-turn-1", json_body=run_body)
             completed_run_id = admitted["run_id"]
-            self.wait_for(
-                "primary gateway inference turn to succeed",
-                lambda: (self.api_json(fwd.port, cookie_a, "GET", f"/v1/runs/{completed_run_id}", 200)
-                         .get("state") == "succeeded"),
-                timeout=60, interval=0.5,
+            self.wait_for_run_succeeded(
+                fwd.port, cookie_a, completed_run_id,
+                "primary gateway inference turn to succeed", PRIMARY_DB_NS, timeout=60,
             )
             self.wait_for(
                 "primary gateway settlement",
@@ -2010,17 +2248,18 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" WHERE id = '{USER_C_IDS['approval']}'::uuid;",
         )
         disabled_principals = [(USER_C_IDS["user"], USER_C_IDS["approval"])]
-        disabled_family_models = [(USER_D_IDS["user"], "UTC", smoke.CATALOG_MODEL)]
-        admin_ref = self.report["images"]["admin"]["reference"]
-        pri_labels = {"openmettle.dev/environment": "dev", RUN_LABEL: self.run_id}
+        disabled_family_models = [
+            {
+                "user_id": USER_D_IDS["user"],
+                "policy": None,
+                "models": [("disabled", smoke.CATALOG_MODEL, True)],
+            }
+        ]
         family_restrict_script = (
-            f'openmettle-admin family set-policy --user "{USER_D_IDS["user"]}" --zone "UTC" '
-            f'--operator-id "{DRILL_OPERATOR_ID}" --request-key "drill-primary-family-policy-1" '
-            '--reason "post-backup family policy creation"\n'
             f'openmettle-admin family set-model --user "{USER_D_IDS["user"]}" --kind disabled '
-            f'--model "{smoke.CATALOG_MODEL}" --enable --operator-id "{DRILL_OPERATOR_ID}" '
+            f'--model {_sh_quote(smoke.CATALOG_MODEL)} --enable --operator-id "{DRILL_OPERATOR_ID}" '
             '--request-key "drill-primary-family-disable-a-1" '
-            '--reason "post-backup disabled model restriction"\n'
+            '--reason "post-backup disabled model restriction on existing family policy"\n'
         )
         family_restrict_job = {
             "apiVersion": "batch/v1", "kind": "Job",
@@ -2148,6 +2387,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             "export_file": export_file,
             "stopped_primary_watermark": stopped_primary_watermark,
             "disabled_principals": disabled_principals,
+            "pre_family_schedule": pre_family_schedule,
             "disabled_family_models": disabled_family_models,
             "cutover_at": cutover_at,
             "personal_conv": personal_conv,
@@ -3027,9 +3267,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         self.verify_identity()
         self.helm_ns(TARGET_APP_NS, "install", RELEASE, str(CHART), "--values", str(target_vals),
                      "--wait=watcher", "--timeout", smoke.HELM_TIMEOUT)
-        for dep in (f"{FULLNAME}-api", f"{FULLNAME}-worker", smoke.GATEWAY_WORKLOAD):
-            self.kube("--namespace", TARGET_APP_NS, "rollout", "status", f"deployment/{dep}",
-                      "--timeout=180s", timeout=210)
+        self.wait_for_inference_ready(TARGET_APP_NS, TARGET_DB_NS)
 
         fwd = smoke.PortForward(self.kubectl, self.env, f"service/{FULLNAME}-api", 8080, namespace=TARGET_APP_NS)
         try:
@@ -3243,11 +3481,9 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             post_run = self.api_json(fwd.port, cookie_a2, "POST", "/v1/runs", 201,
                                      key="drill-post-restore-run",
                                      json_body=smoke.run_request(post_conv, str(uuid.uuid4())))
-            self.wait_for(
-                "post-restore target turn to succeed",
-                lambda: (self.api_json(fwd.port, cookie_a2, "GET", f"/v1/runs/{post_run['run_id']}", 200)
-                         .get("state") == "succeeded"),
-                timeout=60, interval=0.5,
+            self.wait_for_run_succeeded(
+                fwd.port, cookie_a2, post_run["run_id"],
+                "post-restore target turn to succeed", TARGET_DB_NS, timeout=60,
             )
             self.wait_for(
                 "post-restore gateway settlement",
@@ -3279,14 +3515,27 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
         i_unresolved_seq = primary_state["pre_run_seq"][i_run_id] + 1
         i_expected_seq = primary_state["pre_run_seq"][i_run_id] + 2
 
+        sched = primary_state["pre_family_schedule"]
+        expected_family_state = (
+            f"{sched['zone']}:{sched['quiet_start']}:{sched['quiet_end']}:"
+            f"{sched['study_start']}:{sched['study_end']}:t:2"
+        )
         sql_checks = self.psql_superuser(
             TARGET_DB_NS,
             f"SELECT (SELECT outcome || ':' || revision::text FROM openmettle.operations WHERE id = '{i_op_id}'::uuid),"
             f" (SELECT target FROM openmettle.operations WHERE id = '{i_op_id}'::uuid),"
-            f" (SELECT EXISTS (SELECT 1 FROM openmettle.family_policies fp"
-            f"   JOIN openmettle.family_policy_models fpm ON fpm.policy_id = fp.id"
-            f"   WHERE fp.grantee_kind = 'user' AND fp.grantee_user_id = '{USER_D_IDS['user']}'::uuid"
-            f"     AND fp.active AND fpm.rule_kind = 'disabled' AND fpm.model = '{smoke.CATALOG_MODEL}' AND fpm.active)),"
+            f" (SELECT coalesce(("
+            f"    SELECT fp.zone || ':' || coalesce(fp.quiet_start_minute::text, '') || ':'"
+            f"        || coalesce(fp.quiet_end_minute::text, '') || ':'"
+            f"        || coalesce(fp.study_start_minute::text, '') || ':'"
+            f"        || coalesce(fp.study_end_minute::text, '') || ':'"
+            f"        || fp.override_group_schedules::text || ':'"
+            f"        || (SELECT count(*)::text FROM openmettle.family_policy_models fpm"
+            f"             WHERE fpm.policy_id = fp.id AND fpm.active AND fpm.model = '{smoke.CATALOG_MODEL}'"
+            f"               AND fpm.rule_kind IN ('study_allow', 'disabled'))"
+            f"      FROM openmettle.family_policies fp"
+            f"     WHERE fp.grantee_kind = 'user' AND fp.grantee_user_id = '{USER_D_IDS['user']}'::uuid AND fp.active"
+            f" ), '')),"
             f" (SELECT encryption_key_id IS NULL AND access_ciphertext IS NULL AND refresh_ciphertext IS NULL"
             f"    FROM openmettle.external_connections WHERE id = '{primary_state['conn_revoke_id']}'::uuid),"
             f" (SELECT (extract(epoch FROM purge_after) * 1000000)::bigint"
@@ -3316,7 +3565,7 @@ COPY --from=drill-fixture-build /source/target/release/kind-drill-fixture /kind-
             f" (SELECT access_generation FROM openmettle.login_providers WHERE id = '{USER_A_IDS['provider']}'::uuid);",
         ).strip()
         expected_sql = (
-            f"outcome_unknown:1|{target_mcp_url()}|t|t|{expected_purge_after_us}|purged|t|f|"
+            f"outcome_unknown:1|{target_mcp_url()}|{expected_family_state}|t|{expected_purge_after_us}|purged|t|f|"
             f"{w_expected_seq}:{w_expected_seq}:1:{w_expected_seq}|run-terminal:openmettle.run-cancelled|"
             f"{i_expected_seq}:{i_expected_seq}:1:{i_expected_seq}|unresolved-write:{i_op_id}|"
             "run-terminal:openmettle.run-cancelled|released:0|held:25|101|1"
